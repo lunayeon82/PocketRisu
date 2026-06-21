@@ -6262,6 +6262,45 @@ app.post('/api/gdrive/restore', async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
+// ─── Admin force-restore (token-protected, one-shot recovery tool) ──────────
+// Usage: curl -X POST https://pocketrisu.fly.dev/api/admin/force-restore \
+//          -H "X-Admin-Token: $TOKEN" \
+//          -H "Content-Type: application/octet-stream" \
+//          --data-binary @backup.bin
+// Requires ADMIN_RESTORE_TOKEN env var to be set (fly secrets set).
+app.post('/api/admin/force-restore', async (req, res, next) => {
+    const token = process.env.ADMIN_RESTORE_TOKEN;
+    if (!token) return res.status(501).json({ error: 'ADMIN_RESTORE_TOKEN not set' });
+    if (req.headers['x-admin-token'] !== token) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const data = req.body;
+        if (!Buffer.isBuffer(data) || data.length < 10) return res.status(400).json({ error: 'Body must be raw binary (Content-Type: application/octet-stream), min 10 bytes' });
+        await queueStorageOperation(async () => {
+            await flushPendingDb();
+            const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
+            kvCopyValue(DB_BLOB_KEY, preKey);
+            trimSnapshotsToLimits();
+            lastBackupTime = Date.now();
+            kvSet(DB_BLOB_KEY, data);
+            invalidateDbCache();
+            kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            try {
+                const raw = kvGet(DB_BLOB_KEY);
+                if (raw) {
+                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
+                    initChatStore(dbObj);
+                    const finalRaw = kvGet(DB_BLOB_KEY);
+                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                }
+            } catch (e) {
+                logger.warn('[Force restore] post-restore decode failed:', e?.message || e);
+            }
+        });
+        logger.info('[Force restore] Restored', data.length, 'bytes via admin endpoint');
+        res.json({ ok: true, bytes: data.length });
+    } catch (err) { next(err); }
+});
+
 // ─── Express error middleware — must be registered after all routes ─────────
 app.use(expressErrorMiddleware);
 app.use((err, req, res, next) => {
