@@ -417,7 +417,7 @@
             location.search = ''
             location.reload()
         } catch (err) {
-            alertError(err instanceof Error ? err.message : String(err))
+            notifyError(err instanceof Error ? err.message : String(err))
         }
     }
 

@@ -5456,6 +5456,11 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
+            // Save a pre-restore snapshot so the user can undo.
+            const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
+            kvCopyValue(DB_BLOB_KEY, preKey);
+            trimSnapshotsToLimits();
+            lastBackupTime = Date.now();
             kvCopyValue(key, DB_BLOB_KEY);
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
@@ -6232,6 +6237,12 @@ app.post('/api/gdrive/restore', async (req, res, next) => {
         if (!data || data.length < 10) return res.status(400).json({ error: 'Downloaded file appears empty or invalid' });
         await queueStorageOperation(async () => {
             await flushPendingDb();
+            // Save a pre-restore snapshot of the current state before overwriting.
+            // This lets the user undo via the Snapshots UI if something goes wrong.
+            const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
+            kvCopyValue(DB_BLOB_KEY, preKey);
+            trimSnapshotsToLimits();
+            lastBackupTime = Date.now();
             kvSet(DB_BLOB_KEY, data);
             invalidateDbCache();
             kvDel(REMOTE_MIGRATION_MARKER_KEY);
