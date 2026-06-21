@@ -1929,6 +1929,18 @@ function setupProxyStreamWebSocket(server) {
     });
 }
 
+// Returns true if buf looks like a multi-entry backup archive (local-backup format).
+// Archive entries start with [4-byte LE name length][name bytes][4-byte LE data length][data].
+// A raw database/database.bin binary won't start with a short LE uint32 followed by printable ASCII.
+function isBackupArchiveFormat(buf) {
+    if (!buf || buf.length < 12) return false;
+    const nameLen = buf.readUInt32LE(0);
+    if (nameLen < 1 || nameLen > 200) return false;
+    if (buf.length < 4 + nameLen + 4) return false;
+    const possibleName = buf.slice(4, 4 + nameLen).toString('utf-8');
+    return /^[\x21-\x7E][\x20-\x7E]*$/.test(possibleName);
+}
+
 function encodeBackupEntry(name, data) {
     const encodedName = Buffer.from(name, 'utf-8');
     const nameLength = Buffer.allocUnsafe(4);
@@ -2429,16 +2441,28 @@ app.get('/', async (req, res, next) => {
     const clientIP = req.ip || 'Unknown IP';
     const timestamp = new Date().toISOString();
     console.log(`[Server] ${timestamp} | Connection from: ${clientIP}`);
-    
+
     try {
         const mainIndex = await fs.readFile(path.join(process.cwd(), 'dist', 'index.html'))
         const root = htmlparser.parse(mainIndex)
         const head = root.querySelector('head')
         head.innerHTML = `<script>globalThis.__NODE__ = true; globalThis.__PATCH_SYNC__ = ${enablePatchSync}</script>` + head.innerHTML
-        
+
         res.send(root.toString())
     } catch (error) {
         console.log(error)
+        next(error)
+    }
+})
+
+app.get('/settings', async (req, res, next) => {
+    try {
+        const html = await fs.readFile(path.join(process.cwd(), 'dist', 'settings.html'))
+        const root = htmlparser.parse(html)
+        const head = root.querySelector('head')
+        head.innerHTML = `<script>globalThis.__NODE__ = true; globalThis.__PATCH_SYNC__ = ${enablePatchSync}</script>` + head.innerHTML
+        res.send(root.toString())
+    } catch (error) {
         next(error)
     }
 })
@@ -6235,30 +6259,38 @@ app.post('/api/gdrive/restore', async (req, res, next) => {
         const accessToken = await gdriveBackup.getValidAccessToken();
         const data = await gdriveBackup.downloadFile(accessToken, fileId);
         if (!data || data.length < 10) return res.status(400).json({ error: 'Downloaded file appears empty or invalid' });
-        await queueStorageOperation(async () => {
-            await flushPendingDb();
-            // Save a pre-restore snapshot of the current state before overwriting.
-            // This lets the user undo via the Snapshots UI if something goes wrong.
-            const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
-            kvCopyValue(DB_BLOB_KEY, preKey);
-            trimSnapshotsToLimits();
-            lastBackupTime = Date.now();
-            kvSet(DB_BLOB_KEY, data);
-            invalidateDbCache();
-            kvDel(REMOTE_MIGRATION_MARKER_KEY);
-            try {
-                const raw = kvGet(DB_BLOB_KEY);
-                if (raw) {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
-                    initChatStore(dbObj);
-                    const finalRaw = kvGet(DB_BLOB_KEY);
-                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+
+        if (isBackupArchiveFormat(data)) {
+            // Full archive format (same as local backup export) — route through import logic.
+            // importBackupFromSource handles its own pre-restore snapshot + transaction.
+            async function* singleChunk() { yield data; }
+            const result = await queueStorageOperation(() => importBackupFromSource(singleChunk()));
+            res.json({ ok: true, format: 'archive', coldStorageFailed: result?.coldStorageFailed ?? 0 });
+        } else {
+            // Raw DB bytes format (GDrive-native backup)
+            await queueStorageOperation(async () => {
+                await flushPendingDb();
+                const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
+                kvCopyValue(DB_BLOB_KEY, preKey);
+                trimSnapshotsToLimits();
+                lastBackupTime = Date.now();
+                kvSet(DB_BLOB_KEY, data);
+                invalidateDbCache();
+                kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                try {
+                    const raw = kvGet(DB_BLOB_KEY);
+                    if (raw) {
+                        const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
+                        initChatStore(dbObj);
+                        const finalRaw = kvGet(DB_BLOB_KEY);
+                        if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                    }
+                } catch (e) {
+                    logger.warn('[GDrive restore] post-restore decode failed:', e?.message || e);
                 }
-            } catch (e) {
-                logger.warn('[GDrive restore] post-restore decode failed:', e?.message || e);
-            }
-        });
-        res.json({ ok: true });
+            });
+            res.json({ ok: true, format: 'raw-db' });
+        }
     } catch (err) { next(err); }
 });
 
@@ -6275,29 +6307,37 @@ app.post('/api/admin/force-restore', async (req, res, next) => {
     try {
         const data = req.body;
         if (!Buffer.isBuffer(data) || data.length < 10) return res.status(400).json({ error: 'Body must be raw binary (Content-Type: application/octet-stream), min 10 bytes' });
-        await queueStorageOperation(async () => {
-            await flushPendingDb();
-            const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
-            kvCopyValue(DB_BLOB_KEY, preKey);
-            trimSnapshotsToLimits();
-            lastBackupTime = Date.now();
-            kvSet(DB_BLOB_KEY, data);
-            invalidateDbCache();
-            kvDel(REMOTE_MIGRATION_MARKER_KEY);
-            try {
-                const raw = kvGet(DB_BLOB_KEY);
-                if (raw) {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
-                    initChatStore(dbObj);
-                    const finalRaw = kvGet(DB_BLOB_KEY);
-                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+
+        if (isBackupArchiveFormat(data)) {
+            async function* singleChunk() { yield data; }
+            const result = await queueStorageOperation(() => importBackupFromSource(singleChunk()));
+            logger.info('[Force restore] Restored archive format', data.length, 'bytes via admin endpoint');
+            res.json({ ok: true, format: 'archive', bytes: data.length, coldStorageFailed: result?.coldStorageFailed ?? 0 });
+        } else {
+            await queueStorageOperation(async () => {
+                await flushPendingDb();
+                const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
+                kvCopyValue(DB_BLOB_KEY, preKey);
+                trimSnapshotsToLimits();
+                lastBackupTime = Date.now();
+                kvSet(DB_BLOB_KEY, data);
+                invalidateDbCache();
+                kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                try {
+                    const raw = kvGet(DB_BLOB_KEY);
+                    if (raw) {
+                        const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
+                        initChatStore(dbObj);
+                        const finalRaw = kvGet(DB_BLOB_KEY);
+                        if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                    }
+                } catch (e) {
+                    logger.warn('[Force restore] post-restore decode failed:', e?.message || e);
                 }
-            } catch (e) {
-                logger.warn('[Force restore] post-restore decode failed:', e?.message || e);
-            }
-        });
-        logger.info('[Force restore] Restored', data.length, 'bytes via admin endpoint');
-        res.json({ ok: true, bytes: data.length });
+            });
+            logger.info('[Force restore] Restored raw-db format', data.length, 'bytes via admin endpoint');
+            res.json({ ok: true, format: 'raw-db', bytes: data.length });
+        }
     } catch (err) { next(err); }
 });
 

@@ -50,6 +50,12 @@ export default defineConfig(({command, mode}) => {
       // produce sourcemaps for debug builds
       sourcemap: process.env.TAURI_ENV_DEBUG === 'true',
       chunkSizeWarningLimit: 2000,
+      rollupOptions: {
+        input: {
+          main: 'index.html',
+          settings: 'settings.html',
+        },
+      },
     },
     
     optimizeDeps:{

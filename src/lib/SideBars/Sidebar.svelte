@@ -531,13 +531,8 @@
   class="flex items-center justify-center py-2 flex-col gap-1 w-full"
   class:text-textcolor2={!$settingsOpen}
   onclick={() => {
-    if ($settingsOpen) {
-      reseter();
-      settingsOpen.set(false);
-    } else {
-      reseter();
-      settingsOpen.set(true);
-    }
+    reseter();
+    window.location.href = '/settings';
   }}
 >
   <Settings />
@@ -605,13 +600,8 @@
       <div class="absolute w-20 min-w-20 flex border-b-selected border-b bg-bgcolor flex-col items-center pt-2 rounded-b-md z-20 pb-2 max-h-[calc(100dvh-4rem)] overflow-x-hidden overflow-y-auto hamburger-menu">
         <BarIcon
         onClick={() => {
-          if ($settingsOpen) {
-            reseter();
-            settingsOpen.set(false);
-          } else {
-            reseter();
-            settingsOpen.set(true);
-          }
+          reseter();
+          window.location.href = '/settings';
         }}><Settings /></BarIcon
       >
       <div class="mt-2"></div>
@@ -930,13 +920,8 @@
       <div class="absolute bottom-full w-20 min-w-20 flex border-t-selected border-t bg-bgcolor flex-col items-center pt-2 rounded-t-md z-20 pb-2 max-h-[calc(100dvh-4rem)] overflow-x-hidden overflow-y-auto hamburger-menu">
         <BarIcon
         onClick={() => {
-          if ($settingsOpen) {
-            reseter();
-            settingsOpen.set(false);
-          } else {
-            reseter();
-            settingsOpen.set(true);
-          }
+          reseter();
+          window.location.href = '/settings';
         }}><Settings /></BarIcon
       >
       <div class="mt-2"></div>

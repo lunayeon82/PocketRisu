@@ -237,7 +237,7 @@
                 {/if}
                 {#if window.innerWidth < 700 && !$MobileGUI}
                     <button class="absolute top-2 right-2 hover:text-primary text-textcolor" onclick={() => {
-                        settingsOpen.set(false)
+                        window.location.pathname === '/settings' ? (window.location.href = '/') : settingsOpen.set(false)
                     }}> <CircleXIcon size={DBState.db.settingsCloseButtonSize} /> </button>
                 {/if}
             </div>
@@ -299,7 +299,7 @@
             {#if !$MobileGUI}
                 <button class="absolute top-2 right-2 hover:text-primary text-textcolor" onclick={() => {
                     if(window.innerWidth >= 700){
-                        settingsOpen.set(false)
+                        window.location.pathname === '/settings' ? (window.location.href = '/') : settingsOpen.set(false)
                     }
                     else{
                         $SettingsMenuIndex = -1
