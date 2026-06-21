@@ -19,6 +19,9 @@
         TriangleAlertIcon,
         RefreshCwIcon,
         TrashIcon,
+        CloudIcon,
+        LinkIcon,
+        Link2OffIcon,
     } from '@lucide/svelte'
     import { alertConfirm, alertError, alertWait, notifyError, notifySuccess } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
@@ -53,6 +56,16 @@
 
     let backupListEl = $state<ServerBackupList | undefined>(undefined)
     let backupSaving = $state(false)
+
+    // ── Google Drive state ───────────────────────────────────────────────────
+    interface GdriveLastBackup { ts: number; fileName: string; fileId: string }
+    interface GdriveStatus { configured: boolean; connected: boolean; lastBackup: GdriveLastBackup | null; hasFullScope: boolean | null }
+    interface GdriveFile { id: string; name: string; createdTime: string }
+    let gdriveStatus = $state<GdriveStatus | null>(null)
+    let gdriveBusy = $state(false)
+    let gdriveError = $state<string | null>(null)
+    let gdriveFiles = $state<GdriveFile[] | null>(null)
+    let gdriveFilesLoading = $state(false)
 
     let limits = $state<SnapshotLimits | null>(null)
     let limitsDialogOpen = $state(false)
@@ -315,6 +328,99 @@
         }
     }
 
+    // ── Google Drive actions ─────────────────────────────────────────────────
+    async function loadGdriveStatus() {
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/gdrive/status', { headers: { 'risu-auth': auth } })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            gdriveStatus = await res.json()
+        } catch (err) {
+            console.error('[GDrive status]', err)
+        }
+    }
+
+    async function connectGdrive() {
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/gdrive/auth-url', { headers: { 'risu-auth': auth } })
+            const json = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+            window.location.href = json.url
+        } catch (err) {
+            gdriveError = err instanceof Error ? err.message : String(err)
+        }
+    }
+
+    async function disconnectGdrive() {
+        if (!(await alertConfirm('Google Drive 연결을 해제하시겠습니까?'))) return
+        gdriveBusy = true
+        gdriveError = null
+        try {
+            const auth = await forageStorage.createAuth()
+            await fetch('/api/gdrive/disconnect', { method: 'DELETE', headers: { 'risu-auth': auth } })
+            await loadGdriveStatus()
+        } catch (err) {
+            gdriveError = err instanceof Error ? err.message : String(err)
+        } finally {
+            gdriveBusy = false
+        }
+    }
+
+    async function backupToGdrive() {
+        gdriveBusy = true
+        gdriveError = null
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/gdrive/backup', { method: 'POST', headers: { 'risu-auth': auth } })
+            const json = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+            notifySuccess(`Google Drive 백업 완료: ${json.fileName}`)
+            await Promise.all([loadGdriveStatus(), loadGdriveFiles()])
+        } catch (err) {
+            gdriveError = err instanceof Error ? err.message : String(err)
+        } finally {
+            gdriveBusy = false
+        }
+    }
+
+    async function loadGdriveFiles() {
+        gdriveFilesLoading = true
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/gdrive/files', { headers: { 'risu-auth': auth } })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            const json = await res.json()
+            gdriveFiles = json.files ?? []
+        } catch (err) {
+            console.error('[GDrive files]', err)
+            gdriveFiles = []
+        } finally {
+            gdriveFilesLoading = false
+        }
+    }
+
+    async function restoreFromGdrive(file: GdriveFile) {
+        if (!(await alertConfirm(language.backupLoadConfirm))) return
+        if (!(await alertConfirm(language.backupLoadConfirm2))) return
+        alertWait(language.serverBackupRestoring)
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/gdrive/restore', {
+                method: 'POST',
+                headers: { 'risu-auth': auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ fileId: file.id }),
+            })
+            const json = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+            notifySuccess('Google Drive 백업에서 복원 완료')
+            location.search = ''
+            location.reload()
+        } catch (err) {
+            alertError(err instanceof Error ? err.message : String(err))
+        }
+    }
+
     // ── Server backup actions ───────────────────────────────────────────────
     async function createServerBackup() {
         if (!(await alertConfirm(language.backupConfirm))) return
@@ -344,6 +450,16 @@
         loadLimits()
         loadBootReminder()
         loadStats()
+        loadGdriveStatus()
+        // Pick up ?gdriveConnected or ?gdriveError query params after OAuth redirect
+        const params = new URLSearchParams(window.location.search)
+        if (params.has('gdriveConnected')) {
+            notifySuccess('Google Drive 연결 완료!')
+            window.history.replaceState({}, '', window.location.pathname)
+        } else if (params.has('gdriveError')) {
+            gdriveError = 'Google Drive 연결 실패: ' + decodeURIComponent(params.get('gdriveError') ?? '')
+            window.history.replaceState({}, '', window.location.pathname)
+        }
     })
 </script>
 
@@ -508,6 +624,110 @@
         </div>
     </div>
 </div>
+
+<!-- Google Drive backup section ─────────────────────────────────────────── -->
+{#if gdriveStatus}
+<div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
+    <div class="flex items-center justify-between gap-2 mb-3">
+        <div class="flex items-center gap-2 text-textcolor">
+            <CloudIcon size={16} />
+            <span class="font-medium">Google Drive 백업</span>
+        </div>
+        {#if gdriveStatus.connected}
+            <span class="text-xs text-green-400 flex items-center gap-1">
+                <LinkIcon size={12} />연결됨
+            </span>
+        {/if}
+    </div>
+
+    {#if !gdriveStatus.configured}
+        <p class="text-textcolor2 text-sm leading-relaxed">
+            Google Drive 백업을 사용하려면 서버에 <code class="bg-bgcolor px-1 rounded text-xs">GDRIVE_CLIENT_ID</code>와
+            <code class="bg-bgcolor px-1 rounded text-xs">GDRIVE_CLIENT_SECRET</code> 환경변수를 설정해야 합니다.
+        </p>
+    {:else if !gdriveStatus.connected}
+        <p class="text-textcolor2 text-sm leading-relaxed mb-3">
+            Google Drive와 연결하면 5분마다 자동으로 백업되고, 버튼으로 즉시 백업할 수 있습니다.
+        </p>
+        <ShButton variant="primary" onclick={connectGdrive} disabled={gdriveBusy}>
+            <LinkIcon size={14} />
+            Google Drive 연결
+        </ShButton>
+    {:else}
+        {#if gdriveStatus.hasFullScope === false}
+            <div class="bg-yellow-900/30 border border-yellow-700/40 rounded-md px-4 py-3 mb-3 flex items-start gap-2.5 text-yellow-300">
+                <TriangleAlertIcon class="size-4 shrink-0 text-yellow-400 mt-0.5" />
+                <span class="leading-relaxed text-sm">
+                    <strong>권한 부족:</strong> 현재 연결은 앱이 직접 만든 파일만 접근 가능합니다.
+                    수동으로 추가한 파일을 불러오려면 <strong>연결 해제</strong> 후 다시 연결하세요.
+                </span>
+            </div>
+        {/if}
+        <p class="text-textcolor2 text-sm leading-relaxed mb-3">
+            변경 사항이 있을 때 5분마다 자동 백업됩니다. Google Drive의 <strong>PocketRisu Backups</strong> 폴더에 저장됩니다.
+        </p>
+        {#if gdriveStatus.lastBackup}
+            <p class="text-textcolor2 text-xs mb-3">
+                마지막 백업: {new Date(gdriveStatus.lastBackup.ts).toLocaleString()}
+                ({gdriveStatus.lastBackup.fileName})
+            </p>
+        {:else}
+            <p class="text-textcolor2 text-xs mb-3">아직 백업된 기록이 없습니다.</p>
+        {/if}
+        <div class="flex items-center gap-2 mb-4">
+            <ShButton variant="primary" onclick={backupToGdrive} disabled={gdriveBusy}>
+                <CloudIcon size={14} />
+                {gdriveBusy ? '백업 중...' : '지금 백업'}
+            </ShButton>
+            <ShButton variant="outline" onclick={disconnectGdrive} disabled={gdriveBusy}>
+                <Link2OffIcon size={14} />
+                연결 해제
+            </ShButton>
+        </div>
+
+        <!-- Drive 백업 파일 목록 -->
+        <div class="border border-darkborderc/50 rounded-md bg-bgcolor/50">
+            <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-darkborderc/50">
+                <span class="text-textcolor2 text-xs font-medium">Drive 백업 목록 (최대 10개)</span>
+                <ShButton variant="outline" size="xs"
+                    onclick={() => { gdriveFiles === null ? loadGdriveFiles() : loadGdriveFiles() }}
+                    disabled={gdriveFilesLoading}>
+                    <RefreshCwIcon size={12} class={gdriveFilesLoading ? 'animate-spin' : ''} />
+                    {gdriveFiles === null ? '목록 불러오기' : '새로고침'}
+                </ShButton>
+            </div>
+            {#if gdriveFiles === null}
+                <p class="text-textcolor2 text-xs px-3 py-2">버튼을 눌러 목록을 불러오세요.</p>
+            {:else if gdriveFiles.length === 0}
+                <p class="text-textcolor2 text-xs px-3 py-2">백업 파일이 없습니다.</p>
+            {:else}
+                {#each gdriveFiles as file, i (file.id)}
+                    <div class="flex items-center gap-3 px-3 py-2 {i > 0 ? 'border-t border-darkborderc/50' : ''}">
+                        <div class="flex flex-col min-w-0 flex-1">
+                            <span class="text-sm text-textcolor truncate">{file.name}</span>
+                            <span class="text-xs text-textcolor2">{new Date(file.createdTime).toLocaleString()}</span>
+                        </div>
+                        <button
+                            class="text-textcolor2 hover:text-primary cursor-pointer shrink-0"
+                            title="이 백업으로 복원"
+                            aria-label="복원"
+                            onclick={() => restoreFromGdrive(file)}>
+                            <RotateCcwIcon size={16} />
+                        </button>
+                    </div>
+                {/each}
+            {/if}
+        </div>
+    {/if}
+
+    {#if gdriveError}
+        <ShAlert variant="destructive" className="mt-3">
+            {#snippet icon()}<TriangleAlertIcon />{/snippet}
+            {gdriveError}
+        </ShAlert>
+    {/if}
+</div>
+{/if}
 
 <!-- Path-change dialog ──────────────────────────────────────────────────── -->
 <ShDialog bind:open={pathDialogOpen} size="lg">

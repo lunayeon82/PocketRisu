@@ -32,6 +32,8 @@ const {
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
+let gdriveBackup;
+try { gdriveBackup = require('./gdrive-backup.cjs'); } catch { /* gdrive module unavailable */ }
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -6139,6 +6141,116 @@ app.post('/api/tunnel/stop', async (req, res) => {
     res.json({ status: 'off' });
 });
 
+// ─── Google Drive backup routes ──────────────────────────────────────────────
+
+app.get('/api/gdrive/status', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (!gdriveBackup) return res.json({ configured: false, connected: false, lastBackup: null });
+    res.json(await gdriveBackup.getStatus());
+});
+
+app.get('/api/gdrive/auth-url', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
+    const redirectUri = gdriveBackup.getRedirectUri(req);
+    kvSet('config/gdrive-pending-redirect', Buffer.from(redirectUri));
+    res.json({ url: gdriveBackup.buildAuthUrl(redirectUri) });
+});
+
+app.get('/api/gdrive/callback', async (req, res) => {
+    if (!gdriveBackup?.isConfigured()) return res.status(501).send('Google Drive not configured');
+    const { code, error } = req.query;
+    if (error || !code) {
+        return res.redirect('/?gdriveError=' + encodeURIComponent(error || 'no_code'));
+    }
+    try {
+        // Use the stored redirectUri so it exactly matches what was sent to Google
+        const pendingRaw = kvGet('config/gdrive-pending-redirect');
+        const redirectUri = pendingRaw ? pendingRaw.toString('utf-8') : gdriveBackup.getRedirectUri(req);
+        kvDel('config/gdrive-pending-redirect');
+        const tokens = await gdriveBackup.exchangeCode(String(code), redirectUri);
+        if (!tokens.refresh_token) {
+            return res.redirect('/?gdriveError=no_refresh_token');
+        }
+        gdriveBackup.saveTokens({
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expiry_date: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        });
+        res.redirect('/?gdriveConnected=1');
+    } catch (err) {
+        logger.error('[GDrive] OAuth callback error:', err?.message || err);
+        res.redirect('/?gdriveError=' + encodeURIComponent(err?.message || 'unknown'));
+    }
+});
+
+app.post('/api/gdrive/backup', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
+    try {
+        const result = await gdriveBackup.performBackup(async () => {
+            await flushPendingDb();
+            return kvGet('database/database.bin');
+        });
+        res.json({ ok: true, ...result });
+    } catch (err) {
+        logger.error('[GDrive] Manual backup error:', err?.message || err);
+        res.status(500).json({ error: err?.message || 'Backup failed' });
+    }
+});
+
+app.delete('/api/gdrive/disconnect', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (!gdriveBackup) return res.json({ ok: true });
+    gdriveBackup.deleteTokens();
+    res.json({ ok: true });
+});
+
+app.get('/api/gdrive/files', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
+    try {
+        const accessToken = await gdriveBackup.getValidAccessToken();
+        // Ensure folder exists (creates it if needed) so listing always works
+        const folderId = await gdriveBackup.getOrCreateFolder(accessToken);
+        const files = await gdriveBackup.listBackupFiles(accessToken, folderId);
+        res.json({ files });
+    } catch (err) {
+        res.status(500).json({ error: err?.message || 'Failed to list files' });
+    }
+});
+
+app.post('/api/gdrive/restore', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
+    try {
+        const fileId = typeof req.body?.fileId === 'string' ? req.body.fileId.trim() : '';
+        if (!fileId) return res.status(400).json({ error: 'fileId required' });
+        const accessToken = await gdriveBackup.getValidAccessToken();
+        const data = await gdriveBackup.downloadFile(accessToken, fileId);
+        if (!data || data.length < 10) return res.status(400).json({ error: 'Downloaded file appears empty or invalid' });
+        await queueStorageOperation(async () => {
+            await flushPendingDb();
+            kvSet(DB_BLOB_KEY, data);
+            invalidateDbCache();
+            kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            try {
+                const raw = kvGet(DB_BLOB_KEY);
+                if (raw) {
+                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
+                    initChatStore(dbObj);
+                    const finalRaw = kvGet(DB_BLOB_KEY);
+                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                }
+            } catch (e) {
+                logger.warn('[GDrive restore] post-restore decode failed:', e?.message || e);
+            }
+        });
+        res.json({ ok: true });
+    } catch (err) { next(err); }
+});
+
 // ─── Express error middleware — must be registered after all routes ─────────
 app.use(expressErrorMiddleware);
 app.use((err, req, res, next) => {
@@ -6245,5 +6357,21 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         try { checkpointWal('TRUNCATE'); }
         catch { /* non-fatal */ }
     }, 5 * 60 * 1000); // every 5 minutes
+
+    // Periodic Google Drive backup — runs only if configured, connected, and DB changed.
+    setInterval(async () => {
+        if (!gdriveBackup?.isConfigured()) return;
+        if (!gdriveBackup?.loadTokens()?.refresh_token) return;
+        if (!gdriveBackup?.isDbNewerThanLastBackup()) return;
+        try {
+            const result = await gdriveBackup.performBackup(async () => {
+                await flushPendingDb();
+                return kvGet('database/database.bin');
+            });
+            logger.info(`[GDrive] Auto-backup: ${result.fileName}`);
+        } catch (err) {
+            logger.error('[GDrive] Auto-backup failed:', err?.message || err);
+        }
+    }, 5 * 60 * 1000);
 
 })();
