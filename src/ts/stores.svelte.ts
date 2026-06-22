@@ -22,6 +22,10 @@ export const SizeStore = writable({
 })
 
 export const loadedStore = writable(false)
+// Set true only by the chat.html entry (chat-main.ts). Lets shared screen
+// components (e.g. DefaultChatScreen's home view) render a stripped-down
+// layout there without changing index.html's default behavior.
+export const excelHomeMode = writable(false)
 export const isTouchDevice = writable(typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches)
 export const DynamicGUI = writable(false)
 export const sideBarClosing = writable(false)

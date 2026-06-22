@@ -2,7 +2,7 @@
     import { getCustomBackground, getEmotion } from "../../ts/util";
     
     import { DBState } from 'src/ts/stores.svelte';
-    import { CharEmotion, selectedCharID, openModuleListStore } from "../../ts/stores.svelte";
+    import { CharEmotion, selectedCharID, openModuleListStore, excelHomeMode } from "../../ts/stores.svelte";
     import ResizeBox from './ResizeBox.svelte'
     import DefaultChatScreen from "./DefaultChatScreen.svelte";
     import defaultWallpaper from '../../etc/bg.jpg'
@@ -41,7 +41,9 @@
 
 {#if DBState.db.theme === 'waifu'}
     <div class="grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
-        <SideBarArrow />
+        {#if !$excelHomeMode}
+            <SideBarArrow />
+        {/if}
         <BackgroundDom />
         {#if $selectedCharID >= 0}
             {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
@@ -56,7 +58,9 @@
     </div>
 {:else if DBState.db.theme === 'waifuMobile'}
     <div class="grow h-full relative" style={bgImg.length < 4 ? wallPaper : bgImg}>
-        <SideBarArrow />
+        {#if !$excelHomeMode}
+            <SideBarArrow />
+        {/if}
         <BackgroundDom />
         <div class="w-full absolute z-10 bottom-0 left-0"
             class:per33={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
@@ -74,7 +78,9 @@
     </div>
 {:else}
     <div class="grow h-full min-w-0 relative justify-center flex">
-        <SideBarArrow />
+        {#if !$excelHomeMode}
+            <SideBarArrow />
+        {/if}
         <BackgroundDom />
         <div style={bgImg} class="h-full w-full" class:max-w-6xl={DBState.db.classicMaxWidth}>
             {#if $selectedCharID >= 0}

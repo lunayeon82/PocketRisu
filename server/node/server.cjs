@@ -2467,6 +2467,18 @@ app.get('/settings', async (req, res, next) => {
     }
 })
 
+app.get('/chat', async (req, res, next) => {
+    try {
+        const html = await fs.readFile(path.join(process.cwd(), 'dist', 'chat.html'))
+        const root = htmlparser.parse(html)
+        const head = root.querySelector('head')
+        head.innerHTML = `<script>globalThis.__NODE__ = true; globalThis.__PATCH_SYNC__ = ${enablePatchSync}</script>` + head.innerHTML
+        res.send(root.toString())
+    } catch (error) {
+        next(error)
+    }
+})
+
 async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = false} = {}){
     try {
         const authHeader = req.headers['risu-auth'];

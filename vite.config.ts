@@ -54,6 +54,7 @@ export default defineConfig(({command, mode}) => {
         input: {
           main: 'index.html',
           settings: 'settings.html',
+          chat: 'chat.html',
         },
       },
     },
