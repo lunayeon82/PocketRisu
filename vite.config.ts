@@ -56,6 +56,26 @@ export default defineConfig(({command, mode}) => {
           settings: 'settings.html',
           chat: 'chat.html',
         },
+        output: {
+          manualChunks(id) {
+            if (!id.includes('node_modules')) return
+            // Only katex/highlight.js: both are already eager (imported at the
+            // top of parser.svelte.ts, the core chat parser), so isolating them
+            // just moves their bytes out of the app-code chunk for caching/
+            // parallelism — no laziness to preserve, so no risk.
+            //
+            // monaco-editor/wasmoon/transformers/web-llm/pyodide/pdfjs-dist/three
+            // are deliberately NOT bucketed here: they're only ever reached via
+            // dynamic import(), and Rollup's default splitting already isolates
+            // them into their own async chunks correctly. Naming them explicitly
+            // was tried and caused Rollup to statically link those chunks into
+            // the eager graph (confirmed via build: vendor-monaco and
+            // vendor-wasmoon both ended up modulepreloaded on every entry,
+            // undoing the wasmoon lazy-load fix) — so leave them alone.
+            if (id.includes('/katex/')) return 'vendor-katex'
+            if (id.includes('highlight.js')) return 'vendor-highlight'
+          },
+        },
       },
     },
     
