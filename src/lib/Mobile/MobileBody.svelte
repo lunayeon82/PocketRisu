@@ -1,6 +1,6 @@
 <script lang="ts">
     import { MobileGUIStack, MobileSearch, MobileSideBar, selectedCharID } from "src/ts/stores.svelte";
-    import Settings from "../Setting/Settings.svelte";
+    import { loadSettings } from "../Setting/lazySettings";
     import RealmMain from "../UI/Realm/RealmMain.svelte";
     import MobileCharacters from "./MobileCharacters.svelte";
     import ChatScreen from "../ChatScreens/ChatScreen.svelte";
@@ -51,6 +51,11 @@
     {:else if $MobileGUIStack === 1}
         <MobileCharacters search={$MobileSearch} />
     {:else if $MobileGUIStack === 2}
-        <Settings />
+        {#await loadSettings()}
+            <div class="w-full h-full flex justify-center items-center text-textcolor2">Loading...</div>
+        {:then module}
+            {@const SettingsComp = module.default}
+            <SettingsComp />
+        {/await}
     {/if}
 </div>

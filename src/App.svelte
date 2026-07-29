@@ -7,7 +7,7 @@
     import RealmPopUp from './lib/UI/Realm/RealmPopUp.svelte';
     import GridChars from './lib/Others/GridCatalog.svelte';
     import BookmarkList from './lib/Others/BookmarkList.svelte';
-    import Settings from './lib/Setting/Settings.svelte';
+    import { loadSettings } from './lib/Setting/lazySettings';
     import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { readModule } from './ts/process/modules';
@@ -181,7 +181,20 @@
             <span class="text-sm mt-2 text-textcolor2">{LoadingStatusState.text}</span>
         </div>
     {:else if $settingsOpen}
-        <Settings />
+        {#await loadSettings()}
+            <div class="w-full h-full flex justify-center items-center text-textcolor text-xl bg-gray-900 flex-col">
+                <div class="flex flex-row items-center">
+                    <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-textcolor" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    <span>Loading...</span>
+                </div>
+            </div>
+        {:then module}
+            {@const SettingsComp = module.default}
+            <SettingsComp />
+        {/await}
     {:else if $MobileGUI}
         <div class="w-full h-full flex flex-col">
             <MobileHeader />
