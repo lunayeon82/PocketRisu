@@ -1,5 +1,6 @@
 <script lang="ts">
 
+    import { fade } from 'svelte/transition';
     import Suggestion from './Suggestion.svelte';
     import { CameraIcon, ChevronUpIcon, ChevronDownIcon, ChevronsUpIcon, ChevronsDownIcon, DatabaseIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, ZapIcon, Maximize2, Minimize2 } from "@lucide/svelte";
     import ShDropdownMenu from 'src/lib/UI/GUI/ShDropdownMenu.svelte';
@@ -899,7 +900,7 @@ import { isMobile } from 'src/ts/platform'
             {/await}
         {/if}
     {:else if $chatDeselected}
-        <div class="h-full w-full flex items-center justify-center text-textcolor2">
+        <div class="h-full w-full flex items-center justify-center text-textcolor2" transition:fade={{ duration: 150 }}>
             <span>{language.selectChatToView}</span>
         </div>
     {:else if !currentChatReady}
@@ -907,7 +908,7 @@ import { isMobile } from 'src/ts/platform'
              history not yet hydrated from the server) — show a loading state
              instead of the full composer, so it can't briefly render as if this
              were a fresh empty chat before the real history replaces it. -->
-        <div class="h-full w-full flex flex-col items-center justify-center gap-3 text-textcolor2">
+        <div class="h-full w-full flex flex-col items-center justify-center gap-3 text-textcolor2" transition:fade={{ duration: 150 }}>
             <svg class="animate-spin h-6 w-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
@@ -1214,6 +1215,7 @@ import { isMobile } from 'src/ts/platform'
             class:nodeonly-standard={DBState.db.theme === ''}
             class:no-chat-width-wide={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'wide'}
             class:no-chat-width-full={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'full'}
+            transition:fade={{ duration: 150 }}
             onscroll={(e) => {
             if (DBState.db.nodeOnlyScrollButtonType !== 'off') {
                 bumpScrollNav()

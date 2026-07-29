@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { fade } from 'svelte/transition';
     import { ParseMarkdown, risuChatParser } from "src/ts/parser/parser.svelte";
     import { type character } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
@@ -12,9 +13,9 @@
 
 {#if backgroundHTML || $moduleBackgroundEmbedding}
     {#if selIdState.selId > -1}
-        {#key $ReloadGUIPointer}
-            <div class="absolute top-0 left-0 w-full h-full">
-                {#await ParseMarkdown(risuChatParser((backgroundHTML || '') + '\n' + ($moduleBackgroundEmbedding || ''), {chara:currentChar}), currentChar, 'back') then md} 
+        {#key `${selIdState.selId}-${$ReloadGUIPointer}`}
+            <div class="absolute top-0 left-0 w-full h-full" transition:fade={{ duration: 175 }}>
+                {#await ParseMarkdown(risuChatParser((backgroundHTML || '') + '\n' + ($moduleBackgroundEmbedding || ''), {chara:currentChar}), currentChar, 'back') then md}
                     {@html md}
                 {/await}
             </div>
