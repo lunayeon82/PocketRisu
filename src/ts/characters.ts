@@ -2,7 +2,7 @@ import { get, writable } from "svelte/store";
 import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat, newChatModelDefaults } from "./storage/database.svelte";
 import { ensureChatHydrated } from "./storage/chatStorage";
 import { alertAddCharacter, alertConfirm, alertError, alertSelect, alertStore, alertWait, notifySuccess, notifyInfo } from "./alert";
-import { loadingOverlayStore, chatDeselected } from "./stores.svelte";
+import { chatDeselected } from "./stores.svelte";
 import { language } from "../lang";
 import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
@@ -779,14 +779,10 @@ export function changeChar(index: number, arg:{
             const capturedIndex = index
             const capturedChatId = chat.id
             if(char){
-                let cancelled = false
-                loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: () => {
-                    cancelled = true
-                    chatDeselected.set(true)
-                    loadingOverlayStore.set({ active: false, text: '', onCancel: null })
-                }})
+                // No overlay here: DefaultChatScreen renders an inline skeleton
+                // for a placeholder chat.chats[i], driven reactively by the same
+                // _placeholder flag ensureChatHydrated flips off in place.
                 void ensureChatHydrated(char.chats, char.chatPage, char.chaId).then((hydrated) => {
-                    if(cancelled) return
                     const currentChar = getDatabase().characters[capturedIndex]
                     const activeChatId = currentChar?.chats?.[currentChar.chatPage]?.id
                     if(hydrated && get(selectedCharID) === capturedIndex && activeChatId === capturedChatId) {
@@ -794,8 +790,6 @@ export function changeChar(index: number, arg:{
                     }
                 }).catch((e) => {
                     console.error('[selectCharacter] hydration failed:', e)
-                }).finally(() => {
-                    if(!cancelled) loadingOverlayStore.set({ active: false, text: '', onCancel: null })
                 })
             }
         } else {
