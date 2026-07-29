@@ -14,10 +14,12 @@ jobs:
           username: ubuntu
           key: ${{ secrets.SSH_KEY }}
           script: |
+            set -euo pipefail
             cd ~/PocketRisu
             git pull origin main
             pnpm install
             pnpm build
+            test -f dist/index.html || { echo "Build failed: dist/index.html missing, aborting deploy"; exit 1; }
             cd server/node
             npm install
             /usr/bin/pm2 restart risu
