@@ -24,6 +24,7 @@
         ScrollTextIcon,
         FilterIcon,
         TerminalIcon,
+        ShieldCheckIcon,
     } from '@lucide/svelte'
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
@@ -359,6 +360,26 @@
         if ($SystemSubmenuIndex !== 2) return
         loadInitial()
     })
+
+    // ── Account tab (site login gate, rl_users — separate from RisuAI's own
+    // password below) ──────────────────────────────────────────────────────
+    let meUsername = $state<string | null>(null)
+    let meIsAdmin = $state(false)
+
+    async function loadWhoami() {
+        try {
+            const res = await fetch('/api/auth/whoami')
+            if (!res.ok) return
+            const json = await res.json()
+            meUsername = json.username
+            meIsAdmin = !!json.isAdmin
+        } catch { /* non-critical — links still render, just without the admin gate */ }
+    }
+
+    $effect(() => {
+        if ($SystemSubmenuIndex !== 4) return
+        loadWhoami()
+    })
 </script>
 
 <SettingPage title={language.system}>
@@ -367,6 +388,7 @@
         { label: language.systemBackups, value: 1 },
         { label: language.systemLogs, value: 2 },
         { label: language.pluginStorageTab, value: 3 },
+        { label: language.accountTab, value: 4 },
     ]} bind:selected={$SystemSubmenuIndex} />
 
     {#if $SystemSubmenuIndex === 0}
@@ -614,5 +636,25 @@
     {/if}
     {:else if $SystemSubmenuIndex === 3}
     <PluginStorageViewer />
+    {:else if $SystemSubmenuIndex === 4}
+    <p class="text-textcolor2 text-sm mb-4">{language.accountDesc}</p>
+    <div class="flex flex-col gap-3 max-w-sm">
+        <div class="flex items-center gap-2 text-sm">
+            <span class="text-textcolor2">{language.accountLoggedInAs}</span>
+            <span class="font-medium">{meUsername ?? '...'}</span>
+            {#if meIsAdmin}
+            <ShBadge variant="info">{language.accountAdminBadge}</ShBadge>
+            {/if}
+        </div>
+        {#if meIsAdmin}
+        <ShButton variant="outline" href="/admin">
+            <ShieldCheckIcon size={16} />
+            {language.accountAdminPage}
+        </ShButton>
+        {/if}
+        <ShButton variant="destructive" href="/api/auth/logout">
+            {language.logout}
+        </ShButton>
+    </div>
     {/if}
 </SettingPage>

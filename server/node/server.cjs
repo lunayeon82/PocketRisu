@@ -3056,6 +3056,13 @@ app.get('/api/auth/logout', (req, res) => {
     res.redirect(302, '/login')
 })
 
+// Lets the frontend show/hide account UI (username, admin link) without
+// exposing anything not already implied by having a valid session cookie.
+app.get('/api/auth/whoami', (req, res) => {
+    const session = getSession(req)
+    res.json({ username: session.username, isAdmin: isAdmin(session.username) })
+})
+
 // ── Account management (admin only, except self password change) ──────────
 app.get('/admin', requireAdmin, (req, res) => {
     res.send(adminPageHtml(listUsers(), getSession(req).username))
