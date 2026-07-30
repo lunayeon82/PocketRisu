@@ -27,6 +27,10 @@ const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
 const {
+    bootstrapAdmin, verifyCredentials, createSession, destroySession, getSession,
+    setSessionCookie, clearSessionCookie, requireLogin, loginPageHtml,
+} = require('./authGate.cjs');
+const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
@@ -755,6 +759,14 @@ function shouldCompress(req, res) {
     return compression.filter(req, res);
 }
 
+// Nginx terminates TLS and proxies over plain HTTP; trust its
+// X-Forwarded-Proto so req.secure (used for the login cookie's Secure flag)
+// reflects the real client connection.
+app.set('trust proxy', 1);
+// Login gate: mounted before compression/static so nothing — not even
+// hashed JS/CSS assets — is reachable without a session. See authGate.cjs.
+app.use(requireLogin);
+
 app.use(compression({
     filter: shouldCompress,
 }));
@@ -771,6 +783,7 @@ app.use((req, res, next) => {
     return express.raw({ type: 'application/octet-stream', limit: '2gb' })(req, res, next);
 });
 app.use(express.text({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: false })); // login form POST
 const {pipeline} = require('stream/promises')
 const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
 const hubURL = 'https://sv.risuai.xyz';
@@ -3014,6 +3027,32 @@ app.get('/api/test_auth', async(req, res) => {
     else{
         res.send({status: 'success', token: createServerJwt()})
     }
+})
+
+// ── Login gate routes (rl_users) ────────────────────────────────────────────
+// Independent from /api/login above (RisuAI's own single-password JWT).
+// This is the outer wall: nothing past requireLogin renders without it.
+app.get('/login', (req, res) => {
+    if (getSession(req)) return res.redirect(302, '/')
+    res.send(loginPageHtml(!!req.query.error))
+})
+
+app.post('/api/auth/login', loginRouteLimiter, async (req, res) => {
+    const { username, password: pw } = req.body || {}
+    const ok = await verifyCredentials(username, pw)
+    if (!ok) {
+        return res.redirect(302, '/login?error=1')
+    }
+    const { token, expiresAt } = createSession(username)
+    setSessionCookie(req, res, token, expiresAt)
+    res.redirect(302, '/')
+})
+
+app.get('/api/auth/logout', (req, res) => {
+    const session = getSession(req)
+    if (session) destroySession(session.token)
+    clearSessionCookie(res)
+    res.redirect(302, '/login')
 })
 
 app.post('/api/login', loginRouteLimiter, async (req, res) => {
@@ -6392,6 +6431,7 @@ async function getHttpsOptions() {
 
 async function startServer() {
     try {
+        await bootstrapAdmin();
         await migrateInlaysToFilesystem();
         await migrateRemoteBlocksIfNeeded();
         const port = process.env.PORT || 6001;
