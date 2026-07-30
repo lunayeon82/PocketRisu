@@ -45,12 +45,26 @@ sharedDb.exec(`
   )
 `);
 
+// Added after the initial rl_users rollout — guard with table_info so
+// existing deploys upgrade in place instead of erroring on re-run.
+const rlUsersColumns = sharedDb.prepare(`PRAGMA table_info(rl_users)`).all();
+if (!rlUsersColumns.some((c) => c.name === 'is_admin')) {
+    sharedDb.exec(`ALTER TABLE rl_users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`);
+}
+
 const stmtCountUsers = sharedDb.prepare(`SELECT COUNT(*) as n FROM rl_users`);
+const stmtCountAdmins = sharedDb.prepare(`SELECT COUNT(*) as n FROM rl_users WHERE is_admin = 1`);
 const stmtGetUser = sharedDb.prepare(`SELECT * FROM rl_users WHERE username = ?`);
-const stmtInsertUser = sharedDb.prepare(`INSERT INTO rl_users (username, password_hash, created_at) VALUES (?, ?, ?)`);
+const stmtGetUserById = sharedDb.prepare(`SELECT * FROM rl_users WHERE id = ?`);
+const stmtListUsers = sharedDb.prepare(`SELECT id, username, is_admin, created_at FROM rl_users ORDER BY id`);
+const stmtInsertUser = sharedDb.prepare(`INSERT INTO rl_users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)`);
+const stmtDeleteUser = sharedDb.prepare(`DELETE FROM rl_users WHERE id = ?`);
+const stmtUpdatePasswordHash = sharedDb.prepare(`UPDATE rl_users SET password_hash = ? WHERE id = ?`);
 
 // Creates the first account from ADMIN_USER/ADMIN_PASS if rl_users is still
 // empty. No-op once any account exists — safe to leave the env vars set.
+// This is the only way an admin account gets created — the management API
+// only ever creates non-admin accounts.
 async function bootstrapAdmin() {
     const { n } = stmtCountUsers.get();
     if (n > 0) return;
@@ -63,8 +77,8 @@ async function bootstrapAdmin() {
     }
 
     const hash = await bcrypt.hash(adminPass, BCRYPT_ROUNDS);
-    stmtInsertUser.run(adminUser, hash, Date.now());
-    console.log(`[AuthGate] Created initial account '${adminUser}'.`);
+    stmtInsertUser.run(adminUser, hash, 1, Date.now());
+    console.log(`[AuthGate] Created initial admin account '${adminUser}'.`);
 }
 
 async function verifyCredentials(username, password) {
@@ -72,6 +86,39 @@ async function verifyCredentials(username, password) {
     const row = stmtGetUser.get(username);
     if (!row) return false;
     return bcrypt.compare(password, row.password_hash);
+}
+
+function isAdmin(username) {
+    const row = stmtGetUser.get(username);
+    return !!row && !!row.is_admin;
+}
+
+function listUsers() {
+    return stmtListUsers.all();
+}
+
+function getUserById(id) {
+    return stmtGetUserById.get(id);
+}
+
+function countAdmins() {
+    return stmtCountAdmins.get().n;
+}
+
+// Always creates a non-admin account — admin status is only ever granted via
+// bootstrapAdmin(). Throws (SQLITE_CONSTRAINT) if the username is taken.
+async function createUser(username, password) {
+    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    stmtInsertUser.run(username, hash, 0, Date.now());
+}
+
+function deleteUserById(id) {
+    stmtDeleteUser.run(id);
+}
+
+async function updateUserPassword(id, newPassword) {
+    const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    stmtUpdatePasswordHash.run(hash, id);
 }
 
 // ── Session store ────────────────────────────────────────────────────────
@@ -125,6 +172,15 @@ function destroySession(token) {
     saveSessions();
 }
 
+// Logs a user out of every active session — used after their account is
+// deleted or their password is changed, so a stale cookie can't linger.
+function destroySessionsForUsername(username) {
+    for (const [token, data] of sessions) {
+        if (data.username === username) sessions.delete(token);
+    }
+    saveSessions();
+}
+
 function getSession(req) {
     const token = parseCookie(req, SESSION_COOKIE);
     if (!token) return null;
@@ -154,6 +210,19 @@ function requireLogin(req, res, next) {
         res.redirect(302, '/login');
     } else {
         res.status(401).json({ error: 'Unauthorized' });
+    }
+}
+
+// Runs after requireLogin — assumes a valid session already exists.
+function requireAdmin(req, res, next) {
+    const session = getSession(req);
+    if (session && isAdmin(session.username)) return next();
+
+    const acceptsHtml = (req.headers.accept || '').includes('text/html');
+    if (acceptsHtml) {
+        res.redirect(302, '/');
+    } else {
+        res.status(403).json({ error: 'Forbidden' });
     }
 }
 
@@ -190,14 +259,150 @@ function loginPageHtml(showError) {
 </html>`;
 }
 
+function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+}
+
+// ── Admin page ───────────────────────────────────────────────────────────
+// Same standalone-inline-page approach as loginPageHtml, plus a small inline
+// <script> driving fetch() calls to the /api/auth/users endpoints.
+function adminPageHtml(users, currentUsername) {
+    const rows = users.map((u) => {
+        const isSelf = u.username === currentUsername;
+        const isLastAdmin = !!u.is_admin && users.filter((x) => x.is_admin).length <= 1;
+        const deleteDisabled = isSelf || isLastAdmin ? 'disabled' : '';
+        const deleteTitle = isSelf ? 'title="본인 계정은 삭제할 수 없습니다"' : (isLastAdmin ? 'title="마지막 관리자는 삭제할 수 없습니다"' : '');
+        return `<tr>
+  <td>${escapeHtml(u.username)}${isSelf ? ' <span class="you">(나)</span>' : ''}</td>
+  <td>${u.is_admin ? '관리자' : '일반'}</td>
+  <td>${new Date(u.created_at).toLocaleDateString('ko-KR')}</td>
+  <td>
+    <form class="inline" data-action="password" data-id="${u.id}">
+      <input type="password" name="password" placeholder="새 비밀번호" autocomplete="new-password" required minlength="1">
+      <button type="submit">변경</button>
+    </form>
+  </td>
+  <td>
+    <form class="inline" data-action="delete" data-id="${u.id}">
+      <button type="submit" class="danger" ${deleteDisabled} ${deleteTitle}>삭제</button>
+    </form>
+  </td>
+</tr>`;
+    }).join('\n');
+
+    return `<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin — PocketRisu</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #111; color: #eee; }
+  h1 { font-size: 1.3rem; margin: 0 0 1.5rem; }
+  a { color: #8fa2ff; }
+  table { width: 100%; max-width: 48rem; border-collapse: collapse; margin-bottom: 2rem; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #333; font-size: 0.9rem; vertical-align: middle; }
+  th { color: #999; font-weight: 500; }
+  .you { color: #999; font-size: 0.8rem; }
+  form.inline { display: flex; gap: 0.4rem; margin: 0; }
+  input { padding: 0.4rem 0.5rem; border-radius: 0.25rem; border: 1px solid #444; background: #0d0d0d; color: #eee; font-size: 0.9rem; width: 9rem; }
+  button { padding: 0.4rem 0.75rem; border-radius: 0.25rem; border: none; background: #4a5eff; color: #fff; cursor: pointer; font-size: 0.9rem; }
+  button.danger { background: #a83a3a; }
+  button:disabled { background: #333; color: #777; cursor: not-allowed; }
+  .add-form { display: flex; gap: 0.5rem; align-items: flex-end; max-width: 30rem; margin-bottom: 1rem; }
+  .add-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: #999; }
+  .msg { min-height: 1.2rem; font-size: 0.85rem; margin-bottom: 1rem; }
+  .msg.error { color: #ff6b6b; }
+  .msg.ok { color: #6bcb77; }
+</style>
+</head>
+<body>
+<h1>계정 관리 <a href="/">← 앱으로</a></h1>
+
+<table>
+  <thead><tr><th>사용자</th><th>권한</th><th>생성일</th><th>비밀번호 변경</th><th></th></tr></thead>
+  <tbody id="user-rows">
+${rows}
+  </tbody>
+</table>
+
+<form class="add-form" id="add-form">
+  <label>사용자명 <input type="text" name="username" autocomplete="off" required></label>
+  <label>비밀번호 <input type="password" name="password" autocomplete="new-password" required minlength="1"></label>
+  <button type="submit">계정 추가</button>
+</form>
+<div class="msg" id="msg"></div>
+
+<script>
+const msgEl = document.getElementById('msg');
+function showMsg(text, isError) {
+  msgEl.textContent = text;
+  msgEl.className = 'msg ' + (isError ? 'error' : 'ok');
+}
+async function callApi(url, options) {
+  const res = await fetch(url, options);
+  let body = {};
+  try { body = await res.json(); } catch {}
+  if (!res.ok) throw new Error(body.error || ('요청 실패 (' + res.status + ')'));
+  return body;
+}
+document.getElementById('add-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    await callApi('/api/auth/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }),
+    });
+    location.reload();
+  } catch (err) { showMsg(err.message, true); }
+});
+document.getElementById('user-rows').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const id = form.dataset.id;
+  const action = form.dataset.action;
+  try {
+    if (action === 'delete') {
+      await callApi('/api/auth/users/' + id, { method: 'DELETE' });
+    } else if (action === 'password') {
+      const fd = new FormData(form);
+      await callApi('/api/auth/users/' + id + '/password', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: fd.get('password') }),
+      });
+    }
+    location.reload();
+  } catch (err) { showMsg(err.message, true); }
+});
+</script>
+</body>
+</html>`;
+}
+
 module.exports = {
     bootstrapAdmin,
     verifyCredentials,
     createSession,
     destroySession,
+    destroySessionsForUsername,
     getSession,
     setSessionCookie,
     clearSessionCookie,
     requireLogin,
+    requireAdmin,
     loginPageHtml,
+    adminPageHtml,
+    isAdmin,
+    listUsers,
+    getUserById,
+    countAdmins,
+    createUser,
+    deleteUserById,
+    updateUserPassword,
 };

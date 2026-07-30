@@ -27,8 +27,9 @@ const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
 const {
-    bootstrapAdmin, verifyCredentials, createSession, destroySession, getSession,
-    setSessionCookie, clearSessionCookie, requireLogin, loginPageHtml,
+    bootstrapAdmin, verifyCredentials, createSession, destroySession, destroySessionsForUsername, getSession,
+    setSessionCookie, clearSessionCookie, requireLogin, requireAdmin, loginPageHtml, adminPageHtml,
+    isAdmin, listUsers, getUserById, countAdmins, createUser, deleteUserById, updateUserPassword,
 } = require('./authGate.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -3053,6 +3054,62 @@ app.get('/api/auth/logout', (req, res) => {
     if (session) destroySession(session.token)
     clearSessionCookie(res)
     res.redirect(302, '/login')
+})
+
+// ── Account management (admin only, except self password change) ──────────
+app.get('/admin', requireAdmin, (req, res) => {
+    res.send(adminPageHtml(listUsers(), getSession(req).username))
+})
+
+app.get('/api/auth/users', requireAdmin, (req, res) => {
+    res.json(listUsers())
+})
+
+app.post('/api/auth/users', loginRouteLimiter, requireAdmin, async (req, res) => {
+    const { username, password } = req.body || {}
+    if (!username || !password) {
+        return res.status(400).json({ error: 'username/password required' })
+    }
+    try {
+        await createUser(username, password)
+        res.json({ ok: true })
+    } catch (e) {
+        if (/UNIQUE/.test(e.message)) {
+            return res.status(409).json({ error: 'username already exists' })
+        }
+        throw e
+    }
+})
+
+app.delete('/api/auth/users/:id', requireAdmin, (req, res) => {
+    const id = Number(req.params.id)
+    const target = getUserById(id)
+    if (!target) return res.status(404).json({ error: 'not found' })
+    if (target.username === getSession(req).username) {
+        return res.status(400).json({ error: 'cannot delete your own account' })
+    }
+    if (target.is_admin && countAdmins() <= 1) {
+        return res.status(400).json({ error: 'cannot delete the last admin' })
+    }
+    deleteUserById(id)
+    destroySessionsForUsername(target.username)
+    res.json({ ok: true })
+})
+
+app.put('/api/auth/users/:id/password', loginRouteLimiter, async (req, res) => {
+    const id = Number(req.params.id)
+    const target = getUserById(id)
+    if (!target) return res.status(404).json({ error: 'not found' })
+    const session = getSession(req)
+    const isSelf = target.username === session.username
+    if (!isSelf && !isAdmin(session.username)) {
+        return res.status(403).json({ error: 'forbidden' })
+    }
+    const { password } = req.body || {}
+    if (!password) return res.status(400).json({ error: 'password required' })
+    await updateUserPassword(id, password)
+    destroySessionsForUsername(target.username)
+    res.json({ ok: true })
 })
 
 app.post('/api/login', loginRouteLimiter, async (req, res) => {
