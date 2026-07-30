@@ -61,6 +61,25 @@ const stmtInsertUser = sharedDb.prepare(`INSERT INTO rl_users (username, passwor
 const stmtDeleteUser = sharedDb.prepare(`DELETE FROM rl_users WHERE id = ?`);
 const stmtUpdatePasswordHash = sharedDb.prepare(`UPDATE rl_users SET password_hash = ? WHERE id = ?`);
 
+// Upgrade backfill: accounts created before is_admin existed (including via
+// the original single-account bootstrap) default to 0, and bootstrapAdmin()
+// below only fires on a still-empty table, so pre-existing deploys would
+// otherwise end up with zero admins and no way to reach the management API.
+// Promote ADMIN_USER's account if present; otherwise, if there's exactly one
+// pre-existing account, promote it (it was the sole login before this
+// feature existed, so it's unambiguous).
+if (stmtCountAdmins.get().n === 0) {
+    const adminUser = process.env.ADMIN_USER;
+    const target = (adminUser && stmtGetUser.get(adminUser))
+        || (stmtCountUsers.get().n === 1 ? sharedDb.prepare(`SELECT * FROM rl_users LIMIT 1`).get() : null);
+    if (target) {
+        sharedDb.prepare(`UPDATE rl_users SET is_admin = 1 WHERE id = ?`).run(target.id);
+        console.log(`[AuthGate] Promoted existing account '${target.username}' to admin (upgrade backfill).`);
+    } else if (stmtCountUsers.get().n > 0) {
+        console.log('[AuthGate] No admin account exists and multiple accounts are present — set is_admin manually in rl_users, or via ADMIN_USER matching an existing username.');
+    }
+}
+
 // Creates the first account from ADMIN_USER/ADMIN_PASS if rl_users is still
 // empty. No-op once any account exists — safe to leave the env vars set.
 // This is the only way an admin account gets created — the management API
