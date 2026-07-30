@@ -363,14 +363,18 @@
 
     // ── Account tab (site login gate, rl_users — separate from RisuAI's own
     // password below) ──────────────────────────────────────────────────────
+    let meId = $state<number | null>(null)
     let meUsername = $state<string | null>(null)
     let meIsAdmin = $state(false)
+    let newPassword = $state('')
+    let changingPassword = $state(false)
 
     async function loadWhoami() {
         try {
             const res = await fetch('/api/auth/whoami')
             if (!res.ok) return
             const json = await res.json()
+            meId = json.id
             meUsername = json.username
             meIsAdmin = !!json.isAdmin
         } catch { /* non-critical — links still render, just without the admin gate */ }
@@ -380,6 +384,29 @@
         if ($SystemSubmenuIndex !== 4) return
         loadWhoami()
     })
+
+    async function changeOwnPassword() {
+        if (!meId || !newPassword) return
+        changingPassword = true
+        try {
+            const res = await fetch(`/api/auth/users/${meId}/password`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: newPassword }),
+            })
+            const json = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`)
+            notifySuccess(language.accountPasswordChanged)
+            // password change invalidates every session for this account,
+            // including the current one — the next request will bounce to
+            // /login anyway, so just send the user there now.
+            window.location.href = '/login'
+        } catch (e) {
+            notifyError((e instanceof Error ? e.message : String(e)))
+        } finally {
+            changingPassword = false
+        }
+    }
 </script>
 
 <SettingPage title={language.system}>
@@ -652,6 +679,25 @@
             {language.accountAdminPage}
         </ShButton>
         {/if}
+
+        <form class="flex flex-col gap-2 pt-2 border-t border-darkborderc/50" onsubmit={(e) => { e.preventDefault(); changeOwnPassword() }}>
+            <label class="text-textcolor2 text-sm" for="account-new-password">{language.accountChangePassword}</label>
+            <div class="flex gap-2">
+                <ShInput
+                    id="account-new-password"
+                    type="password"
+                    autocomplete="new-password"
+                    placeholder={language.accountNewPasswordPlaceholder}
+                    bind:value={newPassword}
+                    required
+                    minlength={1}
+                />
+                <ShButton type="submit" variant="outline" disabled={changingPassword || !newPassword}>
+                    {language.accountChangePasswordButton}
+                </ShButton>
+            </div>
+        </form>
+
         <ShButton variant="destructive" href="/api/auth/logout">
             {language.logout}
         </ShButton>

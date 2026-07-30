@@ -29,7 +29,7 @@ const { kvGet, kvSet, kvDel, kvList,
 const {
     bootstrapAdmin, verifyCredentials, createSession, destroySession, destroySessionsForUsername, getSession,
     setSessionCookie, clearSessionCookie, requireLogin, requireAdmin, loginPageHtml, adminPageHtml,
-    isAdmin, listUsers, getUserById, countAdmins, createUser, deleteUserById, updateUserPassword,
+    isAdmin, listUsers, getUserById, getUserByUsername, countAdmins, createUser, deleteUserById, updateUserPassword,
 } = require('./authGate.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -3060,7 +3060,8 @@ app.get('/api/auth/logout', (req, res) => {
 // exposing anything not already implied by having a valid session cookie.
 app.get('/api/auth/whoami', (req, res) => {
     const session = getSession(req)
-    res.json({ username: session.username, isAdmin: isAdmin(session.username) })
+    const me = getUserByUsername(session.username)
+    res.json({ id: me.id, username: session.username, isAdmin: isAdmin(session.username) })
 })
 
 // ── Account management (admin only, except self password change) ──────────

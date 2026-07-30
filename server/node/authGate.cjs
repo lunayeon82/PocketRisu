@@ -112,6 +112,15 @@ function isAdmin(username) {
     return !!row && !!row.is_admin;
 }
 
+// Like getUserById, but by username — for looking up "myself" from a
+// session. Strips password_hash the same way listUsers() does.
+function getUserByUsername(username) {
+    const row = stmtGetUser.get(username);
+    if (!row) return undefined;
+    const { password_hash, ...rest } = row;
+    return rest;
+}
+
 function listUsers() {
     return stmtListUsers.all();
 }
@@ -420,6 +429,7 @@ module.exports = {
     isAdmin,
     listUsers,
     getUserById,
+    getUserByUsername,
     countAdmins,
     createUser,
     deleteUserById,
