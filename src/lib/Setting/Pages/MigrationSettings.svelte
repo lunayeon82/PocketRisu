@@ -5,7 +5,7 @@
     import ShAlert from "src/lib/UI/GUI/ShAlert.svelte";
     import ShAccordion from "src/lib/UI/GUI/ShAccordion.svelte";
     import Button from "src/lib/UI/GUI/Button.svelte";
-    import { alertConfirm } from "src/ts/alert";
+    import { alertConfirm, alertStore, notifySuccess, notifyError } from "src/ts/alert";
     import {
         LoadLocalBackup,
         SaveLocalBackupForUpstream,
@@ -16,7 +16,6 @@
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { openSettings, SettingsRoute, SystemTab } from "src/ts/routing";
     import { InfoIcon } from "@lucide/svelte";
-    import { alertConfirm, alertStore, notifySuccess, notifyError } from "src/ts/alert";
     import { DBState } from "src/ts/stores.svelte";
     import { migrateAllChatsToServer } from "src/ts/storage/chatStorage";
 
