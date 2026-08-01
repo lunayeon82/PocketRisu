@@ -712,6 +712,31 @@ export class NodeStorage{
         return map
     }
 
+    // Lightweight metadata patch (folder move / rename) — skips the full
+    // title+messages PUT for a single-field change.
+    async updateChatMeta(chatId: string, meta: { folderId?: string | null, position?: number, title?: string }): Promise<void> {
+        const body: Record<string, unknown> = {}
+        if ('folderId' in meta) body.folder_id = meta.folderId
+        if ('position' in meta) body.position = meta.position
+        if ('title' in meta) body.title = meta.title
+        const da = await this.authFetch(`/api/chats/${encodeURIComponent(chatId)}/meta`, {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        })
+        if (!da.ok) throw new Error(`updateChatMeta error: ${da.status}`)
+    }
+
+    // Bulk position/folder update for drag-and-drop reorder.
+    async reorderChats(updates: { id: string, position: number, folderId?: string | null }[]): Promise<void> {
+        const da = await this.authFetch('/api/chats/reorder', {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(updates.map(u => ({ id: u.id, position: u.position, folder_id: u.folderId ?? null }))),
+        })
+        if (!da.ok) throw new Error(`reorderChats error: ${da.status}`)
+    }
+
     // ── Bulk chat migration (Phase 3) ─────────────────────────────────────────
     // Migrates every chat in every character from the old /api/chat-content/
     // storage to rl_chats/rl_messages. Placeholders are fetched first (the

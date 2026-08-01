@@ -20,6 +20,45 @@ sharedDb.exec(`
 `);
 sharedDb.exec(`CREATE INDEX IF NOT EXISTS idx_rl_chats_user ON rl_chats(user_id, updated_at)`);
 
+// Added after the initial rl_chats rollout — guard with table_info so existing
+// deploys upgrade in place instead of erroring on re-run (mirrors rl_users/is_admin
+// in authGate.cjs). Backfills preserve what folder placement already existed in
+// chat_meta and approximate ordering via created_at since no order was tracked before.
+const rlChatsColumns = sharedDb.prepare(`PRAGMA table_info(rl_chats)`).all();
+if (!rlChatsColumns.some((c) => c.name === 'folder_id')) {
+    sharedDb.exec(`ALTER TABLE rl_chats ADD COLUMN folder_id TEXT`);
+    const rows = sharedDb.prepare(`SELECT id, chat_meta FROM rl_chats WHERE chat_meta IS NOT NULL`).all();
+    const backfillFolder = sharedDb.prepare(`UPDATE rl_chats SET folder_id = ? WHERE id = ?`);
+    sharedDb.transaction(() => {
+        for (const row of rows) {
+            try {
+                const meta = JSON.parse(row.chat_meta);
+                if (meta.folderId != null) backfillFolder.run(meta.folderId, row.id);
+            } catch {}
+        }
+    })();
+}
+if (!rlChatsColumns.some((c) => c.name === 'position')) {
+    sharedDb.exec(`ALTER TABLE rl_chats ADD COLUMN position INTEGER NOT NULL DEFAULT 0`);
+    const groups = sharedDb.prepare(`
+        SELECT id, user_id, character_id, folder_id
+        FROM rl_chats
+        ORDER BY user_id, character_id, folder_id IS NOT NULL, folder_id, created_at ASC
+    `).all();
+    const backfillPosition = sharedDb.prepare(`UPDATE rl_chats SET position = ? WHERE id = ?`);
+    sharedDb.transaction(() => {
+        let prevKey = null;
+        let pos = 0;
+        for (const row of groups) {
+            const key = `${row.user_id} ${row.character_id} ${row.folder_id ?? ''}`;
+            pos = key === prevKey ? pos + 1 : 0;
+            prevKey = key;
+            backfillPosition.run(pos, row.id);
+        }
+    })();
+}
+sharedDb.exec(`CREATE INDEX IF NOT EXISTS idx_rl_chats_folder ON rl_chats(user_id, character_id, folder_id, position)`);
+
 sharedDb.exec(`
   CREATE TABLE IF NOT EXISTS rl_messages (
     id         TEXT    PRIMARY KEY,
@@ -34,33 +73,58 @@ sharedDb.exec(`CREATE INDEX IF NOT EXISTS idx_rl_messages_chat ON rl_messages(ch
 
 // ─── Prepared statements ──────────────────────────────────────────────────────
 const stmtListChats = sharedDb.prepare(`
-  SELECT c.id, c.character_id, c.title, c.chat_meta, c.created_at, c.updated_at,
+  SELECT c.id, c.character_id, c.title, c.chat_meta, c.folder_id, c.position, c.created_at, c.updated_at,
          (SELECT COUNT(*) FROM rl_messages m WHERE m.chat_id = c.id) AS message_count
   FROM rl_chats c
   WHERE c.user_id = ?
-  ORDER BY c.updated_at DESC
+  ORDER BY c.position ASC, c.updated_at DESC
 `);
 
 const stmtGetChat = sharedDb.prepare(`
-  SELECT id, character_id, title, chat_meta, created_at, updated_at
+  SELECT id, character_id, title, chat_meta, folder_id, position, created_at, updated_at
   FROM rl_chats WHERE id = ? AND user_id = ?
 `);
 
 const stmtOwnsChat = sharedDb.prepare(`SELECT 1 FROM rl_chats WHERE id = ? AND user_id = ?`);
 
 const stmtInsertChat = sharedDb.prepare(`
-  INSERT INTO rl_chats (id, user_id, character_id, title, chat_meta, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO rl_chats (id, user_id, character_id, title, chat_meta, folder_id, position, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const stmtUpdateChat = sharedDb.prepare(`
-  UPDATE rl_chats SET title = ?, chat_meta = ?, updated_at = ?
+  UPDATE rl_chats SET title = ?, chat_meta = ?, folder_id = ?, updated_at = ?
   WHERE id = ? AND user_id = ?
 `);
 
 const stmtDeleteChat = sharedDb.prepare(`DELETE FROM rl_chats WHERE id = ? AND user_id = ?`);
 
 const stmtTouchChat = sharedDb.prepare(`UPDATE rl_chats SET updated_at = ? WHERE id = ?`);
+
+const stmtNextPosition = sharedDb.prepare(`
+  SELECT COALESCE(MAX(position), -1) AS max_position FROM rl_chats
+  WHERE user_id = ? AND character_id = ?
+    AND ((folder_id IS NULL AND ? IS NULL) OR folder_id = ?)
+`);
+
+// Metadata-only patch (folder move / reorder / rename). Takes final resolved
+// values (not COALESCE) since folder_id legitimately needs to become NULL
+// (moved out of any folder) — COALESCE can't distinguish "clear it" from
+// "leave it alone" when both mean passing null. The handler resolves
+// "field omitted" vs "field explicitly null" before calling this.
+const stmtPatchMeta = sharedDb.prepare(`
+  UPDATE rl_chats SET folder_id = ?, position = ?, title = ?
+  WHERE id = ? AND user_id = ?
+`);
+
+const stmtPatchMetaTouch = sharedDb.prepare(`
+  UPDATE rl_chats SET folder_id = ?, position = ?, title = ?, updated_at = ?
+  WHERE id = ? AND user_id = ?
+`);
+
+const stmtReorderOne = sharedDb.prepare(`
+  UPDATE rl_chats SET position = ?, folder_id = ? WHERE id = ? AND user_id = ?
+`);
 
 const stmtGetMessages = sharedDb.prepare(`
   SELECT id, role, content, sort_order, created_at
@@ -90,11 +154,11 @@ const stmtMaxSortOrder = sharedDb.prepare(`
 const stmtDeleteChatMessages = sharedDb.prepare(`DELETE FROM rl_messages WHERE chat_id = ?`);
 
 const stmtListChatsByCharacter = sharedDb.prepare(`
-  SELECT c.id, c.character_id, c.title, c.chat_meta, c.created_at, c.updated_at,
+  SELECT c.id, c.character_id, c.title, c.chat_meta, c.folder_id, c.position, c.created_at, c.updated_at,
          (SELECT COUNT(*) FROM rl_messages m WHERE m.chat_id = c.id) AS message_count
   FROM rl_chats c
   WHERE c.user_id = ? AND c.character_id = ?
-  ORDER BY c.updated_at DESC
+  ORDER BY c.position ASC, c.updated_at DESC
 `);
 
 // Bulk message insert — used by createChat and addMessage
@@ -124,6 +188,19 @@ function toJSON(val) {
     return val !== undefined ? JSON.stringify(val) : null;
 }
 
+// folder_id is now a real column (see the migration block above); chat_meta.folderId
+// is kept around for backward-compat clients but the column is the source of truth
+// once set. Full-object writers (create/update/upsert) sync the column from
+// chat_meta.folderId whenever chat_meta is present so the two can't drift.
+function folderIdFromMeta(chat_meta) {
+    return chat_meta && chat_meta.folderId != null ? String(chat_meta.folderId) : null;
+}
+
+function nextPosition(userId, characterId, folderId) {
+    const row = stmtNextPosition.get(userId, characterId, folderId, folderId);
+    return (row?.max_position ?? -1) + 1;
+}
+
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
 // Serialize a raw rl_chats row into the shape the client expects.
@@ -142,8 +219,9 @@ function serializeChatRow(row) {
         created_at:   row.created_at,
         updated_at:   row.updated_at,
         message_count: row.message_count,
-        last_date:    meta.lastDate   ?? null,
-        folder_id:    meta.folderId   ?? null,
+        last_date:    meta.lastDate ?? null,
+        folder_id:    row.folder_id ?? null,
+        position:     row.position ?? 0,
         modules:      Array.isArray(meta.modules) ? meta.modules : null,
     };
 }
@@ -180,10 +258,12 @@ function createChat(req, res) {
     const id = req.body.id || randomUUID();
     const now = Date.now();
     const metaJson = toJSON(chat_meta);
+    const folderId = folderIdFromMeta(chat_meta);
 
     try {
         sharedDb.transaction(() => {
-            stmtInsertChat.run(id, userId, character_id, title, metaJson, now, now);
+            const position = nextPosition(userId, character_id, folderId);
+            stmtInsertChat.run(id, userId, character_id, title, metaJson, folderId, position, now, now);
             if (Array.isArray(messages) && messages.length > 0) {
                 insertMsgsBatch(messages, id, -1, now);
             }
@@ -193,7 +273,7 @@ function createChat(req, res) {
         throw e;
     }
 
-    return res.status(201).json({ id, character_id, title, chat_meta: metaJson, created_at: now, updated_at: now });
+    return res.status(201).json({ id, character_id, title, chat_meta: metaJson, folder_id: folderId, created_at: now, updated_at: now });
 }
 
 // PUT /api/chats/:id
@@ -207,10 +287,11 @@ function updateChat(req, res) {
     const { title, chat_meta } = req.body || {};
     const newTitle = title !== undefined ? title : chat.title;
     const newMeta = chat_meta !== undefined ? toJSON(chat_meta) : chat.chat_meta;
+    const newFolderId = chat_meta !== undefined ? folderIdFromMeta(chat_meta) : chat.folder_id;
     const now = Date.now();
 
-    stmtUpdateChat.run(newTitle, newMeta, now, req.params.id, userId);
-    return res.json({ ...chat, title: newTitle, chat_meta: newMeta, updated_at: now });
+    stmtUpdateChat.run(newTitle, newMeta, newFolderId, now, req.params.id, userId);
+    return res.json({ ...chat, title: newTitle, chat_meta: newMeta, folder_id: newFolderId, updated_at: now });
 }
 
 // PUT /api/chats/:id/full — upsert chat + atomically replace all messages
@@ -225,13 +306,15 @@ function upsertChatFull(req, res) {
 
     const now = Date.now();
     const metaJson = toJSON(chat_meta);
+    const folderId = folderIdFromMeta(chat_meta);
 
     sharedDb.transaction(() => {
         const existing = stmtGetChat.get(chatId, userId);
         if (existing) {
-            stmtUpdateChat.run(title, metaJson, now, chatId, userId);
+            stmtUpdateChat.run(title, metaJson, folderId, now, chatId, userId);
         } else {
-            stmtInsertChat.run(chatId, userId, character_id, title, metaJson, now, now);
+            const position = nextPosition(userId, character_id, folderId);
+            stmtInsertChat.run(chatId, userId, character_id, title, metaJson, folderId, position, now, now);
         }
         stmtDeleteChatMessages.run(chatId);
         if (messages.length > 0) {
@@ -240,6 +323,76 @@ function upsertChatFull(req, res) {
     })();
 
     return res.json({ ok: true, id: chatId, updated_at: now });
+}
+
+// PATCH /api/chats/:id/meta — lightweight metadata patch for folder moves /
+// manual reorder / rename that don't warrant a full title+messages PUT.
+// folder_id/position-only patches skip the updated_at bump (a drag-drop
+// shouldn't bump a chat to the top of a recency-sorted view); a title change
+// counts as a real edit and bumps it, matching updateChat's behavior.
+function patchChatMeta(req, res) {
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const chat = stmtGetChat.get(req.params.id, userId);
+    if (!chat) return res.status(404).json({ error: 'Not found' });
+
+    const body = req.body || {};
+    const hasFolderId = Object.prototype.hasOwnProperty.call(body, 'folder_id');
+    const hasPosition = Object.prototype.hasOwnProperty.call(body, 'position');
+    const hasTitle = Object.prototype.hasOwnProperty.call(body, 'title');
+    if (!hasFolderId && !hasPosition && !hasTitle) {
+        return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const newFolderId = hasFolderId ? (body.folder_id == null ? null : String(body.folder_id)) : chat.folder_id;
+    const newPosition = hasPosition ? Number(body.position) : chat.position;
+    const newTitle = hasTitle ? String(body.title) : chat.title;
+
+    if (hasTitle) {
+        const now = Date.now();
+        stmtPatchMetaTouch.run(newFolderId, newPosition, newTitle, now, req.params.id, userId);
+        return res.json({ ...chat, folder_id: newFolderId, position: newPosition, title: newTitle, updated_at: now });
+    }
+    stmtPatchMeta.run(newFolderId, newPosition, newTitle, req.params.id, userId);
+    return res.json({ ...chat, folder_id: newFolderId, position: newPosition, title: newTitle });
+}
+
+// PATCH /api/chats/reorder — bulk position/folder update for drag-and-drop.
+// Body: [{ id, position, folder_id }, ...]. All-or-nothing: every id must
+// already belong to the requesting user or the whole batch is rejected, so a
+// forged id can't be used to probe/touch another account's chats and a
+// partial failure never leaves the list half-reordered.
+function reorderChats(req, res) {
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const updates = req.body;
+    if (!Array.isArray(updates) || updates.length === 0) {
+        return res.status(400).json({ error: 'Expected a non-empty array' });
+    }
+    for (const u of updates) {
+        if (!u || typeof u.id !== 'string' || typeof u.position !== 'number') {
+            return res.status(400).json({ error: 'Each entry needs id (string) and position (number)' });
+        }
+    }
+
+    const ids = [...new Set(updates.map(u => u.id))];
+    const owned = new Set(
+        ids.filter(id => stmtOwnsChat.get(id, userId))
+    );
+    if (owned.size !== ids.length) {
+        return res.status(404).json({ error: 'One or more chats not found' });
+    }
+
+    sharedDb.transaction(() => {
+        for (const u of updates) {
+            const folderId = u.folder_id == null ? null : String(u.folder_id);
+            stmtReorderOne.run(u.position, folderId, u.id, userId);
+        }
+    })();
+
+    return res.json({ ok: true, updated: updates.length });
 }
 
 // DELETE /api/chats/:id
@@ -314,6 +467,8 @@ function mountChatApi(app) {
     app.post('/api/chats',                         createChat);
     app.put('/api/chats/:id/full',                 upsertChatFull);
     app.put('/api/chats/:id',                      updateChat);
+    app.patch('/api/chats/reorder',                reorderChats);
+    app.patch('/api/chats/:id/meta',                patchChatMeta);
     app.delete('/api/chats/:id',                   deleteChat);
     app.post('/api/chats/:id/messages',            addMessage);
     app.put('/api/chats/:id/messages/:msgId',      updateMessage);

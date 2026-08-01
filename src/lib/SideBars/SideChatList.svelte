@@ -6,7 +6,7 @@
 
     import type { Chat, ChatFolder, character } from "src/ts/storage/database.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
-    import { ensureChatHydrated, deleteChatFromServer, saveChatToServer } from "src/ts/storage/chatStorage";
+    import { ensureChatHydrated, deleteChatFromServer, saveChatToServer, reorderChats } from "src/ts/storage/chatStorage";
     import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
     import { selectedCharID, chatDeselected } from "src/ts/stores.svelte";
 
@@ -43,6 +43,13 @@
     )
     const isOrphanFolder = (folderId: string | null | undefined): boolean =>
         folderId != null && !validFolderIds.has(folderId)
+
+    // Fire-and-forget: the array order + folderId in `chara.chats` is already
+    // the source of truth for rendering, so a failed sync just means the next
+    // drag (which re-sends the whole array) self-corrects the server copy.
+    const syncChatOrder = (chats: Chat[]) => {
+        void reorderChats(chats.map((c, i) => ({ id: c.id, position: i, folderId: c.folderId ?? null }))).catch(() => {})
+    }
 
     let chatsStb: Sortable[] = []
     let folderStb: Sortable = null
@@ -85,6 +92,7 @@
 
                     changeChatTo(newChats.indexOf(chara.chats[currentChatPage]))
                     chara.chats = newChats
+                    syncChatOrder(newChats)
 
                     try {
                         this.destroy()
@@ -125,6 +133,7 @@
                 chara.chatFolders = newFolders
                 changeChatTo(newChats.indexOf(chara.chats[currentChatPage]))
                 chara.chats = newChats
+                syncChatOrder(newChats)
                 try {
                     folderStb.destroy()
                 } catch (e) {}

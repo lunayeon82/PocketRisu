@@ -125,6 +125,16 @@ export async function loadChatListFromServer(): Promise<Map<string, ChatStub[]>>
     return storage.loadChatListFromServer()
 }
 
+export async function updateChatMeta(chatId: string, meta: { folderId?: string | null, position?: number, title?: string }): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.updateChatMeta(chatId, meta)
+}
+
+export async function reorderChats(updates: { id: string, position: number, folderId?: string | null }[]): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.reorderChats(updates)
+}
+
 export async function migrateAllChatsToServer(
     characters: character[],
     onProgress: (done: number, total: number) => void,
