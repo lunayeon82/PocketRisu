@@ -2084,6 +2084,8 @@ export interface ChatFolder{
     name?:string
     color?:string
     folded:boolean
+    /** Parent folder id, or null/undefined for a root-level folder. Max depth is 2. */
+    parentId?:string|null
 }
 
 export interface Message{

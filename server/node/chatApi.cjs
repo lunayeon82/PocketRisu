@@ -475,4 +475,4 @@ function mountChatApi(app) {
     app.delete('/api/chats/:id/messages/:msgId',   deleteMessage);
 }
 
-module.exports = { mountChatApi };
+module.exports = { mountChatApi, resolveUserId };

@@ -29,7 +29,7 @@ import {
     checkCharOrder
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
-import { stubToPlaceholder, loadChatListFromServer } from "./storage/chatStorage";
+import { stubToPlaceholder, loadChatListFromServer, loadChatFoldersFromServer, createChatFolder } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 
 /**
@@ -144,6 +144,47 @@ export async function loadData() {
                     const dbForSync = getDatabase()
                     for (const char of dbForSync.characters) {
                         if (!Array.isArray(char.chats)) char.chats = []
+                    }
+                }
+            }
+
+            // Chat folders: rl_chat_folders is the source (see chatFolderApi.cjs),
+            // scoped per account unlike the old character.chatFolders embedded in
+            // the shared database.bin. One-time migration per character: if the
+            // server has zero folders but database.bin's chatFolders has legacy
+            // entries, upload them once (preserving id/name/color/folded, all as
+            // root-level since the old structure was flat) so existing
+            // chat.folderId references keep resolving. After the first
+            // successful upload the server always has >=1 folder, so this is
+            // naturally skipped on every later boot.
+            {
+                LoadingStatusState.text = "Syncing chat folders..."
+                const dbForFolders = getDatabase()
+                for (const char of dbForFolders.characters) {
+                    if (!char?.chaId) continue
+                    try {
+                        let serverFolders = await loadChatFoldersFromServer(char.chaId)
+                        const legacyFolders = char.chatFolders
+                        if (serverFolders.length === 0 && Array.isArray(legacyFolders) && legacyFolders.length > 0) {
+                            for (const legacyFolder of legacyFolders) {
+                                if (!legacyFolder?.id) continue
+                                try {
+                                    await createChatFolder(char.chaId, {
+                                        id: legacyFolder.id,
+                                        name: legacyFolder.name,
+                                        color: legacyFolder.color,
+                                        parentId: null,
+                                    })
+                                } catch (e) {
+                                    console.error(`[ChatFolders] Failed to migrate folder ${legacyFolder.id} for ${char.chaId}:`, e)
+                                }
+                            }
+                            serverFolders = await loadChatFoldersFromServer(char.chaId)
+                        }
+                        char.chatFolders = serverFolders
+                    } catch (e) {
+                        console.error(`[ChatFolders] Failed to load folders for ${char.chaId}:`, e)
+                        if (!Array.isArray(char.chatFolders)) char.chatFolders = []
                     }
                 }
             }

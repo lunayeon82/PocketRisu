@@ -8,7 +8,7 @@
 import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
-import { normalizeChat, type character, type ChatStub } from "./database.svelte"
+import { normalizeChat, type character, type ChatStub, type ChatFolder } from "./database.svelte"
 
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
@@ -735,6 +735,64 @@ export class NodeStorage{
             body: JSON.stringify(updates.map(u => ({ id: u.id, position: u.position, folder_id: u.folderId ?? null }))),
         })
         if (!da.ok) throw new Error(`reorderChats error: ${da.status}`)
+    }
+
+    // ── Chat folders ────────────────────────────────────────────────────────
+    // rl_chat_folders (chatFolderApi.cjs) — scoped per account, unlike the old
+    // character.chatFolders embedded in the shared database.bin.
+
+    private static deserializeFolderRow(row: any): ChatFolder {
+        const folder: ChatFolder = { id: row.id, folded: !!row.folded }
+        if (row.name != null) folder.name = row.name
+        if (row.color != null) folder.color = row.color
+        folder.parentId = row.parent_id ?? null
+        return folder
+    }
+
+    async loadChatFoldersFromServer(chaId: string): Promise<ChatFolder[]> {
+        const da = await this.authFetch(`/api/chat-folders?character_id=${encodeURIComponent(chaId)}`)
+        if (!da.ok) throw new Error(`loadChatFoldersFromServer: ${da.status}`)
+        const rows: any[] = await da.json()
+        return rows.map(NodeStorage.deserializeFolderRow)
+    }
+
+    async createChatFolder(chaId: string, folder: { id?: string, name?: string, color?: string, parentId?: string | null }): Promise<ChatFolder> {
+        const da = await this.authFetch('/api/chat-folders', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                ...(folder.id ? { id: folder.id } : {}),
+                character_id: chaId,
+                name: folder.name ?? '',
+                color: folder.color ?? null,
+                parent_id: folder.parentId ?? null,
+            }),
+        })
+        if (!da.ok) throw new Error(`createChatFolder error: ${da.status}`)
+        return NodeStorage.deserializeFolderRow(await da.json())
+    }
+
+    async updateChatFolder(folderId: string, patch: { name?: string, color?: string, folded?: boolean, parentId?: string | null, position?: number }): Promise<ChatFolder> {
+        const body: Record<string, unknown> = {}
+        if ('name' in patch) body.name = patch.name
+        if ('color' in patch) body.color = patch.color
+        if ('folded' in patch) body.folded = patch.folded
+        if ('parentId' in patch) body.parent_id = patch.parentId
+        if ('position' in patch) body.position = patch.position
+        const da = await this.authFetch(`/api/chat-folders/${encodeURIComponent(folderId)}`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        })
+        if (!da.ok) throw new Error(`updateChatFolder error: ${da.status}`)
+        return NodeStorage.deserializeFolderRow(await da.json())
+    }
+
+    async deleteChatFolder(folderId: string): Promise<void> {
+        const da = await this.authFetch(`/api/chat-folders/${encodeURIComponent(folderId)}`, {
+            method: 'DELETE',
+        })
+        if (da.status !== 404 && !da.ok) throw new Error(`deleteChatFolder error: ${da.status}`)
     }
 
     // ── Bulk chat migration (Phase 3) ─────────────────────────────────────────

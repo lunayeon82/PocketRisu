@@ -1,5 +1,5 @@
 import { forageStorage } from "../globalApi.svelte"
-import { type Chat, type ChatStub, type ChatOrStub, isChatStub, type character } from "./database.svelte"
+import { type Chat, type ChatStub, type ChatOrStub, isChatStub, type character, type ChatFolder } from "./database.svelte"
 import { tick } from "svelte"
 
 // ── Stub ↔ Placeholder conversion ───────────────────────────────────────────
@@ -144,6 +144,28 @@ export async function migrateAllChatsToServer(
 ): Promise<{ succeeded: number; failed: number }> {
     const storage = forageStorage.realStorage
     return storage.migrateChatsToServer(characters, onProgress)
+}
+
+// ── Chat folders ─────────────────────────────────────────────────────────────
+
+export async function loadChatFoldersFromServer(chaId: string): Promise<ChatFolder[]> {
+    const storage = forageStorage.realStorage
+    return storage.loadChatFoldersFromServer(chaId)
+}
+
+export async function createChatFolder(chaId: string, folder: { id?: string, name?: string, color?: string, parentId?: string | null }): Promise<ChatFolder> {
+    const storage = forageStorage.realStorage
+    return storage.createChatFolder(chaId, folder)
+}
+
+export async function updateChatFolder(folderId: string, patch: { name?: string, color?: string, folded?: boolean, parentId?: string | null, position?: number }): Promise<ChatFolder> {
+    const storage = forageStorage.realStorage
+    return storage.updateChatFolder(folderId, patch)
+}
+
+export async function deleteChatFolder(folderId: string): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.deleteChatFolder(folderId)
 }
 
 // ── Hydration ───────────────────────────────────────────────────────────────

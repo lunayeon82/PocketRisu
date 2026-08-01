@@ -168,10 +168,10 @@ export class RisuSaveEncoder {
         });
         this.characterJsons = {}
         for( const character of data.characters) {
-            // database.bin never carries chats — they live in rl_chats only
-            // (see src/ts/storage/chatStorage.ts). Drop the field entirely
-            // rather than stubbing it.
-            const { chats: _chats, ...charForEncode } = character
+            // database.bin never carries chats or chat folders — they live in
+            // rl_chats / rl_chat_folders only (see src/ts/storage/chatStorage.ts).
+            // Drop both fields entirely rather than stubbing them.
+            const { chats: _chats, chatFolders: _chatFolders, ...charForEncode } = character
             // Raw stringify (no normalize fallback): a circular ref must fail the
             // save loudly, exactly as before, rather than silently persist a
             // lossy copy. This string doubles as the encode payload.
@@ -217,11 +217,11 @@ export class RisuSaveEncoder {
             const chaId = character.chaId
             savedId.add(chaId)
             const index = toSave.character.indexOf(chaId);
-            // Compare with chats excluded so hydration (placeholder → full
-            // chat) and any other chat-only mutation doesn't read as a change
-            // of the character itself. Raw stringify (see init): circular
-            // refs fail the save loudly.
-            const { chats: _chats, ...charForEncode } = character
+            // Compare with chats/chatFolders excluded so hydration (placeholder →
+            // full chat), folder CRUD, and any other server-owned mutation
+            // doesn't read as a change of the character itself. Raw stringify
+            // (see init): circular refs fail the save loudly.
+            const { chats: _chats, chatFolders: _chatFolders, ...charForEncode } = character
             const charJson = JSON.stringify(charForEncode)
             const hasChanged = this.characterJsons[chaId] !== charJson
 
@@ -892,9 +892,9 @@ export class RisuSavePatcher {
 
         for (let i = 0; i < this.lastSyncedDb.characters.length; i++) {
             const character = this.lastSyncedDb.characters[i];
-            // Hash without chats (matching set()) so hashes stay in sync with
-            // the server's chats-free dbCache baseline.
-            const { chats: _chats, ...withoutChats } = character;
+            // Hash without chats/chatFolders (matching set()) so hashes stay in
+            // sync with the server's chats-free dbCache baseline.
+            const { chats: _chats, chatFolders: _chatFolders, ...withoutChats } = character;
             this.hashBlocks[character.chaId] = calculateHash(withoutChats);
             this.lastSyncedDb.characters[i] = withoutChats;
         }
@@ -1090,11 +1090,12 @@ export class RisuSavePatcher {
         const structuralChange = lastIds.length !== curIds.length ||
             lastIds.some((id: string, i: number) => id !== curIds[i])
 
-        // Drop chats for the patch diff — database.bin never carries them,
-        // they live in rl_chats only (src/ts/storage/chatStorage.ts).
+        // Drop chats/chatFolders for the patch diff — database.bin never
+        // carries them, they live in rl_chats / rl_chat_folders only
+        // (src/ts/storage/chatStorage.ts).
         function withoutChats(char: any) {
             if (!char) return char
-            const { chats: _chats, ...rest } = char
+            const { chats: _chats, chatFolders: _chatFolders, ...rest } = char
             return rest
         }
 

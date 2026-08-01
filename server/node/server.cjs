@@ -38,6 +38,7 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
 const { mountChatApi } = require('./chatApi.cjs');
+const { mountChatFolderApi } = require('./chatFolderApi.cjs');
 let gdriveBackup;
 try { gdriveBackup = require('./gdrive-backup.cjs'); } catch { /* gdrive module unavailable */ }
 const { spawn, execSync } = require('child_process');
@@ -2734,6 +2735,7 @@ app.get('/api/auth/whoami', (req, res) => {
 
 // ── Chat storage API ──────────────────────────────────────────────────────
 mountChatApi(app);
+mountChatFolderApi(app);
 
 // ── Account management (admin only, except self password change) ──────────
 app.get('/admin', requireAdmin, (req, res) => {
