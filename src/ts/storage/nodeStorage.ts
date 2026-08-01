@@ -8,7 +8,7 @@
 import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
-import { normalizeChat } from "./database.svelte"
+import { normalizeChat, type character } from "./database.svelte"
 
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
@@ -683,6 +683,59 @@ export class NodeStorage{
         if (da.status !== 404 && !da.ok) {
             console.error(`[Chat] deleteChatContent failed: ${da.status}`)
         }
+    }
+
+    // ── Bulk chat migration (Phase 3) ─────────────────────────────────────────
+    // Migrates every chat in every character from the old /api/chat-content/
+    // storage to rl_chats/rl_messages. Placeholders are fetched first (the
+    // fetchChatContent fallback path handles the actual save); hydrated chats
+    // are written directly. Errors per chat are caught and counted so a single
+    // failure doesn't abort the whole batch.
+
+    async migrateChatsToServer(
+        characters: character[],
+        onProgress: (done: number, total: number) => void,
+    ): Promise<{ succeeded: number; failed: number }> {
+        type Task = { chaId: string; chatIndex: number; chatId: string; placeholder: boolean }
+        const tasks: Task[] = []
+
+        for (const char of characters) {
+            if (!char?.chaId || !Array.isArray(char.chats)) continue
+            for (let i = 0; i < char.chats.length; i++) {
+                const chat = char.chats[i]
+                if (!chat?.id) continue
+                tasks.push({ chaId: char.chaId, chatIndex: i, chatId: chat.id, placeholder: !!chat._placeholder })
+            }
+        }
+
+        let succeeded = 0
+        let failed = 0
+
+        for (let i = 0; i < tasks.length; i++) {
+            onProgress(i, tasks.length)
+            const { chaId, chatIndex, chatId, placeholder } = tasks[i]
+            try {
+                if (placeholder) {
+                    // fetchChatContent: tries rl_chats first; on 404 falls back to
+                    // old endpoint and auto-saves to rl_chats as a side effect.
+                    await this.fetchChatContent(chaId, chatIndex, chatId)
+                } else {
+                    // Already in memory — write directly to rl_chats (upsert).
+                    const chat = characters
+                        .find(c => c.chaId === chaId)?.chats[chatIndex]
+                    if (chat && !chat._placeholder) {
+                        await this.saveChatContent(chaId, chatIndex, chatId, chat)
+                    }
+                }
+                succeeded++
+            } catch (e) {
+                console.error(`[Migrate] ${chatId}:`, e)
+                failed++
+            }
+        }
+
+        onProgress(tasks.length, tasks.length)
+        return { succeeded, failed }
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────
