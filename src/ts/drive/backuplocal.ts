@@ -1,8 +1,8 @@
 import { alertError, alertStore, alertWait, alertMd, alertConfirm, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
 import { downloadFile, LocalWriter, forageStorage } from "../globalApi.svelte";
-import { encodeRisuSaveLegacy } from "../storage/risuSave";
+import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
-import { fetchChatFromServer } from "../storage/chatStorage";
+import { fetchChatFromServer, loadChatListFromServer, saveChatToServer } from "../storage/chatStorage";
 import { language } from "src/lang";
 
 function formatBytes(bytes: number): string {
@@ -226,6 +226,51 @@ export async function SavePartialLocalBackup(){
     }
 }
 
+// Parse the streaming backup format ([nameLen:LE32][name][dataLen:LE32][data]…)
+// to extract full Chat objects embedded in the database.risudat entry.
+// Returns null if the entry is missing or undecodable (e.g. server-generated
+// backup that only has stubs in database.bin, not full chat messages).
+async function extractChatsFromBackup(
+    buf: Uint8Array,
+): Promise<Array<{ chaId: string; chat: Chat }> | null> {
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+    const decoder = new TextDecoder()
+    let offset = 0
+
+    while (offset + 8 <= buf.byteLength) {
+        const nameLen = view.getUint32(offset, true)
+        offset += 4
+        if (offset + nameLen + 4 > buf.byteLength) break
+        const name = decoder.decode(buf.subarray(offset, offset + nameLen))
+        offset += nameLen
+        const dataLen = view.getUint32(offset, true)
+        offset += 4
+        if (offset + dataLen > buf.byteLength) break
+        const data = buf.subarray(offset, offset + dataLen)
+        offset += dataLen
+
+        if (name !== 'database.risudat') continue
+
+        try {
+            const db = await decodeRisuSave(data) as { characters?: any[] }
+            const result: Array<{ chaId: string; chat: Chat }> = []
+            for (const char of db?.characters ?? []) {
+                if (!char?.chaId || !Array.isArray(char.chats)) continue
+                for (const chat of char.chats) {
+                    // Only full chats (have message array, not a stub/placeholder)
+                    if (chat?.id && Array.isArray(chat.message) && !chat._placeholder && !chat._stub) {
+                        result.push({ chaId: char.chaId, chat: chat as Chat })
+                    }
+                }
+            }
+            return result
+        } catch {
+            return null
+        }
+    }
+    return null
+}
+
 export function LoadLocalBackup(){
     try {
         const input = document.createElement('input');
@@ -238,6 +283,56 @@ export function LoadLocalBackup(){
             }
             const file = input.files[0];
             input.remove();
+
+            // ── 1. Parse backup for embedded chat data ──────────────────────
+            alertWait('백업 파일 분석 중...')
+            let chatsToUpload: Array<{ chaId: string; chat: Chat }> | null = null
+            try {
+                const buf = new Uint8Array(await file.arrayBuffer())
+                chatsToUpload = await extractChatsFromBackup(buf)
+            } catch {
+                chatsToUpload = null
+            }
+
+            if (chatsToUpload && chatsToUpload.length > 0) {
+                // ── 2. Detect new vs overwrite ──────────────────────────────
+                let existingIds = new Set<string>()
+                try {
+                    const serverMap = await loadChatListFromServer()
+                    for (const stubs of serverMap.values()) {
+                        for (const s of stubs) existingIds.add(s.id)
+                    }
+                } catch { /* treat all as new on error */ }
+
+                const newCount = chatsToUpload.filter(c => !existingIds.has(c.chat.id)).length
+                const overwriteCount = chatsToUpload.length - newCount
+
+                // ── 3. Confirmation dialog ──────────────────────────────────
+                let confirmed: boolean
+                if (overwriteCount > 0) {
+                    confirmed = await alertConfirm(
+                        `채팅 ${chatsToUpload.length}건이 서버 계정에 업로드됩니다.\n신규 ${newCount}건 / 덮어쓰기 ${overwriteCount}건\n\n기존 서버 데이터를 덮어씁니다. 계속할까요?`
+                    )
+                } else {
+                    confirmed = await alertConfirm(
+                        `채팅 ${newCount}건이 서버 계정에 저장됩니다. 계속할까요?`
+                    )
+                }
+                if (!confirmed) return
+
+                // ── 4. Upload chats to rl_chats ─────────────────────────────
+                for (let i = 0; i < chatsToUpload.length; i++) {
+                    alertWait(`채팅 업로드 중... (${i + 1} / ${chatsToUpload.length})`)
+                    const { chaId, chat } = chatsToUpload[i]
+                    try {
+                        await saveChatToServer(chaId, 0, chat.id, chat)
+                    } catch (e) {
+                        console.error('[backup] chat upload failed:', chat.id, e)
+                    }
+                }
+            }
+
+            // ── 5. Normal server-side import (database.bin + assets) ────────
             alertWait(`Loading local Backup... (Uploading ${file.name})`);
             const result = await forageStorage.importBackup(file, (loaded, total) => {
                 const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
