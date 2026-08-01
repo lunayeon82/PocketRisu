@@ -1595,8 +1595,12 @@ function setupProxyStreamWebSocket(server) {
                 return;
             }
 
-            const auth = reqUrl.searchParams.get('risu-auth') || normalizeAuthHeader(req.headers['risu-auth']);
-            if (!await isAuthorizedProxyRequest({ headers: { 'risu-auth': auth } })) {
+            // This upgrade handler runs on the raw http.Server 'upgrade' event and
+            // never passes through Express — checkAuth (via isAuthorizedProxyRequest)
+            // now authorizes off the rl_auth session cookie, which the real `req`
+            // already carries in its Cookie header (same-origin WS upgrade), so pass
+            // it through directly rather than a synthetic risu-auth-only object.
+            if (!await isAuthorizedProxyRequest(req)) {
                 socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
                 socket.destroy();
                 return;
@@ -2205,75 +2209,27 @@ app.get('/chat', async (req, res, next) => {
     }
 })
 
-async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = false} = {}){
+// Historically this verified a separate `risu-auth` HMAC-JWT (RisuAI's own
+// single shared-password scheme), obtained via a second password prompt the
+// user had to clear even after logging into their rl_users account. Every
+// call site here is already behind the global `app.use(requireLogin)` gate
+// (server.cjs:482) EXCEPT the raw WebSocket upgrade handler for
+// /proxy-stream-jobs/*/ws (setupProxyStreamWebSocket), which bypasses Express
+// middleware entirely and relied on this function as its *only* auth check.
+// So instead of dropping the check, it now authorizes off the same rl_auth
+// session cookie the account gate already established — this removes the
+// redundant prompt everywhere else and, for the WebSocket path, ties it to
+// the actual logged-in account rather than a single shared password.
+async function checkAuth(req, res, returnOnlyStatus = false, _opts = {}){
     try {
-        const authHeader = req.headers['risu-auth'];
-
-        if(!authHeader){
-            console.log('No auth header')
+        const session = getSession(req);
+        if (!session) {
+            console.log('No valid rl_auth session')
             if(returnOnlyStatus){
                 return false;
             }
-            res.status(400).send({
-                error:'No auth header'
-            });
-            return false
-        }
-
-
-        //jwt token
-        const [
-            jsonHeaderB64,
-            jsonPayloadB64,
-            signatureB64,
-        ] = authHeader.split('.');
-
-        //alg, typ
-        const jsonHeader = JSON.parse(Buffer.from(jsonHeaderB64, 'base64url').toString('utf-8'));
-
-        //iat, exp
-        const jsonPayload = JSON.parse(Buffer.from(jsonPayloadB64, 'base64url').toString('utf-8'));
-
-        
-        //check expiration
-        if(!allowExpired){
-            const now = Math.floor(Date.now() / 1000);
-            if(jsonPayload.exp < now){
-                console.log('Token expired')
-                if(returnOnlyStatus){
-                    return false;
-                }
-                res.status(400).send({
-                    error:'Token Expired'
-                });
-                return false
-            }
-        }
-
-        //check signature (HMAC-SHA256)
-        if(jsonHeader.alg !== "HS256"){
-            console.log('Unsupported algorithm')
-            if(returnOnlyStatus){
-                return false;
-            }
-            res.status(400).send({
-                error:'Unsupported Algorithm'
-            });
-            return false
-        }
-
-        const expectedSig = nodeCrypto.createHmac('sha256', jwtSecret)
-            .update(`${jsonHeaderB64}.${jsonPayloadB64}`)
-            .digest()
-        const actualSig = Buffer.from(signatureB64, 'base64url')
-
-        if(expectedSig.length !== actualSig.length || !nodeCrypto.timingSafeEqual(expectedSig, actualSig)){
-            console.log('Invalid signature')
-            if(returnOnlyStatus){
-                return false;
-            }
-            res.status(400).send({
-                error:'Invalid Signature'
+            res.status(401).send({
+                error:'Not logged in'
             });
             return false
         }
