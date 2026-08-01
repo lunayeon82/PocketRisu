@@ -85,7 +85,7 @@
                 DBState.db.characters[$selectedCharID].chats = chats
                 changeChatTo(0)
                 void requestImmediateSave()
-                saveChatToServer(DBState.db.characters[$selectedCharID].chaId, 0, newChat.id, newChat as any).catch(() => {})
+                saveChatToServer(DBState.db.characters[$selectedCharID].chaId, 0, newChat.id, newChat).catch(() => {})
                 close()
             }}>
                 <PlusIcon/>
