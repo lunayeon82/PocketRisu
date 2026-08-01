@@ -10,7 +10,7 @@
     import { findCharacterbyId } from "../../ts/util";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import { changeChatTo, requestImmediateSave } from "src/ts/globalApi.svelte";
-    import { deleteChatFromServer } from "src/ts/storage/chatStorage";
+    import { deleteChatFromServer, saveChatToServer } from "src/ts/storage/chatStorage";
     import { v4 } from "uuid";
 
     let editMode = $state(false)
@@ -85,6 +85,7 @@
                 DBState.db.characters[$selectedCharID].chats = chats
                 changeChatTo(0)
                 void requestImmediateSave()
+                saveChatToServer(DBState.db.characters[$selectedCharID].chaId, 0, newChat.id, newChat as any).catch(() => {})
                 close()
             }}>
                 <PlusIcon/>

@@ -1,6 +1,7 @@
 <script lang="ts">
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors, EyeOff } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
+    import { saveChatToServer } from "src/ts/storage/chatStorage"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
@@ -888,6 +889,7 @@
 
         DBState.db.characters[selIdState.selId].chats.unshift(newChat)
         changeChatTo(0)
+        saveChatToServer(DBState.db.characters[selIdState.selId].chaId, 0, newChat.id, newChat as any).catch(() => {})
     }}>
         <SplitIcon size={20}/>
         {#if showNames}

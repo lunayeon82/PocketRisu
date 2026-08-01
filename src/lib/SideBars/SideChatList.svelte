@@ -6,7 +6,7 @@
 
     import type { Chat, ChatFolder, character } from "src/ts/storage/database.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
-    import { ensureChatHydrated, deleteChatFromServer } from "src/ts/storage/chatStorage";
+    import { ensureChatHydrated, deleteChatFromServer, saveChatToServer } from "src/ts/storage/chatStorage";
     import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
     import { selectedCharID, chatDeselected } from "src/ts/stores.svelte";
 
@@ -163,6 +163,7 @@
         chara.chats = chats
         changeChatTo(0)
         void requestImmediateSave()
+        saveChatToServer(chara.chaId, 0, newChat.id, newChat as Chat).catch(() => {})
         $ReloadGUIPointer += 1
     }}>{language.newChat}</ShButton>
 
@@ -288,6 +289,7 @@
                                 changeChatTo(0)
                                 chara.chats = chara.chats
                                 void requestImmediateSave()
+                                saveChatToServer(chara.chaId, 0, newChat.id, newChat as Chat).catch(() => {})
                                 notifySuccess(language.copyChatSuccess)
                             }}>
                                 <CopyIcon size={18}/>
@@ -382,6 +384,7 @@
                         changeChatTo(0)
                         chara.chats = chara.chats
                         void requestImmediateSave()
+                        saveChatToServer(chara.chaId, 0, newChat.id, newChat as Chat).catch(() => {})
                         notifySuccess(language.copyChatSuccess)
                     }}>
                         <CopyIcon size={18}/>
