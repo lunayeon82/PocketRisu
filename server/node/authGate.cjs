@@ -414,6 +414,7 @@ document.getElementById('user-rows').addEventListener('submit', async (e) => {
 }
 
 module.exports = {
+    sharedDb,
     bootstrapAdmin,
     verifyCredentials,
     createSession,
