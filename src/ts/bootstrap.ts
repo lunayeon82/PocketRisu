@@ -29,7 +29,7 @@ import {
     checkCharOrder
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
-import { convertStubsToPlaceholders } from "./storage/chatStorage";
+import { convertStubsToPlaceholders, stubToPlaceholder, loadChatListFromServer } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 
 /**
@@ -130,6 +130,33 @@ export async function loadData() {
                 const dbForConvert = getDatabase()
                 for (const char of dbForConvert.characters) {
                     char.chats = convertStubsToPlaceholders(char.chats)
+                }
+            }
+
+            // Phase 4: reconcile chat list from rl_chats.
+            // Server is authoritative for chats it knows about; local-only entries
+            // (stubs present in database.bin but absent from rl_chats) are kept so
+            // newly created chats that haven't been saved to the server yet survive
+            // a reload. Characters with zero server chats are left untouched (fallback
+            // for accounts that haven't run Phase 3 migration).
+            {
+                LoadingStatusState.text = "Syncing chat list..."
+                try {
+                    const serverMap = await loadChatListFromServer()
+                    const dbForSync = getDatabase()
+                    for (const char of dbForSync.characters) {
+                        if (!char?.chaId) continue
+                        const serverStubs = serverMap.get(char.chaId)
+                        if (!serverStubs || serverStubs.length === 0) continue
+                        const serverIds = new Set(serverStubs.map(s => s.id))
+                        const localOnly = char.chats.filter(c => c?.id && !serverIds.has(c.id))
+                        char.chats = [
+                            ...serverStubs.map(stubToPlaceholder),
+                            ...localOnly,
+                        ]
+                    }
+                } catch (e) {
+                    console.warn('[P4] Chat list reconciliation failed, keeping database.bin stubs:', e)
                 }
             }
 

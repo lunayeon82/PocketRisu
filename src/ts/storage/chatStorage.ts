@@ -120,6 +120,11 @@ export async function deleteChatFromServer(chatId: string): Promise<void> {
     await storage.deleteChatContent(chatId)
 }
 
+export async function loadChatListFromServer(): Promise<Map<string, ChatStub[]>> {
+    const storage = forageStorage.realStorage
+    return storage.loadChatListFromServer()
+}
+
 export async function migrateAllChatsToServer(
     characters: character[],
     onProgress: (done: number, total: number) => void,

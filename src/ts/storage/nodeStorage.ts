@@ -8,7 +8,7 @@
 import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
-import { normalizeChat, type character } from "./database.svelte"
+import { normalizeChat, type character, type ChatStub } from "./database.svelte"
 
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
@@ -683,6 +683,33 @@ export class NodeStorage{
         if (da.status !== 404 && !da.ok) {
             console.error(`[Chat] deleteChatContent failed: ${da.status}`)
         }
+    }
+
+    // ── Chat list (Phase 4) ───────────────────────────────────────────────────
+
+    async loadChatListFromServer(): Promise<Map<string, ChatStub[]>> {
+        const da = await this.authFetch('/api/chats')
+        if (!da.ok) throw new Error(`loadChatListFromServer: ${da.status}`)
+        const rows: Array<{
+            id: string
+            character_id: string
+            title: string
+            last_date: number | null
+            folder_id: string | null
+            modules: string[] | null
+        }> = await da.json()
+
+        const map = new Map<string, ChatStub[]>()
+        for (const row of rows) {
+            const stub: ChatStub = { id: row.id, name: row.title, _stub: true }
+            if (row.last_date != null) stub.lastDate = row.last_date
+            if (row.folder_id != null) stub.folderId = row.folder_id
+            if (Array.isArray(row.modules)) stub.modules = row.modules
+            const arr = map.get(row.character_id) ?? []
+            arr.push(stub)
+            map.set(row.character_id, arr)
+        }
+        return map
     }
 
     // ── Bulk chat migration (Phase 3) ─────────────────────────────────────────
