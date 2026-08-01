@@ -87,6 +87,16 @@ const stmtMaxSortOrder = sharedDb.prepare(`
   SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM rl_messages WHERE chat_id = ?
 `);
 
+const stmtDeleteChatMessages = sharedDb.prepare(`DELETE FROM rl_messages WHERE chat_id = ?`);
+
+const stmtListChatsByCharacter = sharedDb.prepare(`
+  SELECT c.id, c.character_id, c.title, c.chat_meta, c.created_at, c.updated_at,
+         (SELECT COUNT(*) FROM rl_messages m WHERE m.chat_id = c.id) AS message_count
+  FROM rl_chats c
+  WHERE c.user_id = ? AND c.character_id = ?
+  ORDER BY c.updated_at DESC
+`);
+
 // Bulk message insert — used by createChat and addMessage
 const insertMsgsBatch = sharedDb.transaction((msgs, chatId, baseOrder, now) => {
     const inserted = [];
@@ -116,10 +126,12 @@ function toJSON(val) {
 
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
-// GET /api/chats
+// GET /api/chats[?character_id=xxx]
 function listChats(req, res) {
     const userId = resolveUserId(req);
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const { character_id } = req.query;
+    if (character_id) return res.json(stmtListChatsByCharacter.all(userId, character_id));
     return res.json(stmtListChats.all(userId));
 }
 
@@ -175,6 +187,35 @@ function updateChat(req, res) {
 
     stmtUpdateChat.run(newTitle, newMeta, now, req.params.id, userId);
     return res.json({ ...chat, title: newTitle, chat_meta: newMeta, updated_at: now });
+}
+
+// PUT /api/chats/:id/full — upsert chat + atomically replace all messages
+// Used by the frontend save path; mirrors what POST /api/chat-content/ used to do.
+function upsertChatFull(req, res) {
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const chatId = req.params.id;
+    const { character_id, title = '', chat_meta, messages = [] } = req.body || {};
+    if (!character_id) return res.status(400).json({ error: 'character_id required' });
+
+    const now = Date.now();
+    const metaJson = toJSON(chat_meta);
+
+    sharedDb.transaction(() => {
+        const existing = stmtGetChat.get(chatId, userId);
+        if (existing) {
+            stmtUpdateChat.run(title, metaJson, now, chatId, userId);
+        } else {
+            stmtInsertChat.run(chatId, userId, character_id, title, metaJson, now, now);
+        }
+        stmtDeleteChatMessages.run(chatId);
+        if (messages.length > 0) {
+            insertMsgsBatch(messages, chatId, -1, now);
+        }
+    })();
+
+    return res.json({ ok: true, id: chatId, updated_at: now });
 }
 
 // DELETE /api/chats/:id
@@ -247,6 +288,7 @@ function mountChatApi(app) {
     app.get('/api/chats',                          listChats);
     app.get('/api/chats/:id',                      getChat);
     app.post('/api/chats',                         createChat);
+    app.put('/api/chats/:id/full',                 upsertChatFull);
     app.put('/api/chats/:id',                      updateChat);
     app.delete('/api/chats/:id',                   deleteChat);
     app.post('/api/chats/:id/messages',            addMessage);

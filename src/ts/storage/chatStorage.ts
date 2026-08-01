@@ -115,6 +115,11 @@ export async function saveChatToServer(chaId: string, chatIndex: number, chatId:
     await storage.saveChatContent(chaId, chatIndex, chatId, chat)
 }
 
+export async function deleteChatFromServer(chatId: string): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.deleteChatContent(chatId)
+}
+
 // ── Hydration ───────────────────────────────────────────────────────────────
 
 /**

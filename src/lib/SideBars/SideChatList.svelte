@@ -6,7 +6,7 @@
 
     import type { Chat, ChatFolder, character } from "src/ts/storage/database.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
-    import { ensureChatHydrated } from "src/ts/storage/chatStorage";
+    import { ensureChatHydrated, deleteChatFromServer } from "src/ts/storage/chatStorage";
     import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
     import { selectedCharID, chatDeselected } from "src/ts/stores.svelte";
 
@@ -323,12 +323,14 @@
                                 }
                                 const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                                 if(d){
+                                    const deletedId = chat.id
                                     changeChatTo(0)
                                     $ReloadGUIPointer += 1
                                     let chats = chara.chats
                                     chats.splice(chara.chats.indexOf(chat), 1)
                                     chara.chats = chats
                                     void requestImmediateSave()
+                                    if(deletedId) deleteChatFromServer(deletedId).catch(() => {})
                                 }
                             }}>
                                 <TrashIcon size={18}/>
@@ -415,12 +417,14 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                         if(d){
+                            const deletedId = chat.id
                             changeChatTo(0)
                             $ReloadGUIPointer += 1
                             let chats = chara.chats
                             chats.splice(i, 1)
                             chara.chats = chats
                             void requestImmediateSave()
+                            if(deletedId) deleteChatFromServer(deletedId).catch(() => {})
                         }
                     }}>
                         <TrashIcon size={18}/>

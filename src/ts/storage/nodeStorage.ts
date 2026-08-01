@@ -629,26 +629,60 @@ export class NodeStorage{
     // ── Chat content (runtime lazy load) ────────────────────────────────────
 
     async fetchChatContent(chaId: string, chatIndex: number, chatId: string): Promise<any | null> {
-        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+        // Try new rl_chats storage first
+        const da = await this.authFetch(`/api/chats/${encodeURIComponent(chatId)}`)
+        if (da.ok) {
+            const json = await da.json()
+            const messages = (json.messages ?? []).map((row: any) =>
+                typeof row.content === 'string' ? JSON.parse(row.content) : row.content
+            )
+            const meta = json.chat_meta
+                ? (typeof json.chat_meta === 'string' ? JSON.parse(json.chat_meta) : json.chat_meta)
+                : {}
+            return normalizeChat({ ...meta, id: json.id, name: json.title, message: messages })
+        }
+        if (da.status !== 404) throw new Error(`fetchChatContent error: ${da.status}`)
+
+        // Fallback: old binary endpoint for chats not yet migrated
+        const da2 = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
             headers: { 'x-chat-id': chatId },
         })
-        if (da.status === 404) return null
-        if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
-        const buffer = new Uint8Array(await da.arrayBuffer())
-        return normalizeChat(await decodeRisuSave(buffer))
+        if (da2.status === 404) return null
+        if (!da2.ok) throw new Error(`fetchChatContent error: ${da2.status}`)
+        const buffer = new Uint8Array(await da2.arrayBuffer())
+        const chat = normalizeChat(await decodeRisuSave(buffer))
+        // Migrate on first open — fire and forget
+        this.saveChatContent(chaId, chatIndex, chatId, chat).catch(() => {})
+        return chat
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
-        const encoded = encodeRisuSaveLegacy(chat)
-        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/octet-stream',
-                'x-chat-id': chatId,
-            },
-            body: encoded,
+        const { message: messages, name: title, id: _id, _placeholder: _ph, ...chatMeta } = chat
+        const da = await this.authFetch(`/api/chats/${encodeURIComponent(chatId)}/full`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                character_id: chaId,
+                title: title ?? '',
+                chat_meta: chatMeta,
+                messages: (messages ?? []).map((msg: any, idx: number) => ({
+                    role: msg.role,
+                    content: msg,
+                    sort_order: idx,
+                })),
+            }),
         })
-        if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+        if (!da.ok) throw new Error(`saveChatContent error: ${da.status}`)
+    }
+
+    async deleteChatContent(chatId: string): Promise<void> {
+        const da = await this.authFetch(`/api/chats/${encodeURIComponent(chatId)}`, {
+            method: 'DELETE',
+        })
+        // 404 means already gone on server — not an error
+        if (da.status !== 404 && !da.ok) {
+            console.error(`[Chat] deleteChatContent failed: ${da.status}`)
+        }
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────
