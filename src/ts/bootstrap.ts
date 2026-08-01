@@ -29,7 +29,7 @@ import {
     checkCharOrder
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
-import { convertStubsToPlaceholders, stubToPlaceholder, loadChatListFromServer } from "./storage/chatStorage";
+import { stubToPlaceholder, loadChatListFromServer } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 
 /**
@@ -124,21 +124,10 @@ export async function loadData() {
             LoadingStatusState.text = "Checking For Format Update..."
             await checkNewFormat()
 
-            // Convert any ChatStubs (from server-stripped database.bin) to placeholder Chats
-            // so runtime code only sees Chat objects
-            {
-                const dbForConvert = getDatabase()
-                for (const char of dbForConvert.characters) {
-                    char.chats = convertStubsToPlaceholders(char.chats)
-                }
-            }
-
-            // Phase 4: reconcile chat list from rl_chats.
-            // Server is authoritative for chats it knows about; local-only entries
-            // (stubs present in database.bin but absent from rl_chats) are kept so
-            // newly created chats that haven't been saved to the server yet survive
-            // a reload. Characters with zero server chats are left untouched (fallback
-            // for accounts that haven't run Phase 3 migration).
+            // Chat list: rl_chats is the only source. database.bin never carries
+            // chats (server strips the field on every /api/read — see
+            // stripChatsFromDb in server.cjs), so there is nothing to convert or
+            // merge here — just load each character's chats from the server.
             {
                 LoadingStatusState.text = "Syncing chat list..."
                 try {
@@ -146,17 +135,16 @@ export async function loadData() {
                     const dbForSync = getDatabase()
                     for (const char of dbForSync.characters) {
                         if (!char?.chaId) continue
-                        const serverStubs = serverMap.get(char.chaId)
-                        if (!serverStubs || serverStubs.length === 0) continue
-                        const serverIds = new Set(serverStubs.map(s => s.id))
-                        const localOnly = char.chats.filter(c => c?.id && !serverIds.has(c.id))
-                        char.chats = [
-                            ...serverStubs.map(stubToPlaceholder),
-                            ...localOnly,
-                        ]
+                        const serverStubs = serverMap.get(char.chaId) ?? []
+                        char.chats = serverStubs.map(stubToPlaceholder)
                     }
                 } catch (e) {
-                    console.warn('[P4] Chat list reconciliation failed, keeping database.bin stubs:', e)
+                    console.error('[Chats] Failed to load chat list from server:', e)
+                    alertError(`Failed to load your chat list: ${e}`)
+                    const dbForSync = getDatabase()
+                    for (const char of dbForSync.characters) {
+                        if (!Array.isArray(char.chats)) char.chats = []
+                    }
                 }
             }
 

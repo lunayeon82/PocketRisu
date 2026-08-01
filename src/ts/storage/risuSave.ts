@@ -2,7 +2,6 @@ import { Packr, Unpackr, decode } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
-import { chatToStub } from "./chatStorage";
 
 const packr = new Packr({
     useRecords:false
@@ -169,8 +168,10 @@ export class RisuSaveEncoder {
         });
         this.characterJsons = {}
         for( const character of data.characters) {
-            // Replace chats with stubs for database.bin — full chat data lives server-side
-            const charForEncode = { ...character, chats: character.chats.map(c => chatToStub(c)) }
+            // database.bin never carries chats — they live in rl_chats only
+            // (see src/ts/storage/chatStorage.ts). Drop the field entirely
+            // rather than stubbing it.
+            const { chats: _chats, ...charForEncode } = character
             // Raw stringify (no normalize fallback): a circular ref must fail the
             // save loudly, exactly as before, rather than silently persist a
             // lossy copy. This string doubles as the encode payload.
@@ -216,10 +217,11 @@ export class RisuSaveEncoder {
             const chaId = character.chaId
             savedId.add(chaId)
             const index = toSave.character.indexOf(chaId);
-            // Compare against the stub-replaced character so hydration (stub →
-            // full chat) doesn't read as a change of the character itself.
-            // Raw stringify (see init): circular refs fail the save loudly.
-            const charForEncode = { ...character, chats: character.chats.map(c => chatToStub(c)) }
+            // Compare with chats excluded so hydration (placeholder → full
+            // chat) and any other chat-only mutation doesn't read as a change
+            // of the character itself. Raw stringify (see init): circular
+            // refs fail the save loudly.
+            const { chats: _chats, ...charForEncode } = character
             const charJson = JSON.stringify(charForEncode)
             const hasChanged = this.characterJsons[chaId] !== charJson
 
@@ -890,10 +892,11 @@ export class RisuSavePatcher {
 
         for (let i = 0; i < this.lastSyncedDb.characters.length; i++) {
             const character = this.lastSyncedDb.characters[i];
-            // Hash with stubs only (matching set()) so hashes stay in sync
-            const withStubs = { ...character, chats: (character.chats || []).map((c: any) => chatToStub(c)) };
-            this.hashBlocks[character.chaId] = calculateHash(withStubs);
-            this.lastSyncedDb.characters[i] = withStubs;
+            // Hash without chats (matching set()) so hashes stay in sync with
+            // the server's chats-free dbCache baseline.
+            const { chats: _chats, ...withoutChats } = character;
+            this.hashBlocks[character.chaId] = calculateHash(withoutChats);
+            this.lastSyncedDb.characters[i] = withoutChats;
         }
 
         // Seed the cheap pre-check baselines from the NORMALIZED data, not the
@@ -1087,15 +1090,17 @@ export class RisuSavePatcher {
         const structuralChange = lastIds.length !== curIds.length ||
             lastIds.some((id: string, i: number) => id !== curIds[i])
 
-        // Replace chats with stubs for patch diff — full chat data lives server-side
-        function withStubs(char: any) {
+        // Drop chats for the patch diff — database.bin never carries them,
+        // they live in rl_chats only (src/ts/storage/chatStorage.ts).
+        function withoutChats(char: any) {
             if (!char) return char
-            return { ...char, chats: (char.chats || []).map((c: any) => chatToStub(c)) }
+            const { chats: _chats, ...rest } = char
+            return rest
         }
 
         if (structuralChange) {
             // Structural change → replace entire characters array (safe for deletions/additions)
-            const normChars = normalizeJSON(curCharacters.map(withStubs))
+            const normChars = normalizeJSON(curCharacters.map(withoutChats))
             patch.push({ op: 'replace', path: '/characters', value: normChars })
             // Update all character hashes
             for (const lastId of lastIds) {
@@ -1125,12 +1130,12 @@ export class RisuSavePatcher {
                 // hash, baseline and (empty) diff are all still valid — skip
                 // the normalize + protocol hash + compare entirely.
                 let curJson: string | null = null
-                try { curJson = JSON.stringify(withStubs(curChar)) } catch { curJson = null }
+                try { curJson = JSON.stringify(withoutChats(curChar)) } catch { curJson = null }
                 if (!trackedBySave && curCharId && curJson !== null && curJson === this.lastCharJsons.get(curCharId)) {
                     continue
                 }
 
-                const normChar = normalizeJSON(withStubs(curChar))
+                const normChar = normalizeJSON(withoutChats(curChar))
                 const curCharHash = curCharId ? calculateHash(normChar) : undefined
                 const changedByHash = !!(curCharId && curCharHash !== this.hashBlocks[curCharId])
 
@@ -1169,10 +1174,10 @@ export class RisuSavePatcher {
     }
 }
 
-// Stub metadata fields a patch may legitimately touch on `chats[i]`. Anything
-// else is chat-internal data that lives server-side via /api/chat-content;
-// emitting such ops over /api/patch silently strips the `_stub` flag in the
-// server's dbCache and corrupts the on-disk DB. Keep in sync with chatToStub.
+// database.bin no longer carries chats at all (see withoutChats above), so no
+// `/characters/N/chats/...` path should ever appear in a patch. This allowlist
+// stays as a defense-in-depth trip wire against a future regression that
+// reintroduces chats into the diffed character object.
 const STUB_METADATA_FIELDS = new Set(['id', 'name', '_stub', 'lastDate', 'folderId', 'modules']);
 
 // Only these op types are legitimate on chat-internal paths. The patcher's
@@ -1185,10 +1190,10 @@ const CHAT_FIELD_PATH_RE = /^\/characters\/\d+\/chats\/\d+\/([^/]+)/
 
 /**
  * Detect patch ops that mutate chat-internal fields. The patcher should never
- * produce these — chats are always run through chatToStub before diffing — so
- * any hit indicates a baseline-vs-current mismatch that would cause server-side
- * data loss (see findChatInternalFieldOps in server.cjs). Used by the save
- * pipeline to refuse the patch and fall through to a safe full write.
+ * produce these — chats are always excluded from the diffed character (see
+ * withoutChats above) — so any hit indicates a baseline-vs-current mismatch.
+ * Used by the save pipeline to refuse the patch and fall through to a safe
+ * full write.
  *
  * The `_stub` field gets stricter treatment than other allowed fields: only
  * `add`/`replace` with literal value `true` is permitted. Removing `_stub`

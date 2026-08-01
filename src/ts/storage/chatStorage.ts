@@ -31,11 +31,14 @@ export function stubToPlaceholder(stub: ChatStub): Chat {
 }
 
 /**
- * Convert a Chat (or placeholder) to a ChatStub for database.bin encoding.
+ * Convert a Chat (or placeholder) to a ChatStub.
+ *
+ * database.bin no longer carries chats at all (see risuSave.ts), so this no
+ * longer feeds the save path — kept for the chat-guard diagnostic dump in
+ * globalApi.svelte.ts (classifyChat/chatToStub replay) and its tests.
  *
  * Key presence is preserved even when the value is null/undefined so the
- * stub round-trip distinguishes "user cleared" from "field absent". The
- * server merge layer relies on `in` semantics — see mergeChatStubWithFullChat.
+ * stub round-trip distinguishes "user cleared" from "field absent".
  */
 export function chatToStub(chat: Chat | ChatStub): ChatStub {
     if (isChatStub(chat)) return chat

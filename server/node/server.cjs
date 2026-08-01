@@ -56,13 +56,12 @@ if (nodeMajor < 24) {
 // Configuration flags for patch-based sync
 const enablePatchSync = true;
 
-// In-memory database cache for patch-based sync
-// dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
-// fullChatStore keeps the actual chat data keyed by chaId→chatId.
+// In-memory database cache for patch-based sync.
+// database.bin never carries chat data (chats live in rl_chats/rl_messages,
+// see chatApi.cjs) — dbCache holds characters/lorebooks/presets/settings only.
 let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
-let fullChatStore = null; // Map<chaId, Map<chatId, chatObject>> — lazy-initialized
 
 // ETag for database.bin
 let dbEtag = null;
@@ -226,15 +225,7 @@ async function flushPendingDb() {
         clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
         if (dbCache[DB_HEX_KEY]) {
-            await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
-        } else if (fullChatStore && fullChatStore.size > 0) {
-            // No stripped cache but chat store has data — merge and persist directly
-            const raw = kvGet('database/database.bin');
-            if (raw) {
-                const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
-                kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
-            }
+            await persistDbCache(DB_HEX_KEY, 'database/database.bin');
         }
         createBackupAndRotate();
     }
@@ -242,7 +233,6 @@ async function flushPendingDb() {
 
 function invalidateDbCache() {
     delete dbCache[DB_HEX_KEY];
-    fullChatStore = null;
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
@@ -252,26 +242,11 @@ function invalidateDbCache() {
 
 // ─── Chat runtime lazy load helpers ─────────────────────────────────────────
 
-function assignMissingChatIds(dbObj) {
-    let changed = false;
-    if (!dbObj?.characters) return changed;
-    for (const char of dbObj.characters) {
-        if (!char?.chats) continue;
-        for (const chat of char.chats) {
-            if (!chat || chat._stub || chat.id) continue;
-            chat.id = nodeCrypto.randomUUID();
-            changed = true;
-        }
-    }
-    return changed;
-}
-
-// Recovers chats whose folderId points to a deleted folder. The previous merge
-// layer silently kept stale folderId on disk when a user moved a chat out of a
-// folder, then later deleting that folder produced orphans invisible in the
-// sidebar (rendered into neither the no-folder section nor any folder section).
-// Boot-time normalize so historical corruption self-heals; new corruption is
-// blocked by the merge fix in mergeChatStubWithFullChat.
+// Recovers chats whose folderId points to a deleted folder. Historically this
+// guarded against a merge bug (fixed) that could leave stale folderId on disk.
+// database.bin no longer carries chats at all (see stripChatsFromDb), so this
+// is permanently a no-op today; left in place since decodeDatabaseWithPersistentChatIds
+// still calls it and it's harmless against any legacy pre-migration blob.
 function normalizeOrphanFolderIds(dbObj) {
     let changed = false;
     if (!dbObj?.characters) return changed;
@@ -302,9 +277,6 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     const dbObj = normalizeJSON(await decodeRisuSave(raw));
     let needsPersist = false;
 
-    const hadMissingIds = assignMissingChatIds(dbObj);
-    if (hadMissingIds) needsPersist = true;
-
     const hadOrphanFolderIds = normalizeOrphanFolderIds(dbObj);
     if (hadOrphanFolderIds) needsPersist = true;
 
@@ -334,130 +306,22 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
 }
 
 /**
- * Convert a full chat to a stub (metadata only).
- *
- * Hybrid corruption guard: a chat carrying `_stub: true` AND a real `message`
- * array is the v1.4.x legacy hybrid pattern. The fast-path "if _stub return"
- * would propagate the corruption (server reassemble skips merge for _stub
- * chats with no fullChat lookup match). Treat hybrids as real chats and
- * collapse them to a real stub here.
- */
-function chatToStub(chat) {
-    if (!chat) return chat;
-    if (chat._stub && !Array.isArray(chat.message)) return chat;
-    const stub = {
-        id: chat.id || '',
-        name: chat.name ?? '',
-        _stub: true,
-    };
-    // Preserve key presence even when the value is null/undefined so the
-    // round-trip distinguishes "user cleared" from "field absent". See
-    // mergeChatStubWithFullChat — it relies on `in` semantics.
-    if ('lastDate' in chat) stub.lastDate = chat.lastDate;
-    if ('folderId' in chat) stub.folderId = chat.folderId;
-    if ('modules' in chat) stub.modules = chat.modules;
-    return stub;
-}
-
-/**
- * Initialize fullChatStore from a decoded full database object.
- * Extracts all chat payloads into the store keyed by chaId → chatId.
- *
- * Hybrid corruption recovery: a chat with both `_stub: true` and a real
- * message array is treated as a real chat (its fullChat data is intact).
- * Strip the `_stub` flag in place so subsequent reassemble passes don't
- * reproduce the hybrid on disk.
- */
-function initChatStore(dbObj) {
-    fullChatStore = new Map();
-    if (!dbObj?.characters) return;
-    for (const char of dbObj.characters) {
-        if (!char?.chaId || !char.chats) continue;
-        const charChats = new Map();
-        for (const chat of char.chats) {
-            if (!chat) continue;
-            const isStub = chat._stub === true;
-            const hasMessage = Array.isArray(chat.message);
-            // Real stub (no payload) — fullChatStore tracks payloads only.
-            if (isStub && !hasMessage) continue;
-            // Hybrid: strip the corrupt _stub flag, keep the real chat.
-            if (isStub && hasMessage) {
-                delete chat._stub;
-            }
-            if (!chat.id) {
-                chat.id = nodeCrypto.randomUUID();
-            }
-            charChats.set(chat.id, chat);
-        }
-        if (charChats.size > 0) {
-            fullChatStore.set(char.chaId, charChats);
-        }
-    }
-}
-
-/**
- * Strip full chat data from a decoded database object, replacing with stubs.
- * Returns a new object — does not mutate input.
+ * Drop chat data from a decoded database object. database.bin never carries
+ * chats — they live in rl_chats/rl_messages (chatApi.cjs), scoped per account.
+ * This is a defensive strip so a stale/pre-migration client payload, or
+ * leftover bytes from before this server version, never gets echoed back out
+ * (/api/read) or re-persisted (/api/write, /api/patch baseline). Returns a
+ * new object — does not mutate input.
  */
 function stripChatsFromDb(dbObj) {
     if (!dbObj?.characters) return dbObj;
     const stripped = { ...dbObj };
     stripped.characters = dbObj.characters.map(char => {
-        if (!char?.chats) return char;
-        return { ...char, chats: char.chats.map(chatToStub) };
+        if (!char || !('chats' in char)) return char;
+        const { chats: _drop, ...rest } = char;
+        return rest;
     });
     return stripped;
-}
-
-/**
- * Reassemble a full database from a stripped DB + fullChatStore.
- * Replaces stubs with full chats from the store. Returns a new object.
- */
-function mergeChatStubWithFullChat(stub, fullChat) {
-    if (!fullChat) {
-        return stub;
-    }
-    if (!stub || !stub._stub) {
-        return fullChat;
-    }
-    const merged = {
-        ...fullChat,
-        id: stub.id || fullChat.id || '',
-        name: stub.name,
-    };
-    // Defensive: never let `_stub: true` ride along on a merged chat. If
-    // fullChat carries a stale flag (legacy disk corruption), the spread
-    // would propagate the hybrid pattern back to disk and re-trigger the
-    // chat-data loss path on next round-trip.
-    if ('_stub' in merged) delete merged._stub;
-    // Use key presence (`in`) so an explicit null/undefined from the client —
-    // meaning "user cleared this field" — overwrites fullChat. The previous
-    // `!= null` check conflated "cleared" with "absent" and silently kept
-    // stale folderId / modules on disk, producing orphan-folder chats.
-    if ('lastDate' in stub) merged.lastDate = stub.lastDate;
-    if ('folderId' in stub) merged.folderId = stub.folderId;
-    if ('modules' in stub) merged.modules = stub.modules;
-    return merged;
-}
-
-function reassembleFullDb(strippedDb) {
-    if (!strippedDb?.characters || !fullChatStore) return strippedDb;
-    const full = { ...strippedDb };
-    full.characters = strippedDb.characters.map(char => {
-        if (!char?.chaId || !char.chats) return char;
-        const charChats = fullChatStore.get(char.chaId);
-        if (!charChats) return char;
-        return {
-            ...char,
-            chats: char.chats.map(chat => {
-                if (chat && chat._stub && chat.id) {
-                    return mergeChatStubWithFullChat(chat, charChats.get(chat.id));
-                }
-                return chat;
-            }),
-        };
-    });
-    return full;
 }
 
 // ─── Remote-block migration ─────────────────────────────────────────────────
@@ -554,159 +418,15 @@ async function migrateRemoteBlocksIfNeeded() {
 }
 
 /**
- * Ensure fullChatStore is initialized. Loads from disk if needed.
+ * Persist dbCache to disk. database.bin no longer carries chats (see
+ * stripChatsFromDb), so dbCache already holds exactly what should land on
+ * disk — no reassemble/merge step needed.
  */
-async function ensureChatStore() {
-    if (fullChatStore) return;
-    // Run remote-block migration first so the decode below sees an inline DB.
-    // Idempotent — skipped on every subsequent call.
-    await migrateRemoteBlocksIfNeeded();
-    const raw = kvGet('database/database.bin');
-    if (!raw) {
-        fullChatStore = new Map();
-        return;
-    }
-    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, {
-        createBackup: true,
-    });
-    initChatStore(dbObj);
-}
+async function persistDbCache(filePath, decodedKey) {
+    const db = dbCache[filePath];
+    if (!db) return;
 
-// Stub metadata fields a JSON Patch may legitimately touch on a `chats[i]`
-// entry. Anything else is a chat-internal field — those live in fullChatStore,
-// not in dbCache, and should never appear in a /api/patch payload. Keep in
-// sync with chatToStub on both server and client.
-const STUB_METADATA_FIELDS = new Set(['id', 'name', '_stub', 'lastDate', 'folderId', 'modules']);
-
-// Only add/replace/remove are produced by the legitimate patcher. move/copy
-// could alias _stub or other chat-internal fields through `from`, bypassing
-// the path-based field allowlist. Reject those op types outright on chat
-// paths. test ops can also reveal/manipulate state; deny for symmetry.
-const ALLOWED_CHAT_OP_TYPES = new Set(['add', 'replace', 'remove']);
-
-const CHAT_FIELD_PATH_RE = /^\/characters\/\d+\/chats\/\d+\/([^/]+)/;
-
-/**
- * Detect JSON Patch ops that mutate chat-internal fields (anything beyond
- * STUB_METADATA_FIELDS). Such ops are the loss vector: applying them to
- * dbCache leaves a metadata-only chat without `_stub`, which then bypasses
- * fullChat merge in reassembleFullDb and gets persisted as-is.
- *
- * Whole-chat ops (path = `/characters/N/chats/M` or `/characters/N/chats`)
- * are allowed — those replace/add/remove chat slots wholesale and the
- * reassemble guard takes care of validating the resulting state.
- *
- * The `_stub` field gets stricter treatment than other allowed fields: only
- * `add`/`replace` with literal value `true` is permitted. Any op that could
- * remove the flag or set it to a falsy value is itself the loss mechanism
- * (reassembleFullDb skips merge when `_stub` is falsy), so it must be
- * blocked at the patch boundary, not just at the persist boundary.
- *
- * `move`/`copy` ops are rejected wholesale on chat-internal paths because
- * the field-name allowlist on `path` alone can't catch a `from` that points
- * at `_stub` or another chat-internal field. Both `path` and `from` are
- * checked when present.
- */
-function findChatInternalFieldOps(patch) {
-    if (!Array.isArray(patch)) return [];
-    const violations = [];
-    for (const op of patch) {
-        if (!op || typeof op !== 'object' || typeof op.path !== 'string') continue;
-
-        const pathMatch = op.path.match(CHAT_FIELD_PATH_RE);
-        const fromMatch = typeof op.from === 'string' ? op.from.match(CHAT_FIELD_PATH_RE) : null;
-        if (!pathMatch && !fromMatch) continue;
-
-        if (!ALLOWED_CHAT_OP_TYPES.has(op.op)) {
-            violations.push({
-                op: op.op,
-                path: op.path,
-                field: (pathMatch && pathMatch[1]) || (fromMatch && fromMatch[1]) || '',
-                reason: 'disallowed op type on chat field',
-            });
-            continue;
-        }
-
-        if (pathMatch) {
-            const field = pathMatch[1];
-            if (!STUB_METADATA_FIELDS.has(field)) {
-                violations.push({ op: op.op, path: op.path, field });
-                continue;
-            }
-            if (field === '_stub') {
-                if (op.op === 'remove') {
-                    violations.push({ op: op.op, path: op.path, field, reason: 'remove _stub' });
-                } else if ((op.op === 'add' || op.op === 'replace') && op.value !== true) {
-                    violations.push({ op: op.op, path: op.path, field, reason: 'non-true _stub value' });
-                }
-            }
-        }
-    }
-    return violations;
-}
-
-/**
- * Detect chats that lost their `_stub` flag without being upgraded to a real
- * Chat. reassembleFullDb skips merge when `_stub` is falsy, so persisting such
- * a chat would write metadata-only to disk and silently strip messages — the
- * exact data-loss path reported with PATCH `remove /chats/N/{message,...}` ops.
- *
- * A real Chat has `message` (Array). A real stub has `_stub === true`. Anything
- * with neither is a malformed in-between state; treat as a corruption signal.
- */
-function findStubFlagLossChats(fullDb) {
-    if (!fullDb?.characters) return [];
-    const losses = [];
-    for (let ci = 0; ci < fullDb.characters.length; ci++) {
-        const char = fullDb.characters[ci];
-        if (!char?.chats) continue;
-        for (let chi = 0; chi < char.chats.length; chi++) {
-            const chat = char.chats[chi];
-            if (!chat || typeof chat !== 'object') continue;
-            const isStub = chat._stub === true;
-            const hasMessage = Array.isArray(chat.message);
-            if (!isStub && !hasMessage) {
-                losses.push({
-                    chaId: char.chaId,
-                    charIndex: ci,
-                    chatIndex: chi,
-                    chatId: chat.id || null,
-                });
-            }
-        }
-    }
-    return losses;
-}
-
-/**
- * Persist dbCache to disk with full chats merged back in.
- */
-async function persistDbCacheWithChats(filePath, decodedKey) {
-    const strippedDb = dbCache[filePath];
-    if (!strippedDb) return;
-    await ensureChatStore();
-    const fullDb = reassembleFullDb(strippedDb);
-
-    // Disk protection guard: abort persist when reassemble produced metadata-only
-    // chats. Writing them would lock the loss in (next /api/read returns the
-    // stripped chat with no `_stub`, so hydration never re-merges fullChatStore).
-    // Invalidate dbCache so the next request re-reads from disk and rebuilds a
-    // consistent stub view; client receives 409 on next /api/patch via hash mismatch.
-    if (decodedKey === 'database/database.bin') {
-        const losses = findStubFlagLossChats(fullDb);
-        if (losses.length > 0) {
-            const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
-            const err = new Error(
-                `persist aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
-                + `would silently strip messages on disk. sample=[${sample}]`
-            );
-            recordPersistFailure(err, 'persistDbCacheWithChats:stub-flag-loss');
-            delete dbCache[filePath];
-            throw err;
-        }
-    }
-
-    const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
+    const data = Buffer.from(encodeRisuSaveLegacy(db));
     try {
         kvSet(decodedKey, data);
     } catch (err) {
@@ -716,14 +436,6 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
             try { err.attemptedSize = data.length; } catch {}
         }
         throw err;
-    }
-    // Refresh fullChatStore from the persisted snapshot so subsequent
-    // /api/chat-content GETs return the same metadata (folderId, modules)
-    // that just hit disk. Without this, PATCH-only clears of stub fields
-    // leave fullChatStore holding stale fullChat objects, and hydration
-    // would resurrect the cleared values until the next /api/read.
-    if (decodedKey === 'database/database.bin') {
-        initChatStore(fullDb);
     }
 }
 
@@ -2430,12 +2142,11 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     let coldStorageFailed = 0;
     if (dbRaw) {
         const migration = {};
-        const dbObj = await decodeDatabaseWithPersistentChatIds(dbRaw, {
+        await decodeDatabaseWithPersistentChatIds(dbRaw, {
             createBackup: false,
             migrationResult: migration,
         });
         coldStorageFailed = migration.coldStorageFailed || 0;
-        initChatStore(dbObj);
     }
 
     try {
@@ -3435,13 +3146,12 @@ app.get('/api/read', async (req, res, next) => {
         if(value === null){
             res.send();
         } else {
-            // Strip chat payloads from database.bin — client gets stubs only
+            // Strip any chat payloads from database.bin — chats live in rl_chats only
             if (key === 'database/database.bin') {
                 try {
                     const dbObj = await decodeDatabaseWithPersistentChatIds(value, {
                         createBackup: true,
                     });
-                    initChatStore(dbObj);
                     const stripped = normalizeJSON(stripChatsFromDb(dbObj));
                     // Populate dbCache so patch endpoint uses the same data
                     dbCache[filePath] = stripped;
@@ -3645,44 +3355,16 @@ app.post('/api/write', async (req, res, next) => {
                 await writeInlaySidecar(id, parsed);
                 kvDel(key);
             } else if (key === 'database/database.bin') {
-                // Client sends stubs-only DB — merge full chats from server before persisting
+                // Defensive strip: a stale/pre-migration client could still send
+                // chats embedded in the payload. Chats live in rl_chats only —
+                // never persist or echo back anything under characters[].chats.
                 try {
                     const incomingDb = await decodeRisuSave(fileContent);
-                    await ensureChatStore();
-                    const fullDb = reassembleFullDb(incomingDb);
-
-                    // Mirror the patch-persist guard (persistDbCacheWithChats):
-                    // a malformed full-write payload could carry chats with
-                    // neither `_stub` nor `message` (the v1.4.x metadata-only
-                    // pattern). reassembleFullDb passes them through unchanged
-                    // because there's no fullChat lookup to merge in, so they
-                    // would land on disk and silently strip user messages.
-                    // Normal clients are safe (RisuSaveEncoder runs chatToStub
-                    // on every chat first), but external tools / future
-                    // regressions could bypass that — keep the guard at the
-                    // disk boundary for defense in depth.
-                    const losses = findStubFlagLossChats(fullDb);
-                    if (losses.length > 0) {
-                        const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
-                        const err = new Error(
-                            `write aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
-                            + `would silently strip messages on disk. sample=[${sample}]`
-                        );
-                        recordPersistFailure(err, '/api/write:stub-flag-loss');
-                        logger.error(`[Write] ${err.message}`);
-                        res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
-                        return;
-                    }
-
-                    const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
-                    // Re-init chat store from merged result
-                    initChatStore(fullDb);
-                    kvSet(key, mergedContent);
+                    const cleaned = normalizeJSON(stripChatsFromDb(incomingDb));
+                    kvSet(key, Buffer.from(encodeRisuSaveLegacy(cleaned)));
                 } catch (e) {
-                    logger.error('[Write] Failed to merge chats into database.bin:', e.message);
-                    // Do NOT write stubs-only to disk — that would permanently
-                    // destroy existing full chat data. Preserve disk as-is.
-                    res.status(500).json({ error: 'Database merge failed' });
+                    logger.error('[Write] Failed to process database.bin:', e.message);
+                    res.status(500).json({ error: 'Database write failed' });
                     return;
                 }
             } else {
@@ -3753,56 +3435,22 @@ app.post('/api/patch', async (req, res, next) => {
         await queueStorageOperation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
 
-            // Load database into memory if not already cached
-            // For database.bin, cache holds the STRIPPED version (stubs only)
+            // Load database into memory if not already cached.
+            // database.bin never carries chats (see stripChatsFromDb) — a patch
+            // op that still targets /characters/N/chats/... has nothing to
+            // resolve against and fails applyPatch's own validation below.
             if (!dbCache[filePath]) {
                 const fileContent = kvGet(decodedKey);
                 if (fileContent) {
                     const decoded = decodedKey === 'database/database.bin'
                         ? await decodeDatabaseWithPersistentChatIds(fileContent)
                         : normalizeJSON(await decodeRisuSave(fileContent));
-                    if (decodedKey === 'database/database.bin') {
-                        initChatStore(decoded);
-                        dbCache[filePath] = normalizeJSON(stripChatsFromDb(decoded));
-                    } else {
-                        dbCache[filePath] = decoded;
-                    }
+                    dbCache[filePath] = decodedKey === 'database/database.bin'
+                        ? normalizeJSON(stripChatsFromDb(decoded))
+                        : decoded;
                 } else {
                     dbCache[filePath] = {};
                 }
-            }
-
-            // Reject patch ops that touch chat-internal fields. Lazy loading
-            // strips chats to stubs in dbCache; the only legitimate chat ops
-            // are stub metadata (id, name, _stub, lastDate, folderId, modules)
-            // or whole-chat add/replace/remove. Field-level ops on chats —
-            // particularly remove of message/hypaV3Data/scriptstate/etc —
-            // strip the `_stub` flag and cause silent on-disk data loss when
-            // reassembleFullDb later sees the metadata-only chat. Reject as
-            // 409 so the client falls through to a full write and rebases its
-            // patcher baseline. See findStubFlagLossChats for the disk-side
-            // partner guard.
-            const chatInternalOps = decodedKey === 'database/database.bin'
-                ? findChatInternalFieldOps(patch)
-                : [];
-            if (chatInternalOps.length > 0) {
-                const sample = chatInternalOps.slice(0, 5).map(v => `${v.op} ${v.path}`).join(', ');
-                logger.warn(
-                    `[Patch] Rejected ${chatInternalOps.length} chat-internal field op(s) `
-                    + `(would corrupt lazy-loaded chats): ${sample}`
-                );
-                let currentEtag;
-                try {
-                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
-                    dbEtag = currentEtag;
-                } catch {}
-                res.status(409).send({
-                    error: 'Patch rejected: chat-internal field ops not allowed for lazy-loaded chats',
-                    code: 'CHAT_GUARD_REJECTED',
-                    chatGuardRejected: true,
-                    currentEtag,
-                });
-                return;
             }
 
             const serverHash = calculateHash(dbCache[filePath]).toString(16);
@@ -3840,7 +3488,7 @@ app.post('/api/patch', async (req, res, next) => {
             saveTimers[filePath] = setTimeout(async () => {
                 try {
                     if (decodedKey === 'database/database.bin') {
-                        await persistDbCacheWithChats(filePath, decodedKey);
+                        await persistDbCache(filePath, decodedKey);
                     } else {
                         const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
                         try {
@@ -4515,7 +4163,7 @@ app.get('/api/backup/server/download/:filename', async (req, res, next) => {
 // ── Chat content endpoints (runtime lazy load) ─────────────────────────────
 
 // Cold storage compatibility: restore data stored in coldstorage/ KV entries
-const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01';
+// (COLD_STORAGE_HEADER removed with the legacy chat-content endpoints below)
 
 function restoreColdStorageCharacter(character) {
     if (!character?.coldstorage) return true;
@@ -4602,169 +4250,11 @@ function restoreColdStorageCharactersInDb(dbObj) {
     return result;
 }
 
-function isColdStorageChat(chat) {
-    return chat?.message?.[0]?.data?.startsWith(COLD_STORAGE_HEADER);
-}
-
-function restoreColdStorageChat(chat) {
-    if (!isColdStorageChat(chat)) return true;
-    const key = chat.message[0].data.slice(COLD_STORAGE_HEADER.length);
-    const entry = readColdStorageJsonEntry(key, {
-        migrateLegacy: true,
-    });
-    if (!entry) {
-        logger.error(`[ColdStorage] data not found for key: ${key}`);
-        return false;
-    }
-    try {
-        const coldData = entry.coldData;
-        if (Array.isArray(coldData)) {
-            chat.message = coldData;
-        } else if (coldData?.message) {
-            chat.message = coldData.message;
-            if (coldData.hypaV3Data) chat.hypaV3Data = coldData.hypaV3Data;
-            if (coldData.scriptstate) chat.scriptstate = coldData.scriptstate;
-            if (coldData.localLore) chat.localLore = coldData.localLore;
-        }
-        chat.lastDate = Date.now();
-        return true;
-    } catch (err) {
-        logger.error(`[ColdStorage] restore failed for key ${key}:`, err.message);
-        return false;
-    }
-}
-
-// GET /api/chat-content/:chaId/:chatIndex — retrieve full chat from server
-app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
-    if (!await checkAuth(req, res)) { return; }
-    try {
-        const chaId = req.params.chaId;
-        const chatIndex = parseInt(req.params.chatIndex, 10);
-        const expectedChatId = req.headers['x-chat-id'];
-
-        await ensureChatStore();
-        // First try fullChatStore (fast path)
-        const charChats = fullChatStore.get(chaId);
-        if (charChats && expectedChatId) {
-            const chat = charChats.get(expectedChatId);
-            if (chat) {
-                if (!restoreColdStorageChat(chat)) {
-                    return res.status(500).json({ error: 'Cold storage restore failed' });
-                }
-                const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
-                res.setHeader('Content-Type', 'application/octet-stream');
-                return res.send(encoded);
-            }
-        }
-
-        // Fallback: load from disk and find by index
-        const raw = kvGet('database/database.bin');
-        if (!raw) {
-            return res.status(404).json({ error: 'Database not found' });
-        }
-        const dbObj = await decodeRisuSave(raw);
-        const char = dbObj.characters?.find(c => c?.chaId === chaId);
-        if (!char?.chats?.[chatIndex]) {
-            return res.status(404).json({ error: 'Chat not found' });
-        }
-        const chat = char.chats[chatIndex];
-        // Verify chatId matches if provided
-        if (expectedChatId && chat.id !== expectedChatId) {
-            return res.status(409).json({ error: 'Chat ID mismatch — index may have shifted' });
-        }
-        if (!restoreColdStorageChat(chat)) {
-            return res.status(500).json({ error: 'Cold storage restore failed' });
-        }
-        const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.send(encoded);
-    } catch (error) {
-        next(error);
-    }
-});
-
-// POST /api/chat-content/:chaId/:chatIndex — save chat content to server
-app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
-    if (!await checkAuth(req, res)) { return; }
-    if (!checkActiveSession(req, res)) return;
-    try {
-        await queueStorageOperation(async () => {
-            const chaId = req.params.chaId;
-            const chatIndex = parseInt(req.params.chatIndex, 10);
-            const expectedChatId = req.headers['x-chat-id'];
-            let chatData;
-            if (Buffer.isBuffer(req.body)) {
-                // Binary msgpack body (application/octet-stream)
-                try {
-                    chatData = await decodeRisuSave(req.body);
-                } catch (e) {
-                    return res.status(400).json({ error: 'Invalid binary chat data' });
-                }
-            } else {
-                // JSON body (legacy)
-                chatData = req.body;
-            }
-
-            if (!chatData || !expectedChatId) {
-                return res.status(400).json({ error: 'Chat data and x-chat-id required' });
-            }
-
-            await ensureChatStore();
-
-            // Update fullChatStore
-            if (!fullChatStore.has(chaId)) {
-                fullChatStore.set(chaId, new Map());
-            }
-            fullChatStore.get(chaId).set(expectedChatId, chatData);
-
-            // Schedule debounced persist (reuses existing timer mechanism)
-            if (saveTimers[DB_HEX_KEY]) {
-                clearTimeout(saveTimers[DB_HEX_KEY]);
-            }
-            saveTimers[DB_HEX_KEY] = setTimeout(async () => {
-                try {
-                    // If dbCache has stripped DB, persist with merged chats
-                    if (dbCache[DB_HEX_KEY]) {
-                        await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
-                    } else {
-                        // No stripped cache — load, merge, save
-                        const raw = kvGet('database/database.bin');
-                        if (raw) {
-                            const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
-                            const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
-                            try {
-                                kvSet('database/database.bin', encoded);
-                            } catch (err) {
-                                if (err && typeof err === 'object') {
-                                    try { err.attemptedSize = encoded.length; } catch {}
-                                }
-                                throw err;
-                            }
-                        }
-                    }
-                    // Persist succeeded — clear before backup so a backup-only
-                    // failure isn't attributed to data loss.
-                    clearPersistFailure();
-                    try {
-                        createBackupAndRotate();
-                    } catch (backupErr) {
-                        logger.warn('[ChatContent] Backup rotation failed:', backupErr);
-                    }
-                } catch (error) {
-                    logger.error('[ChatContent] Error persisting chat:', error);
-                    recordPersistFailure(error, 'chat-content');
-                } finally {
-                    delete saveTimers[DB_HEX_KEY];
-                }
-            }, SAVE_INTERVAL);
-
-            res.json({ success: true });
-        });
-    } catch (error) {
-        next(error);
-    }
-});
+// The legacy /api/chat-content/:chaId/:chatIndex endpoints (full chat embedded
+// in database.bin, served from an in-memory fullChatStore) were removed along
+// with database.bin's chats field — chats live in rl_chats/rl_messages only
+// (chatApi.cjs: GET/PUT /api/chats/:id). A chat that was never migrated off
+// this legacy storage is no longer reachable; see the migration tool.
 
 // ── Save-folder migration endpoints ──────────────────────────────────────────
 const migrationMarkerPath = path.join(savePath, '.migrated_to_sqlite');
@@ -4809,7 +4299,7 @@ function clearExistingData() {
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration
-    // to re-evaluate against the new contents on the next ensureChatStore.
+    // to re-evaluate against the new contents on the next decode pass.
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
     clearEntities();
 }
@@ -5273,7 +4763,6 @@ app.get('/api/db/stats', async (req, res, next) => {
 app.get('/api/db/stats/characters', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        await ensureChatStore();
         const raw = kvGet(DB_BLOB_KEY);
         if (!raw) {
             res.json({ characters: [], orphan: { count: 0, totalSize: 0 }, chatBytesNote: 'estimate' });
@@ -5318,13 +4807,11 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
             }
             const remoteBytes = remoteSize.get(cha.chaId) || 0;
 
-            let chatBytes = 0;
-            const charChats = fullChatStore?.get(cha.chaId);
-            if (charChats) {
-                for (const chat of charChats.values()) {
-                    try { chatBytes += JSON.stringify(chat).length; } catch { /* skip un-serializable */ }
-                }
-            }
+            // Chat content now lives in rl_chats/rl_messages (chatApi.cjs), not
+            // in this KV-backed database.bin snapshot, so this admin/debug view
+            // can't attribute chat storage to a character without a separate
+            // SQL query. Leave at 0 rather than wiring that up here.
+            const chatBytes = 0;
 
             // Card body = the character row minus chats (which we count separately).
             // Asset URIs themselves are tiny strings — leaving them in card body is fine.
@@ -5619,10 +5106,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             try {
                 const raw = kvGet(DB_BLOB_KEY);
                 if (raw) {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, {
+                    await decodeDatabaseWithPersistentChatIds(raw, {
                         createBackup: false,
                     });
-                    initChatStore(dbObj);
                     // Migration may have rewritten database.bin — etag must
                     // reflect the post-migration bytes the next /api/read sends.
                     const finalRaw = kvGet(DB_BLOB_KEY);
@@ -6400,8 +5886,7 @@ app.post('/api/gdrive/restore', async (req, res, next) => {
                 try {
                     const raw = kvGet(DB_BLOB_KEY);
                     if (raw) {
-                        const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
-                        initChatStore(dbObj);
+                        await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
                         const finalRaw = kvGet(DB_BLOB_KEY);
                         if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
                     }
@@ -6446,8 +5931,7 @@ app.post('/api/admin/force-restore', async (req, res, next) => {
                 try {
                     const raw = kvGet(DB_BLOB_KEY);
                     if (raw) {
-                        const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
-                        initChatStore(dbObj);
+                        await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
                         const finalRaw = kvGet(DB_BLOB_KEY);
                         if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
                     }
