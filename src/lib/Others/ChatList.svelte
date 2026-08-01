@@ -10,6 +10,7 @@
     import { findCharacterbyId } from "../../ts/util";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import { changeChatTo, requestImmediateSave } from "src/ts/globalApi.svelte";
+    import { deleteChatFromServer } from "src/ts/storage/chatStorage";
     import { v4 } from "uuid";
 
     let editMode = $state(false)
@@ -56,11 +57,13 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                         if(d){
+                            const deletedId = chat.id
                             changeChatTo(0)
                             let chats = DBState.db.characters[$selectedCharID].chats
                             chats.splice(i, 1)
                             DBState.db.characters[$selectedCharID].chats = chats
                             void requestImmediateSave()
+                            if(deletedId) deleteChatFromServer(deletedId).catch(() => {})
                         }
                     }} onkeydown={() => {
                         
