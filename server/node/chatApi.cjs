@@ -126,13 +126,37 @@ function toJSON(val) {
 
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
+// Serialize a raw rl_chats row into the shape the client expects.
+// Extracts stub-level fields from chat_meta so the client can build
+// ChatStub objects without a separate full-chat fetch.
+function serializeChatRow(row) {
+    let meta = {};
+    if (row.chat_meta) {
+        try { meta = JSON.parse(row.chat_meta); } catch {}
+    }
+    return {
+        id:           row.id,
+        character_id: row.character_id,
+        title:        row.title,
+        chat_meta:    row.chat_meta,
+        created_at:   row.created_at,
+        updated_at:   row.updated_at,
+        message_count: row.message_count,
+        last_date:    meta.lastDate   ?? null,
+        folder_id:    meta.folderId   ?? null,
+        modules:      Array.isArray(meta.modules) ? meta.modules : null,
+    };
+}
+
 // GET /api/chats[?character_id=xxx]
 function listChats(req, res) {
     const userId = resolveUserId(req);
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     const { character_id } = req.query;
-    if (character_id) return res.json(stmtListChatsByCharacter.all(userId, character_id));
-    return res.json(stmtListChats.all(userId));
+    const rows = character_id
+        ? stmtListChatsByCharacter.all(userId, character_id)
+        : stmtListChats.all(userId);
+    return res.json(rows.map(serializeChatRow));
 }
 
 // GET /api/chats/:id
