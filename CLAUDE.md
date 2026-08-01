@@ -28,6 +28,7 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - UI 변경은 자유, 단 src/ts 함수 호출은 유지
 - pm2 전체 경로 사용: /usr/bin/pm2
 - ecosystem.config.cjs (ES module 프로젝트라 .cjs 필수)
+- upstream의 서버 사이드 생성 기능을 cherry-pick할 경우, 서버 완성 경로가 chatApi.cjs의 upsertChatFull()도 호출하는지 반드시 확인할 것 (미호출 시 서버 생성 메시지가 rl_chats에 반영되지 않아 클라이언트 재접속 후 덮어씌워질 수 있음)
 
 ## 다음 작업 예정
 - 3단계: 서버 인증 게이트 (rl_users, bcrypt, 세션 쿠키)
