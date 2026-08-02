@@ -67,17 +67,28 @@ export async function uploadEntryToSharedLorebook(entry: loreBook, existing: Sha
     await refreshLinkedBookIndex(true)
 }
 
-// Shared by both "불러오기" (first import) and "업데이트" (refresh an existing
-// link): replaces every local entry already linked to this book with the
-// book's current content, then appends nothing extra — same operation either way.
+// Shared by "불러오기" (first import), "업데이트" (refresh an existing link),
+// and version restore: replaces every local entry already linked to this book
+// with the book's current content, then appends nothing extra — same
+// operation in all three cases. Activation prefs (alwaysActive/disabled) are
+// personal, not part of the shared content, so an entry that's already linked
+// keeps its own local values instead of inheriting whatever the uploader had.
 export async function syncEntriesFromSharedLorebook(character: character, bookId: string): Promise<number> {
     const detail = await ns.getSharedLorebook(bookId)
+    const existingById = new Map(
+        character.globalLore.filter(e => e.source_lorebook_id === bookId && e.id).map(e => [e.id, e])
+    )
     const kept = character.globalLore.filter(e => e.source_lorebook_id !== bookId)
-    const fresh = detail.content.map(entry => ({
-        ...entry,
-        source_lorebook_id: bookId,
-        source_updated_at: detail.updated_at,
-    }))
+    const fresh = detail.content.map(entry => {
+        const prev = entry.id ? existingById.get(entry.id) : undefined
+        return {
+            ...entry,
+            alwaysActive: prev ? prev.alwaysActive : entry.alwaysActive,
+            disabled: prev ? prev.disabled : entry.disabled,
+            source_lorebook_id: bookId,
+            source_updated_at: detail.updated_at,
+        }
+    })
     character.globalLore = [...kept, ...fresh]
     linkedBookIndex[bookId] = detail
     return fresh.length

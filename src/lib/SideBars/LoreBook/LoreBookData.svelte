@@ -1,10 +1,10 @@
 <script lang="ts">
-    import { XIcon, LinkIcon, SunIcon, BookCopyIcon, FolderIcon, FolderOpen, PlusIcon, UploadIcon, SparklesIcon } from "@lucide/svelte";
+    import { XIcon, LinkIcon, SunIcon, BanIcon, HistoryIcon, RotateCcwIcon, BookCopyIcon, FolderIcon, FolderOpen, PlusIcon, UploadIcon, SparklesIcon } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { language } from "../../../lang";
     import { getCurrentCharacter, getCurrentChat, type loreBook } from "../../../ts/storage/database.svelte";
     import { alertConfirm, alertMd, alertError, notifySuccess, notifyError } from "../../../ts/alert";
-    import { SharedLorebookLockedError } from "../../../ts/storage/nodeStorage";
+    import { NodeStorage, SharedLorebookLockedError, type SharedLorebookVersion } from "../../../ts/storage/nodeStorage";
     import { checkUploadTarget, uploadEntryToSharedLorebook, syncEntriesFromSharedLorebook, linkedBookIndex } from "../../../ts/process/sharedLorebookLink.svelte";
     import Check from "../../UI/GUI/CheckInput.svelte";
     import Help from "../../Others/Help.svelte";
@@ -143,6 +143,60 @@
         }
     }
 
+    // Three-way activation: alwaysActive/disabled are two independent booleans
+    // on loreBook, but only three combinations are meaningful — disabled wins
+    // over alwaysActive if both were ever somehow set.
+    type ActivationMode = 'always'|'trigger'|'disabled'
+    function getActivationMode(book: loreBook): ActivationMode {
+        if(book.disabled) return 'disabled'
+        return book.alwaysActive ? 'always' : 'trigger'
+    }
+    function setActivationMode(book: loreBook, mode: ActivationMode){
+        book.disabled = mode === 'disabled'
+        book.alwaysActive = mode === 'always'
+    }
+    function cycleActivationMode(book: loreBook){
+        const order: ActivationMode[] = ['trigger', 'always', 'disabled']
+        const next = order[(order.indexOf(getActivationMode(book)) + 1) % order.length]
+        setActivationMode(book, next)
+    }
+
+    const ns = new NodeStorage()
+    let showVersions = $state(false)
+    let versions = $state<SharedLorebookVersion[]>([])
+    let loadingVersions = $state(false)
+
+    async function openVersions(book: loreBook){
+        if(!book.source_lorebook_id) return
+        showVersions = true
+        loadingVersions = true
+        try {
+            versions = await ns.listSharedLorebookVersions(book.source_lorebook_id)
+        } catch(e){
+            alertError(String(e))
+        } finally {
+            loadingVersions = false
+        }
+    }
+
+    async function restoreVersion(book: loreBook, versionId: string){
+        if(!book.source_lorebook_id) return
+        const ok = await alertConfirm('이 버전으로 되돌리시겠습니까? 현재 공유 로어북 내용은 버전 기록에 보관됩니다.')
+        if(!ok) return
+        try {
+            await ns.restoreSharedLorebookVersion(book.source_lorebook_id, versionId)
+            await syncEntriesFromSharedLorebook(getCurrentCharacter(), book.source_lorebook_id)
+            showVersions = false
+            notifySuccess('복원했습니다')
+        } catch(e){
+            alertError(String(e))
+        }
+    }
+
+    function formatVersionTime(ts: number): string {
+        return new Date(ts).toLocaleString('ko-KR')
+    }
+
 </script>
 <div class={"w-full flex flex-col " + (
     isLastInContainer ? 
@@ -177,33 +231,55 @@
                 <span>{value.comment.length === 0 ? "Unnamed Folder" : value.comment}</span>
             {:else}
                 <span>{value.comment.length === 0 ? value.key.length === 0 ? "Unnamed Lore" : value.key : value.comment}</span>
+                {#if value.source_lorebook_id}
+                    <span class="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-blue-700/50 text-blue-200 shrink-0">공유</span>
+                {/if}
             {/if}
         </button>
-        <button
-            class="mr-1"
-            class:text-textcolor2={!value.alwaysActive}
-            class:text-textcolor={value.alwaysActive}
-            onclick={async () => {
-                if(value.mode === 'folder'){
+        {#if value.mode === 'folder'}
+            <button
+                class="mr-1"
+                class:text-textcolor2={!value.alwaysActive}
+                class:text-textcolor={value.alwaysActive}
+                onclick={async () => {
                     for(let i = 0; i < externalLoreBooks.length; i++){
                         if(externalLoreBooks[i].folder === value.key){
                             externalLoreBooks[i].alwaysActive = !value.alwaysActive
                         }
                     }
-                }
-                value.alwaysActive = !value.alwaysActive
-            }}
-        >
-            {#if value.alwaysActive}
-                <SunIcon size={20} />
-            {:else}
-                <LinkIcon size={20} />
-            {/if}
-        </button>
-        {#if value.mode !== 'folder'}
+                    value.alwaysActive = !value.alwaysActive
+                }}
+            >
+                {#if value.alwaysActive}
+                    <SunIcon size={20} />
+                {:else}
+                    <LinkIcon size={20} />
+                {/if}
+            </button>
+        {:else}
+            <button
+                class="mr-1"
+                class:text-textcolor2={getActivationMode(value) !== 'always'}
+                class:text-textcolor={getActivationMode(value) === 'always'}
+                title={getActivationMode(value) === 'always' ? '상시 활성화' : getActivationMode(value) === 'trigger' ? '키워드 트리거' : '비활성화'}
+                onclick={() => cycleActivationMode(value)}
+            >
+                {#if getActivationMode(value) === 'always'}
+                    <SunIcon size={20} />
+                {:else if getActivationMode(value) === 'trigger'}
+                    <LinkIcon size={20} />
+                {:else}
+                    <BanIcon size={20} />
+                {/if}
+            </button>
             {#if hasSharedUpdate(value)}
                 <button class="mr-1 text-green-400 hover:text-green-300" title="공유 로어북에 새 버전이 있습니다 — 최신으로 교체" onclick={() => syncFromShared(value)}>
                     <SparklesIcon size={20} />
+                </button>
+            {/if}
+            {#if value.source_lorebook_id}
+                <button class="mr-1 valuer" title="버전 기록" onclick={() => openVersions(value)}>
+                    <HistoryIcon size={20} />
                 </button>
             {/if}
             <button class="mr-1 valuer" title="공유 로어북에 업로드" onclick={() => uploadEntry(value)}>
@@ -250,6 +326,35 @@
         </button>
     {/if}
     </div>
+    {#if showVersions}
+        <div class="flex flex-col gap-2 mb-2 ml-6 border border-selected rounded-md p-3">
+            <div class="flex items-center">
+                <span class="text-textcolor text-sm">최근 버전 (최대 3개)</span>
+                <button class="ml-auto text-textcolor2 hover:text-primary cursor-pointer" onclick={() => { showVersions = false }}>
+                    <XIcon size={14}/>
+                </button>
+            </div>
+            {#if loadingVersions}
+                <span class="text-textcolor2 text-sm">불러오는 중...</span>
+            {:else if versions.length === 0}
+                <span class="text-textcolor2 text-sm">저장된 버전이 없습니다</span>
+            {:else}
+                {#each versions as version (version.id)}
+                    <div class="flex items-center gap-2 text-sm">
+                        <span class="text-textcolor2 grow">
+                            {version.saved_by_username ?? '알 수 없음'} · {formatVersionTime(version.saved_at)}
+                        </span>
+                        <button
+                            class="px-2 py-1 rounded-md bg-selected text-textcolor flex items-center gap-1 cursor-pointer shrink-0"
+                            onclick={() => restoreVersion(value, version.id)}
+                        >
+                            <RotateCcwIcon size={14}/> 복원
+                        </button>
+                    </div>
+                {/each}
+            {/if}
+        </div>
+    {/if}
     {#if open}
         {#if value.mode === 'folder'}
         <div class="border-0 outline-hidden w-full mt-2 flex flex-col mb-2">
@@ -282,7 +387,7 @@
         <div class="border-0 outline-hidden w-full mt-2 flex flex-col mb-2">
             <span class="text-textcolor mt-6">{language.name} <Help key="loreName"/></span>
             <TextInput bind:value={value.comment}/>
-            {#if !value.alwaysActive}
+            {#if getActivationMode(value) === 'trigger'}
                 <span class="text-textcolor mt-6">{language.activationKeys} <Help key="loreActivationKey"/></span>
                 <span class="text-xs text-textcolor2">{language.activationKeysInfo}</span>
                 <TextInput bind:value={value.key}/>
@@ -309,10 +414,21 @@
             <span class="text-textcolor mt-4 mb-2">{language.prompt}</span>
             <TextAreaInput highlight autocomplete="off" bind:value={value.content} />
             <span class="text-textcolor2 mt-2 mb-2 text-sm">{tokens} {language.tokens}</span>
-            <div class="flex items-center mt-4">
-                <Check bind:check={value.alwaysActive} name={language.alwaysActive}/>
+            <span class="text-textcolor mt-4 mb-2">활성화 방식</span>
+            <div class="flex border border-selected rounded-md overflow-hidden w-fit">
+                {#each ([['trigger','키워드 트리거'],['always',language.alwaysActive],['disabled','비활성화']] as const) as [mode, label]}
+                    <button
+                        class="px-3 py-1.5 text-sm cursor-pointer"
+                        class:bg-selected={getActivationMode(value) === mode}
+                        class:text-textcolor={getActivationMode(value) === mode}
+                        class:text-textcolor2={getActivationMode(value) !== mode}
+                        onclick={() => setActivationMode(value, mode)}
+                    >
+                        {label}
+                    </button>
+                {/each}
             </div>
-            {#if !value.alwaysActive && getCurrentCharacter()?.globalLore?.includes(value) && DBState.db.localActivationInGlobalLorebook}
+            {#if getActivationMode(value) === 'trigger' && getCurrentCharacter()?.globalLore?.includes(value) && DBState.db.localActivationInGlobalLorebook}
                 <div class="flex items-center mt-2">
                     <Check check={isLocallyActivated(value)} onChange={(check: boolean) => toggleLocalActive(check, value)} name={language.alwaysActiveInChat}/>
                 </div>
@@ -323,7 +439,7 @@
                     <Help key="loreSelective" name={language.selective}/>
                 </div>
             {/if}
-            {#if !value.alwaysActive}
+            {#if getActivationMode(value) === 'trigger'}
                 <div class="flex items-center mt-2">
                     <Check bind:check={value.useRegex} name={language.useRegexLorebook}/>
                     <Help key="useRegexLorebook" name={language.useRegexLorebook}/>

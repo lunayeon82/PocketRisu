@@ -1536,6 +1536,7 @@ export interface loreBook{
     folder?:string
     source_lorebook_id?:string
     source_updated_at?:number
+    disabled?:boolean
 }
 
 export interface character{

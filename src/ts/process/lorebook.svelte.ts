@@ -256,6 +256,9 @@ export async function loadLoreBookV3Prompt(){
             if(activatedIndexes.includes(i)){
                 continue
             }
+            if(fullLore[i].disabled){
+                continue
+            }
             if(!fullLore[i].alwaysActive && !fullLore[i].key){
                 continue
             }
@@ -678,7 +681,12 @@ export async function importLoreBook(mode:'global'|'local'|'sglobal'){
         if(importedlore.type === 'risu' && importedlore.data){
             const datas:loreBook[] = importedlore.data
             for(const data of datas){
-                lore.push(data)
+                // Imported entries always start out personal — a shared-book
+                // link from wherever this file came from shouldn't silently
+                // carry over (it could point at someone else's live book, or
+                // one that no longer exists).
+                const { source_lorebook_id, source_updated_at, ...rest } = data
+                lore.push(rest as loreBook)
             }
         }
         else if(importedlore.entries){
