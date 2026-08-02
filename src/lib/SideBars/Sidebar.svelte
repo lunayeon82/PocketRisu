@@ -80,8 +80,8 @@
   // sort is cheap; the $derived is only read while on the home screen.
   let recentChars = $derived(
     DBState.db.characters
-      .map((c, index) => ({ index, name: c.name, image: c.image, lastInteraction: c.lastInteraction ?? 0 }))
-      .filter((c) => c.lastInteraction > 0)
+      .map((c, index) => ({ index, name: c.name, image: c.image, lastInteraction: c.lastInteraction ?? 0, trashTime: c.trashTime }))
+      .filter((c) => c.lastInteraction > 0 && !c.trashTime)
       .sort((a, b) => b.lastInteraction - a.lastInteraction)
   );
   // Progressive reveal: render `recentVisible` items, "Load more" adds 10.
@@ -896,10 +896,11 @@
         }
       }} ondragenter={preventAll}></div>
     {/each}
+    {#if !DBState.db.autoOpenSingleCharacter}
     <div class="flex flex-col items-center gap-2 px-2">
       <BaseRoundedButton
         onClick={async () => {
-          addCharacter({reseter}) 
+          addCharacter({reseter})
         }}
         ><svg viewBox="0 0 24 24" width="1.2em" height="1.2em"
           ><path
@@ -913,6 +914,7 @@
         ></BaseRoundedButton
       >
     </div>
+    {/if}
   </div>
   {#if DBState.db.hamburgerButtonBottom}
   <div class="border-t border-t-selected w-full relative text-white" class:max-xs:hidden={$leftBarCollapsed}>

@@ -219,9 +219,11 @@ export async function loadData() {
                 console.warn('[bootstrap] boot backup reminder failed:', err)
             }
             loadedStore.set(true)
-            const realCharacters = db.characters.filter(c => c.chaId !== '§playground')
-            if (db.autoOpenSingleCharacter && realCharacters.length === 1) {
-                changeChar(db.characters.indexOf(realCharacters[0]))
+            const autoOpenTarget = db.autoOpenSingleCharacter
+                ? db.characters.find(c => c.chaId !== '§playground' && !c.trashTime)
+                : undefined
+            if (autoOpenTarget) {
+                changeChar(db.characters.indexOf(autoOpenTarget))
             } else {
                 selectedCharID.set(-1)
             }
