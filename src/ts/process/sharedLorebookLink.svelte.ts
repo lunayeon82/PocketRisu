@@ -86,3 +86,56 @@ export async function syncEntriesFromSharedLorebook(character: character, bookId
 export function isCharacterLinkedToBook(character: character, bookId: string): boolean {
     return character.globalLore.some(e => e.source_lorebook_id === bookId)
 }
+
+// Global books nobody on this character has pulled down yet.
+export function getPendingNewBooks(character: character): SharedLorebookSummary[] {
+    const linkedIds = new Set(character.globalLore.map(e => e.source_lorebook_id).filter(Boolean))
+    return Object.values(linkedBookIndex).filter(b => b.scope === 'global' && !linkedIds.has(b.id))
+}
+
+// Books this character already pulled from, whose shared copy has since moved on.
+export function getPendingUpdatedBooks(character: character): SharedLorebookSummary[] {
+    const staleIds = new Set<string>()
+    for (const e of character.globalLore) {
+        if (!e.source_lorebook_id) continue
+        const linked = linkedBookIndex[e.source_lorebook_id]
+        if (linked && linked.updated_at > (e.source_updated_at ?? 0)) staleIds.add(e.source_lorebook_id)
+    }
+    return [...staleIds].map(id => linkedBookIndex[id])
+}
+
+// Pulls every pending new/updated book into globalLore in one shot. Sequential,
+// not parallel — syncEntriesFromSharedLorebook reassigns character.globalLore
+// from a snapshot, so concurrent calls would clobber each other.
+export async function applyAllPending(character: character): Promise<{ newBooks: number, newEntries: number, updatedBooks: number, updatedEntries: number }> {
+    const pendingNew = getPendingNewBooks(character)
+    const pendingUpdated = getPendingUpdatedBooks(character)
+    let newEntries = 0, updatedEntries = 0, newBooks = 0, updatedBooks = 0
+    for (const book of pendingNew) {
+        try {
+            newEntries += await syncEntriesFromSharedLorebook(character, book.id)
+            newBooks++
+        } catch { /* deleted or otherwise unreachable mid-flight — skip it */ }
+    }
+    for (const book of pendingUpdated) {
+        try {
+            updatedEntries += await syncEntriesFromSharedLorebook(character, book.id)
+            updatedBooks++
+        } catch { /* same */ }
+    }
+    return { newBooks, newEntries, updatedBooks, updatedEntries }
+}
+
+// Background polling — keeps linkedBookIndex fresh while the character's
+// lorebook screen is open, so the pending-new/pending-updated banner stays
+// current without the user manually refreshing.
+let pollTimer: ReturnType<typeof setInterval> | null = null
+export function startBackgroundSync() {
+    stopBackgroundSync()
+    refreshLinkedBookIndex(true)
+    pollTimer = setInterval(() => refreshLinkedBookIndex(true), 15000)
+}
+export function stopBackgroundSync() {
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
+}
