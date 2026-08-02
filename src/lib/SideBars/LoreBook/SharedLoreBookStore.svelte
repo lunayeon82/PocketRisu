@@ -17,13 +17,14 @@
     // content needs that entry's lock (global only — private has exactly one
     // possible editor, so no lock is needed there). Add/delete/reorder/rename
     // are structural, not content edits, so they're lock-free too.
-    import { XIcon, PlusIcon, LockIcon, HistoryIcon, RotateCcwIcon, RefreshCwIcon, SparklesIcon, GlobeIcon, LockKeyholeIcon, CopyIcon, TrashIcon, SlidersHorizontalIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, PencilIcon, CheckIcon } from "@lucide/svelte";
+    import { XIcon, PlusIcon, LockIcon, HistoryIcon, RotateCcwIcon, RefreshCwIcon, SparklesIcon, GlobeIcon, LockKeyholeIcon, CopyIcon, TrashIcon, SlidersHorizontalIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, PencilIcon, CheckIcon, DownloadIcon } from "@lucide/svelte";
     import {
         NodeStorage, SharedLorebookLockedError,
         type SharedLorebookSummary, type SharedLorebookDetail, type SharedLorebookVersion,
         type SharedLorebookOverrideMode, type SharedLorebookScope,
     } from "src/ts/storage/nodeStorage";
-    import type { loreBook } from "src/ts/storage/database.svelte";
+    import { getCurrentCharacter, type loreBook } from "src/ts/storage/database.svelte";
+    import { syncEntriesFromSharedLorebook, isCharacterLinkedToBook } from "src/ts/process/sharedLorebookLink.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
@@ -62,6 +63,27 @@
     function hasUnseenUpdate(book: SharedLorebookSummary): boolean {
         const seenAt = seenMap[book.id]
         return seenAt !== undefined && book.updated_at > seenAt
+    }
+    function isUnseenBook(book: SharedLorebookSummary): boolean {
+        return seenMap[book.id] === undefined
+    }
+
+    // "불러오기"와 "업데이트"는 같은 동작 — 이 책에 연결된 로컬 항목들을 최신 content로 교체.
+    function isImportedIntoCharacter(book: SharedLorebookSummary): boolean {
+        const char = getCurrentCharacter()
+        return !!char && isCharacterLinkedToBook(char, book.id)
+    }
+
+    async function importOrUpdate(book: SharedLorebookSummary) {
+        const char = getCurrentCharacter()
+        if (!char) return
+        try {
+            const count = await syncEntriesFromSharedLorebook(char, book.id)
+            markSeen(book)
+            notifySuccess(`"${book.title}"의 항목 ${count}개를 반영했습니다`)
+        } catch (e) {
+            alertError(String(e))
+        }
     }
 
     let myId = $state<number | null>(null)
@@ -585,12 +607,23 @@
                             {:else}
                                 <span class="grow truncate">{book.title || '(제목 없음)'}</span>
                             {/if}
-                            {#if hasUnseenUpdate(book)}
+                            {#if book.scope === 'global' && isUnseenBook(book)}
+                                <span class="text-xs px-1.5 py-0.5 rounded-full bg-amber-700/60 text-amber-200 flex items-center gap-1 shrink-0">
+                                    <SparklesIcon size={12}/> NEW
+                                </span>
+                            {:else if hasUnseenUpdate(book)}
                                 <span class="text-xs px-1.5 py-0.5 rounded-full bg-green-700/60 text-green-200 flex items-center gap-1 shrink-0">
                                     <SparklesIcon size={12}/> 새 버전
                                 </span>
                             {/if}
                             <div class="flex items-center gap-1 shrink-0" role="presentation" onclick={(e) => e.stopPropagation()}>
+                                <button
+                                    class="text-textcolor2 hover:text-primary p-1 cursor-pointer"
+                                    onclick={() => importOrUpdate(book)}
+                                    title={isImportedIntoCharacter(book) ? '캐릭터 로어북에 최신으로 업데이트' : '캐릭터 로어북으로 불러오기'}
+                                >
+                                    <DownloadIcon size={14}/>
+                                </button>
                                 {#if canEditStructure(book) && renamingId !== book.id}
                                     <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={() => startRename(book)} title="이름 변경">
                                         <PencilIcon size={14}/>

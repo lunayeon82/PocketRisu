@@ -10,6 +10,7 @@
     import SharedLoreBookStore from "./SharedLoreBookStore.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
+    import { refreshLinkedBookIndex } from "src/ts/process/sharedLorebookLink.svelte";
 
     let submenu = $state(0)
     interface Props {
@@ -51,6 +52,10 @@
             book.alwaysActive = !allActive;
         });
     }
+
+    $effect(() => {
+        if (submenu === 0 && !globalMode) refreshLinkedBookIndex()
+    })
 </script>
 
 {#if !globalMode}

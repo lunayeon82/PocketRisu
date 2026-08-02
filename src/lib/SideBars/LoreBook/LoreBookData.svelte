@@ -1,9 +1,11 @@
 <script lang="ts">
-    import { XIcon, LinkIcon, SunIcon, BookCopyIcon, FolderIcon, FolderOpen, PlusIcon } from "@lucide/svelte";
+    import { XIcon, LinkIcon, SunIcon, BookCopyIcon, FolderIcon, FolderOpen, PlusIcon, UploadIcon, SparklesIcon } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { language } from "../../../lang";
     import { getCurrentCharacter, getCurrentChat, type loreBook } from "../../../ts/storage/database.svelte";
-    import { alertConfirm, alertMd } from "../../../ts/alert";
+    import { alertConfirm, alertMd, alertError, notifySuccess, notifyError } from "../../../ts/alert";
+    import { SharedLorebookLockedError } from "../../../ts/storage/nodeStorage";
+    import { checkUploadTarget, uploadEntryToSharedLorebook, syncEntriesFromSharedLorebook, linkedBookIndex } from "../../../ts/process/sharedLorebookLink.svelte";
     import Check from "../../UI/GUI/CheckInput.svelte";
     import Help from "../../Others/Help.svelte";
     import TextInput from "../../UI/GUI/TextInput.svelte";
@@ -107,7 +109,40 @@
         }
     }
 
-    
+    function hasSharedUpdate(book: loreBook): boolean {
+        if(!book.source_lorebook_id) return false
+        const linked = linkedBookIndex[book.source_lorebook_id]
+        return !!linked && linked.updated_at > (book.source_updated_at ?? 0)
+    }
+
+    async function uploadEntry(book: loreBook){
+        const existing = await checkUploadTarget(book)
+        const ok = await alertConfirm(existing
+            ? `기존 공유 로어북 "${existing.title}"을 덮어씁니다. 계속할까요?`
+            : '새 공유 로어북으로 등록됩니다. 계속할까요?')
+        if(!ok) return
+        try {
+            await uploadEntryToSharedLorebook(book, existing)
+            notifySuccess('공유 로어북에 업로드했습니다')
+        } catch(e){
+            if(e instanceof SharedLorebookLockedError){
+                notifyError(`${e.lockedByUsername ?? '다른 사용자'}가 수정 중입니다`)
+            } else {
+                alertError(String(e))
+            }
+        }
+    }
+
+    async function syncFromShared(book: loreBook){
+        if(!book.source_lorebook_id) return
+        try {
+            await syncEntriesFromSharedLorebook(getCurrentCharacter(), book.source_lorebook_id)
+            notifySuccess('최신 버전으로 업데이트했습니다')
+        } catch(e){
+            alertError(String(e))
+        }
+    }
+
 </script>
 <div class={"w-full flex flex-col " + (
     isLastInContainer ? 
@@ -165,6 +200,16 @@
                 <LinkIcon size={20} />
             {/if}
         </button>
+        {#if value.mode !== 'folder'}
+            {#if hasSharedUpdate(value)}
+                <button class="mr-1 text-green-400 hover:text-green-300" title="공유 로어북에 새 버전이 있습니다 — 최신으로 교체" onclick={() => syncFromShared(value)}>
+                    <SparklesIcon size={20} />
+                </button>
+            {/if}
+            <button class="mr-1 valuer" title="공유 로어북에 업로드" onclick={() => uploadEntry(value)}>
+                <UploadIcon size={20} />
+            </button>
+        {/if}
         <button class="valuer" onclick={async () => {
             let shouldRemove = true;
             if (value.mode === 'folder' && externalLoreBooks.some(e => e.folder === value.key)) {

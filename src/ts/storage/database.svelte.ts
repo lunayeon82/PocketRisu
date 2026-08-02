@@ -1534,6 +1534,8 @@ export interface loreBook{
     bookVersion?:number
     id?:string
     folder?:string
+    source_lorebook_id?:string
+    source_updated_at?:number
 }
 
 export interface character{
