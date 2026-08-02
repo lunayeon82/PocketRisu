@@ -14,7 +14,7 @@ import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
-import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
+import { ConflictError, ChatConflictError, type PersistWarning } from "./storage/nodeStorage";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
@@ -811,7 +811,15 @@ export async function saveDb() {
             try {
                 await saveChatToServer(chaId, chatIndex, chatId, chat)
             } catch (e) {
-                console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
+                if (e instanceof ChatConflictError) {
+                    // Same account, same chat, saved from elsewhere first — not
+                    // overwritten (see upsertChatFull's expected_updated_at check).
+                    // This save attempt is simply dropped; the in-memory chat is
+                    // untouched and will be retried whenever it next changes.
+                    console.warn(`[Save] Chat ${chaId}/${chatId} conflicted with a newer save elsewhere — skipped, not overwritten`)
+                } else {
+                    console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
+                }
                 failedChats.push([chaId, chatId])
             }
         }

@@ -20,6 +20,22 @@ export class ConflictError extends Error {
     }
 }
 
+// Last known-good rl_chats.updated_at per chat, used as an optimistic
+// concurrency token for saveChatContent's full-replace PUT. Module-level
+// (not per-NodeStorage-instance) so every caller shares the same view
+// regardless of how many NodeStorage instances exist in the app.
+const chatUpdatedAtCache = new Map<string, number>()
+
+// Thrown by saveChatContent when the same account already has a newer save
+// for this chat (e.g. the same login open in two tabs/devices at once) —
+// see the expected_updated_at comment on upsertChatFull in chatApi.cjs.
+export class ChatConflictError extends Error {
+    constructor(chatId: string) {
+        super(`Chat ${chatId} was saved elsewhere more recently — not overwriting`)
+        this.name = 'ChatConflictError'
+    }
+}
+
 // Thrown by lockSharedLorebookEntry when someone else already holds the lock.
 export class SharedLorebookLockedError extends Error {
     lockedByUsername: string | null
@@ -694,6 +710,7 @@ export class NodeStorage{
             const meta = json.chat_meta
                 ? (typeof json.chat_meta === 'string' ? JSON.parse(json.chat_meta) : json.chat_meta)
                 : {}
+            if (typeof json.updated_at === 'number') chatUpdatedAtCache.set(chatId, json.updated_at)
             return normalizeChat({ ...meta, id: json.id, name: json.title, message: messages })
         }
         if (da.status !== 404) throw new Error(`fetchChatContent error: ${da.status}`)
@@ -713,6 +730,7 @@ export class NodeStorage{
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
         const { message: messages, name: title, id: _id, _placeholder: _ph, ...chatMeta } = chat
+        const expectedUpdatedAt = chatUpdatedAtCache.get(chatId)
         const da = await this.authFetch(`/api/chats/${encodeURIComponent(chatId)}/full`, {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
@@ -725,15 +743,30 @@ export class NodeStorage{
                     content: msg,
                     sort_order: idx,
                 })),
+                // Omitted (undefined) the first time we save a chat we never
+                // fetched from the server — the server skips the check in
+                // that case, same as x-session-id's "no version support" path.
+                expected_updated_at: expectedUpdatedAt,
             }),
         })
+        if (da.status === 409) {
+            const data = await da.json().catch(() => ({}))
+            // Someone else's save landed first — refresh our baseline so the
+            // *next* attempt (after the user reloads, or edits again) checks
+            // against current reality instead of repeating the same conflict.
+            if (typeof data.updated_at === 'number') chatUpdatedAtCache.set(chatId, data.updated_at)
+            throw new ChatConflictError(chatId)
+        }
         if (!da.ok) throw new Error(`saveChatContent error: ${da.status}`)
+        const result = await da.json().catch(() => ({}))
+        if (typeof result.updated_at === 'number') chatUpdatedAtCache.set(chatId, result.updated_at)
     }
 
     async deleteChatContent(chatId: string): Promise<void> {
         const da = await this.authFetch(`/api/chats/${encodeURIComponent(chatId)}`, {
             method: 'DELETE',
         })
+        chatUpdatedAtCache.delete(chatId)
         // 404 means already gone on server — not an error
         if (da.status !== 404 && !da.ok) {
             console.error(`[Chat] deleteChatContent failed: ${da.status}`)
@@ -1011,6 +1044,20 @@ export class NodeStorage{
         })
         if (!da.ok) throw new Error(`saveSharedLorebookEntry error: ${da.status}`)
         return da.json()
+    }
+
+    // Persists in-progress edit content to the lock holder's personal draft
+    // row (rl_lorebook_drafts) — does not touch the canonical entry. Requires
+    // currently holding the lock. Meant to be called on a debounce while
+    // editing so a reload doesn't lose work; failures are non-fatal (the
+    // edit still lives in the editor's own browser memory either way).
+    async saveSharedLorebookEntryDraft(id: string, entryId: string, entry: loreBook): Promise<void> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/${encodeURIComponent(entryId)}/draft`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(entry),
+        })
+        if (!da.ok) throw new Error(`saveSharedLorebookEntryDraft error: ${da.status}`)
     }
 
     // ── Bulk chat migration (Phase 3) ─────────────────────────────────────────

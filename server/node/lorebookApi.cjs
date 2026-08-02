@@ -674,6 +674,33 @@ function saveEntry(req, res) {
     return res.json(serializeLorebookDetail(updated, userId));
 }
 
+// PUT /api/lorebooks/:id/entries/:entryId/draft — persists the lock holder's
+// in-progress edit to rl_lorebook_drafts without touching the canonical
+// content. This is what lets an edit survive a page reload: the client
+// debounces calls here while typing, so re-acquiring the lock later (the
+// same idempotent POST .../lock every "편집 시작" already does) hands back
+// whatever was last saved here, not just whatever existed when the lock was
+// first taken. Requires holding the lock — same as saveEntry, minus the
+// canonical write.
+function saveDraft(req, res) {
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const book = stmtGetLorebook.get(req.params.id);
+    if (!book || !canView(book, userId)) return res.status(404).json({ error: 'Not found' });
+    if (book.scope !== 'global') return res.status(400).json({ error: 'Private lorebooks do not use drafts' });
+
+    const lock = getLockStatus(req.params.id, req.params.entryId);
+    if (!lock || lock.locked_by !== userId) return res.status(403).json({ error: 'Lock not held by you' });
+
+    const entry = req.body;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return res.status(400).json({ error: 'Body must be a single entry object' });
+    }
+
+    stmtUpsertDraft.run(req.params.id, req.params.entryId, userId, JSON.stringify(entry), Date.now());
+    return res.status(204).end();
+}
+
 // ─── Mount ────────────────────────────────────────────────────────────────────
 function mountLorebookApi(app) {
     app.get('/api/lorebooks', listLorebooks);
@@ -692,6 +719,7 @@ function mountLorebookApi(app) {
     app.post('/api/lorebooks/:id/entries/:entryId/lock', lockEntry);
     app.delete('/api/lorebooks/:id/entries/:entryId/lock', cancelEntryLock);
     app.put('/api/lorebooks/:id/entries/:entryId', saveEntry);
+    app.put('/api/lorebooks/:id/entries/:entryId/draft', saveDraft);
     app.delete('/api/lorebooks/:id/entries/:entryId', deleteEntry);
 }
 

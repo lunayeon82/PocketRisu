@@ -685,7 +685,7 @@ export async function importLoreBook(mode:'global'|'local'|'sglobal'){
                 // link from wherever this file came from shouldn't silently
                 // carry over (it could point at someone else's live book, or
                 // one that no longer exists).
-                const { source_lorebook_id, source_updated_at, source_synced_snapshot, ...rest } = data
+                const { source_lorebook_id, source_updated_at, ...rest } = data
                 lore.push(rest as loreBook)
             }
         }

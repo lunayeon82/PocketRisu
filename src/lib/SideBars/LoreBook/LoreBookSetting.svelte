@@ -71,8 +71,7 @@
         applyingPending = true
         try {
             const result = await applyAllPending(DBState.db.characters[$selectedCharID])
-            const skippedNote = result.skippedEntries > 0 ? ` (로컬 미업로드 변경으로 ${result.skippedEntries}건 건너뜀)` : ''
-            notifySuccess(`공유 로어북 반영: 신규 ${result.newEntries}건, 업데이트 ${result.updatedEntries}건 반영됨${skippedNote}`)
+            notifySuccess(`공유 로어북 반영: 신규 ${result.newEntries}건, 업데이트 ${result.updatedEntries}건 반영됨`)
         } catch (e) {
             alertError(String(e))
         } finally {

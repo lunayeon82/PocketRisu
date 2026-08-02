@@ -296,20 +296,36 @@ function updateChat(req, res) {
 
 // PUT /api/chats/:id/full — upsert chat + atomically replace all messages
 // Used by the frontend save path; mirrors what POST /api/chat-content/ used to do.
+//
+// This is a blind full-replace (delete all messages, reinsert whatever the
+// client sent) with no per-message diffing, so it's only safe when exactly
+// one writer is active for a given chat at a time — true for the common case
+// (single tab/device autosaving its own chat) but not if the same account
+// has the same chat open in two places at once. expected_updated_at is an
+// optional optimistic-concurrency check for that case: if the client's last
+// known updated_at doesn't match what's actually in the DB right now, someone
+// else's write landed in between, and applying this one anyway would silently
+// drop whatever they saved. Reject with 409 instead of overwriting; omit the
+// field (older client, or a chat that was never fetched from the server) to
+// skip the check, same "no version support" fallback pattern as x-session-id.
 function upsertChatFull(req, res) {
     const userId = resolveUserId(req);
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const chatId = req.params.id;
-    const { character_id, title = '', chat_meta, messages = [] } = req.body || {};
+    const { character_id, title = '', chat_meta, messages = [], expected_updated_at } = req.body || {};
     if (!character_id) return res.status(400).json({ error: 'character_id required' });
 
     const now = Date.now();
     const metaJson = toJSON(chat_meta);
     const folderId = folderIdFromMeta(chat_meta);
 
+    const existing = stmtGetChat.get(chatId, userId);
+    if (existing && expected_updated_at !== undefined && existing.updated_at !== expected_updated_at) {
+        return res.status(409).json({ error: 'Conflict', updated_at: existing.updated_at });
+    }
+
     sharedDb.transaction(() => {
-        const existing = stmtGetChat.get(chatId, userId);
         if (existing) {
             stmtUpdateChat.run(title, metaJson, folderId, now, chatId, userId);
         } else {

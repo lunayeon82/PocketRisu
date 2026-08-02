@@ -1536,11 +1536,6 @@ export interface loreBook{
     folder?:string
     source_lorebook_id?:string
     source_updated_at?:number
-    // Content fingerprint (see contentFingerprint in sharedLorebookLink.svelte.ts)
-    // taken at the last point this entry matched the shared copy — upload or
-    // sync. Diverges the moment the user edits a linked entry locally, which
-    // is how the "업로드" button knows to reappear.
-    source_synced_snapshot?:string
     disabled?:boolean
 }
 

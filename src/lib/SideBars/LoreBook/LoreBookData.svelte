@@ -5,7 +5,7 @@
     import { getCurrentCharacter, getCurrentChat, type loreBook } from "../../../ts/storage/database.svelte";
     import { alertConfirm, alertMd, alertError, notifySuccess, notifyError } from "../../../ts/alert";
     import { NodeStorage, SharedLorebookLockedError, type SharedLorebookVersion } from "../../../ts/storage/nodeStorage";
-    import { checkUploadTarget, uploadEntryToSharedLorebook, syncEntriesFromSharedLorebook, linkedBookIndex, isEntryDirty, contentFingerprint } from "../../../ts/process/sharedLorebookLink.svelte";
+    import { checkUploadTarget, uploadEntryToSharedLorebook, syncEntriesFromSharedLorebook, linkedBookIndex } from "../../../ts/process/sharedLorebookLink.svelte";
     import Check from "../../UI/GUI/CheckInput.svelte";
     import Help from "../../Others/Help.svelte";
     import TextInput from "../../UI/GUI/TextInput.svelte";
@@ -46,22 +46,23 @@
     // A linked entry is read-only until "편집 시작" acquires the server-side,
     // per-entry lock (rl_lorebook_locks) — exclusive, like a single-writer I/O
     // lock: while one person holds it, nobody else can even start editing
-    // (though they can keep using whatever content they already have). Once
-    // held, edits land directly on `value` (the character's own globalLore
-    // copy) — not a separate draft — so they immediately feed the same
-    // dirty/snapshot tracking personal edits use. "업로드" is the only thing
-    // that actually publishes to the shared repo, and is what releases the
-    // lock (see uploadEntry below); "취소" releases it early without
-    // publishing, for a start-then-changed-my-mind edit.
+    // (though they can keep using whatever content they already have).
+    //
+    // character.globalLore is NOT per-account isolated — the whole deployment
+    // shares one database.bin, autosaved ~500ms after any edit (see
+    // sharedLorebookLink.svelte.ts's header comment). So editing must NOT
+    // write to `value` directly — that would broadcast an unpublished WIP
+    // edit to the entire deployment before "업로드" ever runs. Instead edits
+    // land on `editDraft`, a separate object seeded from the lock response
+    // (either the canonical content, or this same user's own draft
+    // preserved server-side in rl_lorebook_drafts from an earlier session).
+    // A debounced call persists editDraft back to that per-user draft row
+    // while typing, so a reload doesn't lose the edit — resuming just means
+    // clicking "편집 시작" again, which idempotently re-fetches it.
     let editingShared = $state(false)
+    let editDraft = $state<loreBook | null>(null)
+    let contentTarget = $derived(editingShared && editDraft ? editDraft : value)
     let locked = $derived(!!value.source_lorebook_id && !editingShared)
-
-    // An entry linked before this tracking existed has no snapshot yet;
-    // assume it currently matches the shared copy rather than flagging it
-    // dirty on first render.
-    if (value.source_lorebook_id && value.source_synced_snapshot === undefined) {
-        value.source_synced_snapshot = contentFingerprint(value)
-    }
 
     let tokens = $state(0)
     let tokenTimer: ReturnType<typeof setTimeout> | null = null
@@ -75,13 +76,34 @@
     // once the next debounce fires 400ms later.
     $effect(() => {
         if (!open) return
-        const content = value.content
+        const content = contentTarget.content
         const seq = ++tokenSeq
         if (tokenTimer) clearTimeout(tokenTimer)
         tokenTimer = setTimeout(() => {
             tokenizeAccurate(content).then(result => { if (seq === tokenSeq) tokens = result })
         }, 400)
         return () => { if (tokenTimer) clearTimeout(tokenTimer) }
+    })
+
+    let draftSaveTimer: ReturnType<typeof setTimeout> | null = null
+    // Debounced persistence of the in-progress edit to the lock holder's
+    // personal draft row — best-effort, failures are non-fatal since the
+    // edit still lives in editDraft either way.
+    $effect(() => {
+        if (!editingShared || !editDraft || !value.source_lorebook_id || !value.id) return
+        // Touch every field so this effect reruns on each of them changing.
+        const snapshot = {
+            ...editDraft,
+            key: editDraft.key, secondkey: editDraft.secondkey, comment: editDraft.comment,
+            content: editDraft.content, insertorder: editDraft.insertorder, selective: editDraft.selective,
+            useRegex: editDraft.useRegex, activationPercent: editDraft.activationPercent,
+        }
+        const bookId = value.source_lorebook_id, entryId = value.id
+        if (draftSaveTimer) clearTimeout(draftSaveTimer)
+        draftSaveTimer = setTimeout(() => {
+            ns.saveSharedLorebookEntryDraft(bookId, entryId, snapshot).catch(() => {})
+        }, 600)
+        return () => { if (draftSaveTimer) clearTimeout(draftSaveTimer) }
     })
 
     function isLocallyActivated(book: loreBook){
@@ -136,20 +158,21 @@
     }
 
     async function uploadEntry(book: loreBook){
+        // While editing a linked entry, the content to publish is editDraft
+        // (the private WIP), not `book` — `book`/`value` only ever holds the
+        // last-known canonical content. Unlinked entries have no draft, so
+        // `book` itself is both target and content there.
+        const contentSource = editingShared && editDraft ? editDraft : book
         const existing = await checkUploadTarget(book)
-        // No separate lock peek here — by the time an already-linked entry can
-        // be dirty, editing it required holding the lock via "편집 시작", so a
-        // peek would just be reporting back our own lock. uploadEntryToSharedLorebook
-        // does the real (identity-aware) lock+save atomically; SharedLorebookLockedError
-        // below is what actually catches someone else holding it.
         const ok = await alertConfirm(existing
             ? `기존 공유 로어북 "${existing.title}"을 덮어씁니다. 계속할까요?`
             : '새 공유 로어북으로 등록됩니다. 계속할까요?')
         if(!ok) return
         try {
-            await uploadEntryToSharedLorebook(book, existing)
+            await uploadEntryToSharedLorebook(book, contentSource, existing)
             // Publishing is what releases the edit lock — mirror that locally.
             editingShared = false
+            editDraft = null
             notifySuccess('공유 로어북에 업로드했습니다')
         } catch(e){
             if(e instanceof SharedLorebookLockedError){
@@ -160,13 +183,17 @@
         }
     }
 
-    // Acquires the exclusive per-entry lock — the moment this succeeds, every
-    // other viewer's fields for this entry go read-only until this is either
+    // Acquires the exclusive per-entry lock and seeds editDraft from whatever
+    // it hands back — either the canonical content (first time editing this
+    // entry) or this same user's own draft preserved server-side from an
+    // earlier session that reloaded/closed without canceling or uploading.
+    // Every other viewer's fields stay read-only until this is either
     // published (uploadEntry) or explicitly abandoned (cancelEditShared).
     async function startEditShared(book: loreBook){
         if(!book.source_lorebook_id || !book.id) return
         try {
-            await ns.lockSharedLorebookEntry(book.source_lorebook_id, book.id)
+            const lockRes = await ns.lockSharedLorebookEntry(book.source_lorebook_id, book.id)
+            editDraft = lockRes.entry
             editingShared = true
             if(!open){
                 open = true
@@ -181,11 +208,13 @@
         }
     }
 
-    // Releases the lock without publishing. Local edits made while editing
-    // are deliberately left in place (not reverted) — they're still yours to
-    // upload later if you change your mind again; only the exclusive hold on
-    // the shared entry is given up.
+    // Releases the lock WITHOUT publishing — and, since the WIP only ever
+    // lived in editDraft/the per-user server draft (never in `value`),
+    // canceling discards it. There's no other place for it to keep existing
+    // once the lock (and the draft row tied to it) is given up.
     async function cancelEditShared(book: loreBook){
+        const ok = await alertConfirm('편집을 취소하면 지금까지 작성한 내용이 사라지고 잠금이 풀립니다. 계속할까요?')
+        if(!ok) return
         if(book.source_lorebook_id && book.id){
             try {
                 await ns.cancelSharedLorebookEntryLock(book.source_lorebook_id, book.id)
@@ -194,16 +223,13 @@
             }
         }
         editingShared = false
+        editDraft = null
     }
 
     async function syncFromShared(book: loreBook){
         if(!book.source_lorebook_id) return
-        if(isEntryDirty(book)){
-            const ok = await alertConfirm('로컬에 저장되지 않은 수정 사항이 있습니다. 최신 버전으로 교체하면 사라집니다. 계속할까요?')
-            if(!ok) return
-        }
         try {
-            await syncEntriesFromSharedLorebook(getCurrentCharacter(), book.source_lorebook_id, { force: true })
+            await syncEntriesFromSharedLorebook(getCurrentCharacter(), book.source_lorebook_id)
             notifySuccess('최신 버전으로 업데이트했습니다')
         } catch(e){
             alertError(String(e))
@@ -248,16 +274,11 @@
 
     async function restoreVersion(book: loreBook, versionId: string){
         if(!book.source_lorebook_id) return
-        let confirmMsg = '이 버전으로 되돌리시겠습니까? 현재 공유 로어북 내용은 버전 기록에 보관됩니다.'
-        if(isEntryDirty(book)){
-            confirmMsg += ' 로컬에 저장되지 않은 수정 사항이 있습니다 — 복원하면 함께 사라집니다.'
-        }
-        const ok = await alertConfirm(confirmMsg)
+        const ok = await alertConfirm('이 버전으로 되돌리시겠습니까? 현재 공유 로어북 내용은 버전 기록에 보관됩니다.')
         if(!ok) return
         try {
             await ns.restoreSharedLorebookVersion(book.source_lorebook_id, versionId)
-            // Explicit single-entry action — always take effect, even over local edits.
-            await syncEntriesFromSharedLorebook(getCurrentCharacter(), book.source_lorebook_id, { force: true })
+            await syncEntriesFromSharedLorebook(getCurrentCharacter(), book.source_lorebook_id)
             showVersions = false
             notifySuccess('복원했습니다')
         } catch(e){
@@ -305,7 +326,7 @@
                 <span>{value.comment.length === 0 ? value.key.length === 0 ? "Unnamed Lore" : value.key : value.comment}</span>
                 {#if value.source_lorebook_id}
                     <span class="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-blue-700/50 text-blue-200 shrink-0">공유</span>
-                    {#if isEntryDirty(value)}
+                    {#if editingShared}
                         <span class="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-amber-700/50 text-amber-200 shrink-0">미업로드</span>
                     {/if}
                 {/if}
@@ -360,7 +381,7 @@
                     <button class="mr-1 text-amber-400" title="편집 중 — 잠금 보유">
                         <PencilIcon size={20} />
                     </button>
-                    <button class="mr-1 valuer" title="편집 취소 (잠금 해제, 로컬 내용은 유지)" onclick={() => cancelEditShared(value)}>
+                    <button class="mr-1 valuer" title="편집 취소 (잠금 해제, 작성 중이던 내용은 사라짐)" onclick={() => cancelEditShared(value)}>
                         <XIcon size={16} />
                     </button>
                 {:else}
@@ -369,7 +390,7 @@
                     </button>
                 {/if}
             {/if}
-            {#if !value.source_lorebook_id || isEntryDirty(value)}
+            {#if !value.source_lorebook_id || editingShared}
                 <button class="mr-1 valuer" title="공유 로어북에 업로드" onclick={() => uploadEntry(value)}>
                     <UploadIcon size={20} />
                 </button>
@@ -477,38 +498,38 @@
             {#if value.source_lorebook_id}
                 <span class="text-xs text-textcolor2 mt-2">
                     {editingShared
-                        ? '편집 중 — 잠금을 쥐고 있는 동안 다른 사람은 이 항목을 수정할 수 없습니다. "업로드"로 반영하거나 "편집 취소"로 잠금을 놓으세요.'
+                        ? '편집 중 — 잠금을 쥐고 있는 동안 다른 사람은 이 항목을 수정할 수 없습니다. "업로드"로 반영하거나 "편집 취소"로 잠금을 놓으세요(취소 시 작성 중이던 내용은 사라집니다).'
                         : '공유 로어북에 연결된 항목입니다 — 수정하려면 "편집 시작"으로 잠금을 먼저 획득하세요.'}
                 </span>
             {/if}
             <span class="text-textcolor mt-6">{language.name} <Help key="loreName"/></span>
-            <TextInput bind:value={value.comment} disabled={locked}/>
+            <TextInput bind:value={contentTarget.comment} disabled={locked}/>
             {#if getActivationMode(value) === 'trigger'}
                 <span class="text-textcolor mt-6">{language.activationKeys} <Help key="loreActivationKey"/></span>
                 <span class="text-xs text-textcolor2">{language.activationKeysInfo}</span>
-                <TextInput bind:value={value.key} disabled={locked}/>
+                <TextInput bind:value={contentTarget.key} disabled={locked}/>
 
-                {#if value.selective}
+                {#if contentTarget.selective}
                     <span class="text-textcolor mt-6">{language.SecondaryKeys}</span>
                     <span class="text-xs text-textcolor2">{language.activationKeysInfo}</span>
-                    <TextInput bind:value={value.secondkey} disabled={locked}/>
+                    <TextInput bind:value={contentTarget.secondkey} disabled={locked}/>
                 {/if}
             {/if}
-            {#if !(value.activationPercent === undefined || value.activationPercent === null)}
+            {#if !(contentTarget.activationPercent === undefined || contentTarget.activationPercent === null)}
                 <span class="text-textcolor mt-6">{language.activationProbability}</span>
-                <NumberInput bind:value={value.activationPercent} disabled={locked} onChange={() => {
-                    if(isNaN(value.activationPercent) || !value.activationPercent || value.activationPercent < 0){
-                        value.activationPercent = 0
+                <NumberInput bind:value={contentTarget.activationPercent} disabled={locked} onChange={() => {
+                    if(isNaN(contentTarget.activationPercent) || !contentTarget.activationPercent || contentTarget.activationPercent < 0){
+                        contentTarget.activationPercent = 0
                     }
-                    if(value.activationPercent > 100){
-                        value.activationPercent = 100
+                    if(contentTarget.activationPercent > 100){
+                        contentTarget.activationPercent = 100
                     }
                 }} />
             {/if}
             <span class="text-textcolor mt-4">{language.insertOrder} <Help key="loreorder"/></span>
-            <NumberInput bind:value={value.insertorder} min={0} max={1000} disabled={locked}/>
+            <NumberInput bind:value={contentTarget.insertorder} min={0} max={1000} disabled={locked}/>
             <span class="text-textcolor mt-4 mb-2">{language.prompt}</span>
-            <TextAreaInput highlight autocomplete="off" bind:value={value.content} disabled={locked}/>
+            <TextAreaInput highlight autocomplete="off" bind:value={contentTarget.content} disabled={locked}/>
             <span class="text-textcolor2 mt-2 mb-2 text-sm">{tokens} {language.tokens}</span>
             <span class="text-textcolor mt-4 mb-2">활성화 방식</span>
             <div class="flex border border-selected rounded-md overflow-hidden w-fit">
@@ -529,15 +550,15 @@
                     <Check check={isLocallyActivated(value)} onChange={(check: boolean) => toggleLocalActive(check, value)} name={language.alwaysActiveInChat}/>
                 </div>
             {/if}
-            {#if !value.useRegex}
+            {#if !contentTarget.useRegex}
                 <div class="flex items-center mt-2">
-                    <Check bind:check={value.selective} disabled={locked} name={language.selective}/>
+                    <Check bind:check={contentTarget.selective} disabled={locked} name={language.selective}/>
                     <Help key="loreSelective" name={language.selective}/>
                 </div>
             {/if}
             {#if getActivationMode(value) === 'trigger'}
                 <div class="flex items-center mt-2">
-                    <Check bind:check={value.useRegex} disabled={locked} name={language.useRegexLorebook}/>
+                    <Check bind:check={contentTarget.useRegex} disabled={locked} name={language.useRegexLorebook}/>
                     <Help key="useRegexLorebook" name={language.useRegexLorebook}/>
                 </div>
             {/if}
