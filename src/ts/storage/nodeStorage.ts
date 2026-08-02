@@ -978,11 +978,11 @@ export class NodeStorage{
         return da.json()
     }
 
-    // Acquires the pessimistic lock on one entry and returns the editor's
-    // personal copy (freshly copied from the canonical entry, or the
-    // requester's own still-preserved draft from an earlier expired/
-    // cancelled session). Throws SharedLorebookLockedError if another user
-    // currently holds it. Global only — private has no lock endpoint.
+    // Acquires the pessimistic, non-expiring lock on one entry and returns the
+    // editor's personal copy (freshly copied from the canonical entry, or the
+    // requester's own still-preserved draft from an earlier cancelled
+    // session). Throws SharedLorebookLockedError if another user currently
+    // holds it. Global only — private has no lock endpoint.
     async lockSharedLorebookEntry(id: string, entryId: string): Promise<{ entry: loreBook, locked_at: number }> {
         const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/${encodeURIComponent(entryId)}/lock`, { method: 'POST' })
         if (da.status === 409) {

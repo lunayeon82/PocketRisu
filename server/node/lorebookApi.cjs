@@ -7,11 +7,10 @@ const { resolveUserId } = require('./chatApi.cjs');
 // Foreign-key constraints (CASCADE DELETE on versions/locks/drafts/overrides) require this per-connection.
 sharedDb.pragma('foreign_keys = ON');
 
-// Pessimistic-lock timeout. A lock older than this is treated as abandoned.
-// On expiry only the lock row is dropped — the draft is intentionally kept
-// (see rl_lorebook_drafts below) so a user who stepped away for over an hour
-// doesn't come back to find their in-progress edit gone.
-const LOCK_TTL_MS = 60 * 60 * 1000;
+// Pessimistic, non-expiring lock: single-writer, exclusive, held until the
+// same user either saves (PUT entries/:entryId) or explicitly cancels
+// (DELETE .../lock) — no timeout. Whoever holds it blocks every other user's
+// edit attempt on that entry until then.
 const MAX_VERSIONS = 3;
 const VALID_OVERRIDE_MODES = new Set(['always', 'trigger', 'disabled']);
 
@@ -84,8 +83,8 @@ if (draftColumns.length > 0 && !draftColumns.some((c) => c.name === 'entry_id'))
 
 // One row per (lorebook, entry) — existence means that entry is locked.
 // locked_at is refreshed on re-lock by the same holder; a different
-// requester gets 409 while it's live and not expired. Only ever created for
-// entries belonging to scope='global' books.
+// requester gets 409 for as long as the row exists (no expiry). Only ever
+// created for entries belonging to scope='global' books.
 sharedDb.exec(`
   CREATE TABLE IF NOT EXISTS rl_lorebook_locks (
     lorebook_id TEXT    NOT NULL REFERENCES rl_lorebooks(id) ON DELETE CASCADE,
@@ -97,9 +96,8 @@ sharedDb.exec(`
 `);
 
 // Personal copy of a single entry, keyed per (lorebook, entry, user) so a
-// past editor's abandoned draft can't collide with the current one. Survives
-// lock expiry by design (see LOCK_TTL_MS comment); only cleared by an
-// explicit save or cancel.
+// past editor's abandoned draft can't collide with the current one. Only
+// cleared by an explicit save or cancel.
 sharedDb.exec(`
   CREATE TABLE IF NOT EXISTS rl_lorebook_drafts (
     lorebook_id TEXT    NOT NULL REFERENCES rl_lorebooks(id) ON DELETE CASCADE,
@@ -211,17 +209,10 @@ function backfillEntryIds(content) {
     return { content: result, changed };
 }
 
-// Resolves the live lock for one entry, lazily clearing it if it has
-// expired. The draft is deliberately left alone on expiry (see LOCK_TTL_MS
-// comment above).
+// Resolves the live lock for one entry. No expiry — a lock lives until its
+// holder saves or explicitly cancels.
 function getLockStatus(lorebookId, entryId) {
-    const lock = stmtGetLock.get(lorebookId, entryId);
-    if (!lock) return null;
-    if (Date.now() - lock.locked_at > LOCK_TTL_MS) {
-        stmtDeleteLock.run(lorebookId, entryId);
-        return null;
-    }
-    return lock;
+    return stmtGetLock.get(lorebookId, entryId) ?? null;
 }
 
 function serializeLockStatus(lorebookId, entryId) {
@@ -257,7 +248,7 @@ function serializeLorebookDetail(row, userId) {
         detail.overrides = stmtGetOverrides.all(userId, row.id);
         const locks = {};
         for (const lock of stmtListLocksForBook.all(row.id)) {
-            const status = serializeLockStatus(row.id, lock.entry_id); // lazily expires
+            const status = serializeLockStatus(row.id, lock.entry_id);
             if (status) locks[lock.entry_id] = status;
         }
         detail.locks = locks;
@@ -592,7 +583,7 @@ function lockEntry(req, res) {
     if (!entry) return res.status(404).json({ error: 'Entry not found' });
 
     const now = Date.now();
-    const lock = getLockStatus(req.params.id, req.params.entryId); // lazily expires a stale lock
+    const lock = getLockStatus(req.params.id, req.params.entryId);
 
     if (lock) {
         if (lock.locked_by !== userId) {
@@ -610,11 +601,9 @@ function lockEntry(req, res) {
         return res.json({ entry: JSON.parse(draft.content), locked_at: now });
     }
 
-    // No live lock: acquire it. If this requester already has a draft of
-    // their own for this entry (left over from an expired lock they never
-    // came back to finish, or cancel), keep it — that's the whole point of
-    // preserving drafts across expiry. Only start from the canonical entry
-    // when they have no draft yet.
+    // No live lock: acquire it. If this requester already has a leftover
+    // draft of their own for this entry, keep it; only start from the
+    // canonical entry when they have no draft yet.
     const draft = sharedDb.transaction(() => {
         stmtUpsertLock.run(req.params.id, req.params.entryId, userId, now);
         let d = stmtGetDraft.get(req.params.id, req.params.entryId, userId);
