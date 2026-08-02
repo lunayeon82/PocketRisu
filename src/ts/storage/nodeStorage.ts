@@ -38,9 +38,22 @@ export interface SharedLorebookLock {
     locked_at: number
 }
 
+export type SharedLorebookScope = 'global' | 'private'
+
+// Per-viewer activation preference for one entry of a global lorebook.
+// Absent for an entry == 'trigger' (the default) — see PUT .../overrides.
+export type SharedLorebookOverrideMode = 'always' | 'trigger' | 'disabled'
+
+export interface SharedLorebookOverride {
+    entry_id: string
+    mode: SharedLorebookOverrideMode
+}
+
 export interface SharedLorebookSummary {
     id: string
     title: string
+    scope: SharedLorebookScope
+    owner_id: number | null
     updated_at: number
     updated_by: number
     updated_by_username: string | null
@@ -49,6 +62,8 @@ export interface SharedLorebookSummary {
 
 export interface SharedLorebookDetail extends SharedLorebookSummary {
     content: loreBook[]
+    /** Only present for scope === 'global' — the requester's own overrides. */
+    overrides?: SharedLorebookOverride[]
 }
 
 export interface SharedLorebookVersion {
@@ -848,14 +863,49 @@ export class NodeStorage{
         return da.json()
     }
 
-    async createSharedLorebook(title: string, content: loreBook[]): Promise<SharedLorebookDetail> {
+    async createSharedLorebook(title: string, content: loreBook[], scope: SharedLorebookScope = 'private'): Promise<SharedLorebookDetail> {
         const da = await this.authFetch('/api/lorebooks', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ title, content }),
+            body: JSON.stringify({ title, content, scope }),
         })
         if (!da.ok) throw new Error(`createSharedLorebook error: ${da.status}`)
         return da.json()
+    }
+
+    // Owner only, one-way (private → global). There is no reverse endpoint.
+    async convertSharedLorebookToGlobal(id: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/to-global`, { method: 'POST' })
+        if (!da.ok) throw new Error(`convertSharedLorebookToGlobal error: ${da.status}`)
+        return da.json()
+    }
+
+    // Copies a global lorebook into a new private one owned by the caller —
+    // entry ids are regenerated server-side, so the clone never shares
+    // per-user overrides with the source.
+    async cloneSharedLorebook(id: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/clone`, { method: 'POST' })
+        if (!da.ok) throw new Error(`cloneSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
+    // Global requires admin; private requires ownership (enforced server-side).
+    async deleteSharedLorebook(id: string): Promise<void> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        if (da.status !== 404 && !da.ok) throw new Error(`deleteSharedLorebook error: ${da.status}`)
+    }
+
+    // Replaces the caller's entire override set for a global lorebook in one
+    // shot. No lock required — this is the viewer's own activation
+    // preference, not a content edit.
+    async saveSharedLorebookOverrides(id: string, overrides: SharedLorebookOverride[]): Promise<SharedLorebookOverride[]> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/overrides`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(overrides),
+        })
+        if (!da.ok) throw new Error(`saveSharedLorebookOverrides error: ${da.status}`)
+        return (await da.json()).overrides
     }
 
     async getSharedLorebook(id: string): Promise<SharedLorebookDetail> {

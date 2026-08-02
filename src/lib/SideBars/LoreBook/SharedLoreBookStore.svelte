@@ -1,18 +1,26 @@
 <script lang="ts">
     // Shared lorebook repository UI — pessimistic lock + personal copy, backed
     // by rl_lorebooks/rl_lorebook_versions/rl_lorebook_locks/rl_lorebook_drafts
-    // (server/node/lorebookApi.cjs). Separate from character.globalLore; this
-    // is a standalone store of lorebooks any account can check out, edit, and
-    // save back for everyone else to see.
-    import { XIcon, PlusIcon, LockIcon, HistoryIcon, RotateCcwIcon, RefreshCwIcon, SparklesIcon } from "@lucide/svelte";
+    // (server/node/lorebookApi.cjs). Separate from character.globalLore.
+    //
+    // Two scopes:
+    // - global: visible to everyone, edited under the lock/draft dance below,
+    //   deletable only by admins. Per-viewer entry activation lives in
+    //   rl_lorebook_overrides (see the override view further down) instead of
+    //   the shared content's own alwaysActive/mode fields, so one person's
+    //   "always active" choice can't leak into everyone else's chats.
+    // - private: visible only to its owner, edited directly (no lock — a
+    //   private lorebook has exactly one possible editor), deletable by the owner.
+    import { XIcon, PlusIcon, LockIcon, HistoryIcon, RotateCcwIcon, RefreshCwIcon, SparklesIcon, GlobeIcon, LockKeyholeIcon, CopyIcon, TrashIcon, SlidersHorizontalIcon } from "@lucide/svelte";
     import {
         NodeStorage, SharedLorebookLockedError,
         type SharedLorebookSummary, type SharedLorebookDetail, type SharedLorebookVersion,
+        type SharedLorebookOverrideMode, type SharedLorebookScope,
     } from "src/ts/storage/nodeStorage";
     import type { loreBook } from "src/ts/storage/database.svelte";
     import LoreBookList from "./LoreBookList.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
-    import { alertConfirm, alertError, alertInput, notifyError, notifySuccess } from "src/ts/alert";
+    import { alertConfirm, alertError, alertInput, alertSelect, notifyError, notifySuccess } from "src/ts/alert";
     import { saveLorebookDraftLocal, loadLorebookDraftLocal, clearLorebookDraftLocal } from "src/ts/storage/lorebookDraftDb";
     import { onMount, onDestroy } from "svelte";
 
@@ -41,10 +49,15 @@
     }
 
     let myId = $state<number | null>(null)
+    let myIsAdmin = $state(false)
     onMount(async () => {
         try {
             const res = await fetch('/api/auth/whoami')
-            if (res.ok) myId = (await res.json()).id
+            if (res.ok) {
+                const data = await res.json()
+                myId = data.id
+                myIsAdmin = !!data.isAdmin
+            }
         } catch {}
     })
 
@@ -85,13 +98,53 @@
     async function createNew() {
         const title = await alertInput('새 로어북 이름')
         if (!title) return
+        const sel = parseInt(await alertSelect(['개인', '글로벌']))
+        if (isNaN(sel)) return
+        const scope: SharedLorebookScope = sel === 1 ? 'global' : 'private'
         try {
-            const created = await ns.createSharedLorebook(title, [])
+            const created = await ns.createSharedLorebook(title, [], scope)
             markSeen(created)
             await refreshList()
         } catch (e) {
             alertError(String(e))
         }
+    }
+
+    async function shareToGlobal(book: SharedLorebookSummary) {
+        const ok = await alertConfirm(`"${book.title}"를 글로벌로 공유하면 모든 사용자가 보고 편집할 수 있게 됩니다. 계속할까요?`)
+        if (!ok) return
+        try {
+            await ns.convertSharedLorebookToGlobal(book.id)
+            notifySuccess('글로벌로 공유했습니다')
+            await refreshList()
+        } catch (e) {
+            alertError(String(e))
+        }
+    }
+
+    async function cloneToPrivate(book: SharedLorebookSummary) {
+        try {
+            await ns.cloneSharedLorebook(book.id)
+            notifySuccess('내 사본을 만들었습니다')
+            await refreshList()
+        } catch (e) {
+            alertError(String(e))
+        }
+    }
+
+    async function deleteBook(book: SharedLorebookSummary) {
+        const ok = await alertConfirm(`"${book.title}"를 삭제하시겠습니까? 되돌릴 수 없습니다.`)
+        if (!ok) return
+        try {
+            await ns.deleteSharedLorebook(book.id)
+            await refreshList()
+        } catch (e) {
+            alertError(String(e))
+        }
+    }
+
+    function canDelete(book: SharedLorebookSummary): boolean {
+        return book.scope === 'global' ? myIsAdmin : book.owner_id === myId
     }
 
     // ── Editing ──────────────────────────────────────────────────────────────
@@ -102,6 +155,18 @@
 
     async function startEdit(book: SharedLorebookSummary) {
         try {
+            if (book.scope === 'private') {
+                // Single possible editor (the owner) — no lock, no server-side
+                // draft, just edit the canonical content directly.
+                const local = await loadLorebookDraftLocal(book.id)
+                const detail = await ns.getSharedLorebook(book.id)
+                editing = detail
+                draftTitle = detail.title
+                draftContent = local ?? detail.content
+                markSeen(detail)
+                stopPolling()
+                return
+            }
             // A locally-buffered draft (see lorebookDraftDb.ts) may hold edits
             // typed after the last lock/relock but never PUT back — prefer it
             // over the server-issued copy, which is only as fresh as the lock.
@@ -160,10 +225,12 @@
     async function cancelEdit() {
         if (!editing) return
         const id = editing.id
-        try {
-            await ns.cancelSharedLorebookLock(id)
-        } catch (e) {
-            // Lock already gone (expired / taken elsewhere) — still fine to leave edit mode.
+        if (editing.scope === 'global') {
+            try {
+                await ns.cancelSharedLorebookLock(id)
+            } catch (e) {
+                // Lock already gone (expired / taken elsewhere) — still fine to leave edit mode.
+            }
         }
         await clearLorebookDraftLocal(id)
         exitEdit()
@@ -183,7 +250,7 @@
         }]
     }
 
-    // ── Version history / restore ───────────────────────────────────────────
+    // ── Version history / restore (global-only in this UI) ─────────────────
     let showVersions = $state(false)
     let versions = $state<SharedLorebookVersion[]>([])
     let loadingVersions = $state(false)
@@ -218,6 +285,54 @@
         }
     }
 
+    // ── Per-viewer activation overrides (global only, no lock needed) ──────
+    const OVERRIDE_LABELS: Record<SharedLorebookOverrideMode, string> = {
+        always: '상시',
+        trigger: '트리거',
+        disabled: '비활성',
+    }
+    let viewingOverrides = $state<SharedLorebookDetail | null>(null)
+    let overridesMap = $state<Record<string, SharedLorebookOverrideMode>>({})
+    let savingOverrides = $state(false)
+
+    async function openOverrides(book: SharedLorebookSummary) {
+        try {
+            const detail = await ns.getSharedLorebook(book.id)
+            viewingOverrides = detail
+            const map: Record<string, SharedLorebookOverrideMode> = {}
+            for (const entry of detail.content) {
+                if (entry.id) map[entry.id] = 'trigger'
+            }
+            for (const o of detail.overrides ?? []) {
+                map[o.entry_id] = o.mode
+            }
+            overridesMap = map
+        } catch (e) {
+            alertError(String(e))
+        }
+    }
+
+    function closeOverrides() {
+        viewingOverrides = null
+        overridesMap = {}
+    }
+
+    async function setOverrideMode(entryId: string, mode: SharedLorebookOverrideMode) {
+        if (!viewingOverrides) return
+        const prev = overridesMap[entryId]
+        overridesMap = { ...overridesMap, [entryId]: mode }
+        savingOverrides = true
+        try {
+            const payload = Object.entries(overridesMap).map(([entry_id, m]) => ({ entry_id, mode: m }))
+            await ns.saveSharedLorebookOverrides(viewingOverrides.id, payload)
+        } catch (e) {
+            overridesMap = { ...overridesMap, [entryId]: prev }
+            alertError(String(e))
+        } finally {
+            savingOverrides = false
+        }
+    }
+
     function formatTime(ts: number): string {
         return new Date(ts).toLocaleString('ko-KR')
     }
@@ -225,7 +340,47 @@
 
 <div class="fixed inset-0 z-40 bg-black/50 flex justify-center items-center">
     <div class="bg-darkbg p-4 rounded-md flex flex-col max-w-3xl w-full mx-4 max-h-[85vh]">
-        {#if !editing}
+        {#if viewingOverrides}
+            <div class="flex items-center text-textcolor mb-4">
+                <h2 class="mt-0 mb-0 truncate">{viewingOverrides.title} · 내 활성화 설정</h2>
+                <div class="grow flex justify-end">
+                    <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={closeOverrides}>
+                        <XIcon size={22}/>
+                    </button>
+                </div>
+            </div>
+            <span class="text-textcolor2 text-sm mb-3">여기서 고른 모드는 나에게만 적용되고 다른 사람에게는 영향을 주지 않습니다.</span>
+            <div class="flex flex-col gap-2 overflow-y-auto">
+                {#if viewingOverrides.content.length === 0}
+                    <span class="text-textcolor2">항목이 없습니다</span>
+                {:else}
+                    {#each viewingOverrides.content as entry (entry.id)}
+                        {#if entry.mode !== 'folder' && entry.id}
+                            <div class="flex items-center border border-selected rounded-md p-3 gap-3">
+                                <div class="flex flex-col min-w-0 grow">
+                                    <span class="text-textcolor truncate">{entry.comment || entry.key || '(이름 없음)'}</span>
+                                    <span class="text-textcolor2 text-xs truncate">{entry.key}</span>
+                                </div>
+                                <div class="flex border border-selected rounded-md overflow-hidden shrink-0">
+                                    {#each (['always', 'trigger', 'disabled'] as const) as mode}
+                                        <button
+                                            class="px-2 py-1 text-xs cursor-pointer"
+                                            class:bg-selected={(overridesMap[entry.id] ?? 'trigger') === mode}
+                                            class:text-textcolor={(overridesMap[entry.id] ?? 'trigger') === mode}
+                                            class:text-textcolor2={(overridesMap[entry.id] ?? 'trigger') !== mode}
+                                            disabled={savingOverrides}
+                                            onclick={() => entry.id && setOverrideMode(entry.id, mode)}
+                                        >
+                                            {OVERRIDE_LABELS[mode]}
+                                        </button>
+                                    {/each}
+                                </div>
+                            </div>
+                        {/if}
+                    {/each}
+                {/if}
+            </div>
+        {:else if !editing}
             <div class="flex items-center text-textcolor mb-4">
                 <h2 class="mt-0 mb-0">공유 로어북 저장소</h2>
                 <div class="grow flex justify-end items-center gap-1">
@@ -254,6 +409,15 @@
                         <div class="flex items-center border border-selected rounded-md p-3 gap-3">
                             <div class="flex flex-col min-w-0 grow">
                                 <div class="flex items-center gap-2">
+                                    {#if book.scope === 'global'}
+                                        <span class="text-xs px-1.5 py-0.5 rounded-full bg-blue-700/50 text-blue-200 flex items-center gap-1 shrink-0">
+                                            <GlobeIcon size={12}/> 글로벌
+                                        </span>
+                                    {:else}
+                                        <span class="text-xs px-1.5 py-0.5 rounded-full bg-selected text-textcolor2 flex items-center gap-1 shrink-0">
+                                            <LockKeyholeIcon size={12}/> 개인
+                                        </span>
+                                    {/if}
                                     <span class="text-textcolor truncate">{book.title || '(제목 없음)'}</span>
                                     {#if hasUnseenUpdate(book)}
                                         <span class="text-xs px-1.5 py-0.5 rounded-full bg-green-700/60 text-green-200 flex items-center gap-1 shrink-0">
@@ -271,13 +435,32 @@
                                     </span>
                                 {/if}
                             </div>
-                            <button
-                                class="px-3 py-1.5 rounded-md bg-selected text-textcolor shrink-0 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                                disabled={lockedByOther}
-                                onclick={() => startEdit(book)}
-                            >
-                                수정
-                            </button>
+                            <div class="flex items-center gap-1 shrink-0">
+                                {#if book.scope === 'global'}
+                                    <button class="text-textcolor2 hover:text-primary p-1.5 cursor-pointer" onclick={() => openOverrides(book)} title="내 활성화 설정">
+                                        <SlidersHorizontalIcon size={16}/>
+                                    </button>
+                                    <button class="text-textcolor2 hover:text-primary p-1.5 cursor-pointer" onclick={() => cloneToPrivate(book)} title="내 사본 만들기">
+                                        <CopyIcon size={16}/>
+                                    </button>
+                                {:else}
+                                    <button class="text-textcolor2 hover:text-primary p-1.5 cursor-pointer" onclick={() => shareToGlobal(book)} title="글로벌로 공유">
+                                        <GlobeIcon size={16}/>
+                                    </button>
+                                {/if}
+                                {#if canDelete(book)}
+                                    <button class="text-textcolor2 hover:text-red-400 p-1.5 cursor-pointer" onclick={() => deleteBook(book)} title="삭제">
+                                        <TrashIcon size={16}/>
+                                    </button>
+                                {/if}
+                                <button
+                                    class="px-3 py-1.5 rounded-md bg-selected text-textcolor shrink-0 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                                    disabled={lockedByOther}
+                                    onclick={() => startEdit(book)}
+                                >
+                                    수정
+                                </button>
+                            </div>
                         </div>
                     {/each}
                 {/if}
@@ -285,9 +468,11 @@
         {:else}
             <div class="flex items-center text-textcolor mb-4 gap-2">
                 <TextInput bind:value={draftTitle} placeholder="로어북 이름" fullwidth padding className="grow"/>
-                <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer shrink-0" onclick={openVersions} title="버전 기록">
-                    <HistoryIcon size={20}/>
-                </button>
+                {#if editing.scope === 'global'}
+                    <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer shrink-0" onclick={openVersions} title="버전 기록">
+                        <HistoryIcon size={20}/>
+                    </button>
+                {/if}
             </div>
 
             {#if showVersions}
