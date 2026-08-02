@@ -21,6 +21,8 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - 코드 스플리팅: Monaco→dynamic import, wasmoon→lazy load, Settings→lazy load, katex/highlight.js→manualChunks 분리
 - 채팅 전환 깜빡임 개선: LoadingOverlay→fade 트랜지션, BackgroundDom→캐릭터ID 키 추가, DefaultChatScreen→분기별 transition
 - 백업 업로드 수정: Nginx proxy_buffering/proxy_request_buffering off 적용
+- 3단계: 서버 인증 게이트 (rl_users, bcrypt, rl_auth 세션 쿠키, authGate.cjs)
+- 5단계: 채팅 폴더 UI 개선 (옵시디언 스타일) — chatTree.ts로 폴더/채팅 트리 구성, ChatTreeItem.svelte로 재귀 렌더링(접기/펼치기, 이름변경, 색상, 삭제 시 자식 승격), MoveToFolderModal.svelte로 컨텍스트 메뉴 이동, 드래그 앤 드롭(같은 종류끼리 순서 변경, 폴더로 이동, 최상위 드롭존, 최대 깊이 2 및 자기 자신 하위 이동 가드) — reorderChats/updateChatFolder API 사용
 
 ## 제약 사항
 - src/ts 함수 시그니처 변경 시 upstream 호환성 고려
@@ -31,6 +33,4 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - upstream의 서버 사이드 생성 기능을 cherry-pick할 경우, 서버 완성 경로가 chatApi.cjs의 upsertChatFull()도 호출하는지 반드시 확인할 것 (미호출 시 서버 생성 메시지가 rl_chats에 반영되지 않아 클라이언트 재접속 후 덮어씌워질 수 있음)
 
 ## 다음 작업 예정
-- 3단계: 서버 인증 게이트 (rl_users, bcrypt, 세션 쿠키)
 - 4단계: 공유 로어북 저장소 (비관적 잠금, 개인 사본, 버전 관리)
-- 5단계: 채팅 폴더 UI 개선 (옵시디언 스타일)
