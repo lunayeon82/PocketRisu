@@ -16,6 +16,7 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - 각 엔트리 안에서는 전역 Svelte store로 뷰 스위칭 (라우터 없음)
 - 로컬 퍼스트: 채팅 데이터는 각 사용자 브라우저 IndexedDB에 저장
 - 서버 저장 모드: 채팅을 placeholder로 부팅 → 처음 열 때 hydration
+- 캐릭터 카드(로어북/프리셋/설정 포함)는 계정별로 분리되지 않음 — 배포 전체가 database.bin 하나를 공유 (server.cjs의 /api/read|write|patch에 rl_auth 유저 스코핑 없음, checkAuth는 RisuAI 자체 JWT로 rl_auth와 무관). 반면 채팅·채팅폴더는 rl_chats/rl_chat_folders로 계정별 분리됨 — 4단계(공유 로어북 저장소) 작업 시 이 갭을 참고할 것
 
 ## 완료된 작업
 - 코드 스플리팅: Monaco→dynamic import, wasmoon→lazy load, Settings→lazy load, katex/highlight.js→manualChunks 분리
@@ -23,6 +24,8 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - 백업 업로드 수정: Nginx proxy_buffering/proxy_request_buffering off 적용
 - 3단계: 서버 인증 게이트 (rl_users, bcrypt, rl_auth 세션 쿠키, authGate.cjs)
 - 5단계: 채팅 폴더 UI 개선 (옵시디언 스타일) — chatTree.ts로 폴더/채팅 트리 구성, ChatTreeItem.svelte로 재귀 렌더링(접기/펼치기, 이름변경, 색상, 삭제 시 자식 승격), MoveToFolderModal.svelte로 컨텍스트 메뉴 이동, 드래그 앤 드롭(같은 종류끼리 순서 변경, 폴더로 이동, 최상위 드롭존, 최대 깊이 2 및 자기 자신 하위 이동 가드) — reorderChats/updateChatFolder API 사용
+- 단일 캐릭터 자동 진입 (autoOpenSingleCharacter 설정) — 켜면 부팅 시 캐릭터 갤러리 건너뛰고 첫 번째(휴지통 제외) 캐릭터 채팅으로 바로 진입, 사이드바 캐릭터 추가(+) 버튼도 숨김. bootstrap.ts에서 처리
+- 사이드바 "최근에 본" 목록 버그 수정 — Sidebar.svelte의 recentChars가 trashTime(휴지통) 필터링을 안 해서, 삭제(소프트 삭제) 캐릭터가 메인 그리드에서는 사라져도 최근 목록엔 3일 뒤 자동 정리 전까지 계속 표시되던 문제
 
 ## 제약 사항
 - src/ts 함수 시그니처 변경 시 upstream 호환성 고려
