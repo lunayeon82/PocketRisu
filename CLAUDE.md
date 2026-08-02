@@ -16,7 +16,7 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - 각 엔트리 안에서는 전역 Svelte store로 뷰 스위칭 (라우터 없음)
 - 로컬 퍼스트: 채팅 데이터는 각 사용자 브라우저 IndexedDB에 저장
 - 서버 저장 모드: 채팅을 placeholder로 부팅 → 처음 열 때 hydration
-- 캐릭터 카드(로어북/프리셋/설정 포함)는 계정별로 분리되지 않음 — 배포 전체가 database.bin 하나를 공유 (server.cjs의 /api/read|write|patch에 rl_auth 유저 스코핑 없음, checkAuth는 RisuAI 자체 JWT로 rl_auth와 무관). 반면 채팅·채팅폴더는 rl_chats/rl_chat_folders로 계정별 분리됨 — 4단계(공유 로어북 저장소) 작업 시 이 갭을 참고할 것
+- 캐릭터 카드(로어북/프리셋/설정 포함)는 계정별로 분리되지 않음 — 배포 전체가 database.bin 하나를 공유 (server.cjs의 /api/read|write|patch에 rl_auth 유저 스코핑 없음, checkAuth는 RisuAI 자체 JWT로 rl_auth와 무관). 채팅·채팅폴더는 rl_chats/rl_chat_folders로, 공유 로어북은 rl_lorebooks 계열로 각각 별도 계정별/스코프별 분리됨 (아래 4단계 참고) — database.bin 자체는 여전히 미분리
 
 ## 완료된 작업
 - 코드 스플리팅: Monaco→dynamic import, wasmoon→lazy load, Settings→lazy load, katex/highlight.js→manualChunks 분리
@@ -26,9 +26,13 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - 5단계: 채팅 폴더 UI 개선 (옵시디언 스타일) — chatTree.ts로 폴더/채팅 트리 구성, ChatTreeItem.svelte로 재귀 렌더링(접기/펼치기, 이름변경, 색상, 삭제 시 자식 승격), MoveToFolderModal.svelte로 컨텍스트 메뉴 이동, 드래그 앤 드롭(같은 종류끼리 순서 변경, 폴더로 이동, 최상위 드롭존, 최대 깊이 2 및 자기 자신 하위 이동 가드) — reorderChats/updateChatFolder API 사용
 - 단일 캐릭터 자동 진입 (autoOpenSingleCharacter 설정) — 켜면 부팅 시 캐릭터 갤러리 건너뛰고 첫 번째(휴지통 제외) 캐릭터 채팅으로 바로 진입, 사이드바 캐릭터 추가(+) 버튼도 숨김. bootstrap.ts에서 처리
 - 사이드바 "최근에 본" 목록 버그 수정 — Sidebar.svelte의 recentChars가 trashTime(휴지통) 필터링을 안 해서, 삭제(소프트 삭제) 캐릭터가 메인 그리드에서는 사라져도 최근 목록엔 3일 뒤 자동 정리 전까지 계속 표시되던 문제
-- 4단계: 공유 로어북 저장소 — rl_lorebooks/rl_lorebook_versions/rl_lorebook_locks/rl_lorebook_drafts (lorebookApi.cjs), 비관적 잠금(1시간 타임아웃, 만료 시 draft는 보존하고 lock만 해제 — 재잠금 시 자기 draft 우선 사용) + 개인 사본 + 최근 3버전 관리. 클라이언트는 LoreBookSetting.svelte 툴바에 진입점(LibraryBigIcon), SharedLoreBookStore.svelte가 목록/잠금배지/새버전뱃지(15초 폴링)/편집(LoreBookList 재사용)/버전복원 담당, 임시저장은 lorebookDraftDb.ts(순수 IndexedDB)에만
-  - 글로벌/개인 스코프 확장 — rl_lorebooks.scope('global'/'private')+owner_id, rl_lorebook_overrides(user_id, lorebook_id, entry_id, mode) 신규. private은 잠금 없이 소유자가 직접 편집, global은 잠금 플로우. entry_id는 모든 쓰기 경로(생성/저장/복원/to-global, scope 무관)에서 backfillEntryIds()로 누락분만 채움 — override뿐 아니라 항목 단위 API가 항목을 특정하려면 필수. clone은 override/잠금 연결을 완전히 끊기 위해 전체 id 재발급(백필과 다름). 삭제는 global=관리자만/private=소유자만, to-global은 단방향(역방향 없음). 활성화 모드(상시/트리거/비활성)는 per-viewer라 콘텐츠 자체엔 안 남기고 오버라이드 테이블에만 저장(기본값 트리거는 행 자체를 안 씀)
-  - 잠금을 책 단위→항목(entry) 단위로 재설계 — "책"은 scope/제목 묶음(폴더)일 뿐 잠금 개념이 없고, rl_lorebook_locks/rl_lorebook_drafts를 (lorebook_id, entry_id)로 키 변경(구버전 스키마는 upgrade 시 그냥 DROP 후 재생성 — 이 두 테이블은 진행 중 편집 상태만 담아서 안전). 읽기는 항상 잠금 없이 전체 표시, 추가/삭제/순서변경/이름변경은 구조 변경이라 잠금 불필요(global은 아무나, private은 소유자만), 실제 내용 편집(PUT .../entries/:entryId)만 그 항목의 잠금 필요. 버전 스냅샷은 여전히 책 전체 단위로 유지. 클라이언트는 LoreBookData.svelte와 동일한 필드 레이아웃을 인라인 재현(entryEditor 스니펫)해서, 캐릭터 자체 로어북처럼 펼치면 바로 보이고 항목별 연필 아이콘으로 그 항목만 잠그고 편집 — "+"로 항목 추가 시 즉시 그 항목의 편집 모드로 진입
+- 4단계: 공유 로어북 저장소 (lorebookApi.cjs, SharedLoreBookStore.svelte) — 현재 상태:
+  - 스코프: rl_lorebooks.scope('global'/'private')+owner_id. global은 전체 공개, private은 owner_id 본인만 조회/편집 가능(GET/PUT 등에서 canView()로 404 처리). private→global 전환(to-global)은 단방향, 역방향 없음. global→private 복제(clone)는 entry id 전체 재발급으로 원본과 완전 분리. 삭제는 global=관리자만/private=소유자만
+  - 잠금은 책이 아니라 **항목(entry) 단위** — "책"은 scope/제목을 묶는 폴더일 뿐. rl_lorebook_locks/rl_lorebook_drafts가 (lorebook_id, entry_id) 키. 읽기는 항상 잠금 없음. 추가/삭제/순서변경/이름변경(구조 변경)도 잠금 불필요(global=아무나, private=소유자만) — 실제 내용 편집(PUT .../entries/:entryId)만 그 항목의 잠금 필요, 그래서 같은 책의 다른 항목은 여러 명이 동시에 편집 가능. 1시간 타임아웃, 만료 시 draft는 보존(재잠금 시 우선 사용). entry_id는 모든 쓰기 경로에서 backfillEntryIds()로 누락분만 채움(항목 단위 API가 항목을 특정하려면 scope 무관하게 필수)
+  - 버전 스냅샷/복원(최근 3개)은 여전히 책 전체 단위 — 잠글 대상이 없어 global은 아무나, private은 소유자만 복원 가능
+  - 활성화 모드(상시/트리거/비활성)는 rl_lorebook_overrides(user_id, lorebook_id, entry_id, mode)에 per-viewer로 저장, 콘텐츠 자체엔 안 남김(기본값 트리거는 행 자체를 안 씀) — 잠금 불필요
+  - 클라이언트: LoreBookSetting.svelte의 Character 탭에 캐릭터 자체 로어북 목록과 이어 붙여 표시(별도 탭/모달 아님). 각 공유 로어북은 폴더처럼 펼치면 항목이 바로 보이고(LoreBookData.svelte와 동일한 필드 레이아웃을 인라인 재현), 항목별 연필 아이콘으로 그 항목만 잠그고 편집 — "+"로 항목 추가 시 즉시 편집 모드 진입. 임시저장은 lorebookDraftDb.ts(순수 IndexedDB, entry 단위)에만
+  - 미구현: 항목 순서 변경 API(PATCH .../entries/reorder)는 서버에 있지만 드래그 UI는 아직 없음
 - 채팅/폴더 트리 UX 개선 — 이름변경을 인라인 입력 대신 ShDialog 모달로 분리(행이 draggable이라 인라인 입력 드래그 시 텍스트 선택이 행 드래그로 오인식되던 문제 해결), 뎁스별 세로 가이드라인으로 폴더 소속 명시, 드래그 중 "어디로 이동하는지" 설명 배너 추가, 최상위 드롭존을 드래그 중에만 노출되는 라벨 있는 큰 영역으로 개선, ondragend로 드롭존 상태 항상 리셋
   - 터치 기기 드래그 미지원(HTML5 DnD가 터치 스크롤과 충돌해서 isTouchDevice면 draggable 자체를 꺼둠) — grip 핸들 꾹 눌러 pointer 이벤트 기반 커스텀 드래그로 보완 예정, 아직 미착수
 
