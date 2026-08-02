@@ -24,8 +24,14 @@
     import { saveLorebookDraftLocal, loadLorebookDraftLocal, clearLorebookDraftLocal } from "src/ts/storage/lorebookDraftDb";
     import { onMount, onDestroy } from "svelte";
 
-    interface Props { close?: () => void }
-    let { close = () => {} }: Props = $props();
+    interface Props {
+        close?: () => void
+        /** Render in the host's normal flow (no fixed backdrop/centering, no
+         *  close button) — used when this is embedded as a tab in
+         *  LoreBookSetting.svelte instead of opened as a standalone modal. */
+        inline?: boolean
+    }
+    let { close = () => {}, inline = false }: Props = $props();
 
     const ns = new NodeStorage();
 
@@ -338,8 +344,7 @@
     }
 </script>
 
-<div class="fixed inset-0 z-40 bg-black/50 flex justify-center items-center">
-    <div class="bg-darkbg p-4 rounded-md flex flex-col max-w-3xl w-full mx-4 max-h-[85vh]">
+{#snippet content()}
         {#if viewingOverrides}
             <div class="flex items-center text-textcolor mb-4">
                 <h2 class="mt-0 mb-0 truncate">{viewingOverrides.title} · 내 활성화 설정</h2>
@@ -390,9 +395,11 @@
                     <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={createNew} title="새 로어북">
                         <PlusIcon size={20}/>
                     </button>
-                    <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={close}>
-                        <XIcon size={22}/>
-                    </button>
+                    {#if !inline}
+                        <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={close}>
+                            <XIcon size={22}/>
+                        </button>
+                    {/if}
                 </div>
             </div>
 
@@ -529,5 +536,16 @@
                 </button>
             </div>
         {/if}
+{/snippet}
+
+{#if inline}
+    <div class="flex flex-col">
+        {@render content()}
     </div>
-</div>
+{:else}
+    <div class="fixed inset-0 z-40 bg-black/50 flex justify-center items-center">
+        <div class="bg-darkbg p-4 rounded-md flex flex-col max-w-3xl w-full mx-4 max-h-[85vh]">
+            {@render content()}
+        </div>
+    </div>
+{/if}

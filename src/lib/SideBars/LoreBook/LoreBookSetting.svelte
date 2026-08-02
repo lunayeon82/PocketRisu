@@ -2,7 +2,7 @@
     
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from "../../../lang";
-    import { DownloadIcon, HardDriveUploadIcon, PlusIcon, SunIcon, LinkIcon, FolderPlusIcon, LibraryBigIcon } from "@lucide/svelte";
+    import { DownloadIcon, HardDriveUploadIcon, PlusIcon, SunIcon, LinkIcon, FolderPlusIcon } from "@lucide/svelte";
     import { addLorebook, addLorebookFolder, exportLoreBook, importLoreBook } from "../../../ts/process/lorebook.svelte";
     import Check from "../../UI/GUI/CheckInput.svelte";
     import NumberInput from "../../UI/GUI/NumberInput.svelte";
@@ -12,7 +12,6 @@
     import { selectedCharID } from "src/ts/stores.svelte";
 
     let submenu = $state(0)
-    let openSharedStore = $state(false)
     interface Props {
         globalMode?: boolean;
     }
@@ -71,9 +70,16 @@
         }} class="p-2 flex-1" class:bg-selected={submenu === 2}>
             <span>{language.settings}</span>
         </button>
+        <button onclick={() => {
+            submenu = 3
+        }} class="p-2 flex-1 border-l border-selected" class:bg-selected={submenu === 3}>
+            <span>공유</span>
+        </button>
     </div>
 {/if}
-{#if submenu !== 2}
+{#if submenu === 3}
+    <SharedLoreBookStore inline />
+{:else if submenu !== 2}
     {#if !globalMode}
         <span class="text-textcolor2 mt-2 mb-6 text-sm">{submenu === 0 ? language.globalLoreInfo : language.localLoreInfo}</span>
     {/if}
@@ -111,7 +117,7 @@
         </div>
     {/if}
 {/if}
-{#if submenu !== 2}
+{#if submenu !== 2 && submenu !== 3}
 
 <div class="text-textcolor2 mt-2 flex">
     <button onclick={() => {addLorebook(globalMode ? -1 : submenu)}} class="hover:text-textcolor cursor-pointer">
@@ -131,9 +137,6 @@
         importLoreBook(globalMode ? 'sglobal' : submenu === 0 ? 'global' : 'local')
     }} class="hover:text-textcolor ml-2  cursor-pointer">
         <HardDriveUploadIcon />
-    </button>
-    <button onclick={() => { openSharedStore = true }} class="hover:text-textcolor ml-2 cursor-pointer" title="공유 로어북 저장소">
-        <LibraryBigIcon />
     </button>
     {#if DBState.db.bulkEnabling}
         <button onclick={() => {
@@ -158,7 +161,4 @@
         </button>
     {/if}
 </div>
-{/if}
-{#if openSharedStore}
-    <SharedLoreBookStore close={() => { openSharedStore = false }} />
 {/if}
