@@ -1,6 +1,6 @@
 import { get, writable } from "svelte/store";
-import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat, newChatModelDefaults } from "./storage/database.svelte";
-import { ensureChatHydrated } from "./storage/chatStorage";
+import { saveImage, setDatabase, type character, type Chat, type ChatFolder, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat, newChatModelDefaults } from "./storage/database.svelte";
+import { ensureChatHydrated, createChatFolder } from "./storage/chatStorage";
 import { alertAddCharacter, alertConfirm, alertError, alertSelect, alertStore, alertWait, notifySuccess, notifyInfo } from "./alert";
 import { chatDeselected } from "./stores.svelte";
 import { language } from "../lang";
@@ -404,20 +404,50 @@ export async function importChat(){
                 const chats = Array.isArray(json.data) ? json.data : [json.data]
                 const selectedID = get(selectedCharID)
                 let db = getDatabase()
-                let folderIdMap = {}
+                const chaId = db.characters[selectedID].chaId
+                let folderIdMap: Record<string, string> = {}
                 folders.forEach(folder => {
                     if(db.characters[selectedID].chatFolders?.some(f => f.id === folder.id)){
-                        const newId = uuidv4()
-                        folderIdMap[folder.id] = newId
-                        folder.id = newId
+                        folderIdMap[folder.id] = uuidv4()
                     } else {
                         folderIdMap[folder.id] = folder.id
+                    }
+                })
+                // Remap both id and parentId up front (not just id) — a child
+                // folder's parentId may point at another folder in this same
+                // import that also got a fresh id above.
+                folders.forEach(folder => {
+                    folder.id = folderIdMap[folder.id]
+                    if(folder.parentId){
+                        folder.parentId = folderIdMap[folder.parentId] ?? null
                     }
                 })
                 if(db.characters[selectedID].chatFolders === undefined){
                     db.characters[selectedID].chatFolders = []
                 }
-                db.characters[selectedID].chatFolders.push(...folders)
+                // Folders live server-side (rl_chat_folders) now, not in
+                // database.bin — recreate them there (parents before children)
+                // so they survive a reload instead of vanishing on next boot.
+                const createdFolders: ChatFolder[] = []
+                const byParent = (id: string | null) => folders.filter((f: any) => (f.parentId ?? null) === id)
+                async function createFolderLevel(parentId: string | null){
+                    for(const folder of byParent(parentId)){
+                        try {
+                            const created = await createChatFolder(chaId, {
+                                id: folder.id,
+                                name: folder.name,
+                                color: folder.color,
+                                parentId: folder.parentId ?? null,
+                            })
+                            createdFolders.push(created)
+                        } catch (e) {
+                            console.error('[importChat] Failed to create folder', folder.id, e)
+                        }
+                        await createFolderLevel(folder.id)
+                    }
+                }
+                await createFolderLevel(null)
+                db.characters[selectedID].chatFolders.push(...createdFolders)
                 chats.forEach(chat => {
                     if(chat.folderId && folderIdMap[chat.folderId]){
                         chat.folderId = folderIdMap[chat.folderId]

@@ -1,22 +1,20 @@
 <script lang="ts">
-    import { onDestroy, onMount } from "svelte";
     import { v4 } from "uuid";
-    import Sortable from 'sortablejs/modular/sortable.core.esm.js';
-    import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon, PackageIcon, CopyIcon } from "@lucide/svelte";
+    import { DownloadIcon, PencilIcon, HardDriveUploadIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon, PackageIcon } from "@lucide/svelte";
 
-    import type { Chat, ChatFolder, character } from "src/ts/storage/database.svelte";
+    import type { character, Chat, ChatFolder } from "src/ts/storage/database.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
-    import { ensureChatHydrated, deleteChatFromServer, saveChatToServer, reorderChats } from "src/ts/storage/chatStorage";
-    import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
+    import { saveChatToServer, createChatFolder, updateChatMeta, updateChatFolder, reorderChats } from "src/ts/storage/chatStorage";
+    import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID, chatDeselected } from "src/ts/stores.svelte";
 
-    import CheckInput from "../UI/GUI/CheckInput.svelte";
+    import ChatTreeItem from "./ChatTreeItem.svelte";
+    import MoveToFolderModal from "./MoveToFolderModal.svelte";
     import ShButton from "../UI/GUI/ShButton.svelte";
-    import TextInput from "../UI/GUI/TextInput.svelte";
 
-    import { exportChat, importChat, exportAllChats } from "src/ts/characters";
-    import { alertConfirm, alertError, alertSelect, alertStore, notifySuccess, notifyError } from "src/ts/alert";
-    import { findCharacterbyId, sleep, sortableOptions } from "src/ts/util";
+    import { exportAllChats, importChat } from "src/ts/characters";
+    import { alertStore, notifyError } from "src/ts/alert";
+    import { buildChatTree } from "src/ts/chatTree";
 
     import { bookmarkListOpen, openModuleListStore } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -24,141 +22,214 @@
     import PersonaBind from "./PersonaBind.svelte";
     import PromptBind from "./PromptBind.svelte";
     import ModelBind from "./ModelBind.svelte";
-    import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte";
+    import { changeChatTo, requestImmediateSave } from "src/ts/globalApi.svelte";
 
     interface Props {
         chara: character;
     }
 
     let { chara = $bindable() }: Props = $props();
-    let editMode = $state(false)
 
-    // Safety net: chats whose folderId references a deleted folder would
-    // otherwise be invisible (excluded from both the no-folder section and
-    // any folder section). Render them in the no-folder section instead.
-    // The server-side fix prevents new orphans; this guard rescues existing
-    // ones until boot-time normalize touches the disk.
-    const validFolderIds = $derived(
-        new Set((chara.chatFolders ?? []).map(f => f.id).filter(Boolean))
-    )
-    const isOrphanFolder = (folderId: string | null | undefined): boolean =>
-        folderId != null && !validFolderIds.has(folderId)
+    const tree = $derived(buildChatTree(chara))
 
-    // Fire-and-forget: the array order + folderId in `chara.chats` is already
-    // the source of truth for rendering, so a failed sync just means the next
-    // drag (which re-sends the whole array) self-corrects the server copy.
-    const syncChatOrder = (chats: Chat[]) => {
-        void reorderChats(chats.map((c, i) => ({ id: c.id, position: i, folderId: c.folderId ?? null }))).catch(() => {})
+    // Move-to-folder modal state, shared across every ChatTreeItem in the tree.
+    let moveModalOpen = $state(false)
+    let moveTarget: { kind: 'chat' | 'folder', id: string } | null = $state(null)
+
+    function onMove(kind: 'chat' | 'folder', id: string) {
+        moveTarget = { kind, id }
+        moveModalOpen = true
     }
 
-    let chatsStb: Sortable[] = []
-    let folderStb: Sortable = null
-
-    let folderEles: HTMLDivElement = $state()
-    let listEle: HTMLDivElement = $state()
-    let sorted = $state(0)
-    let opened = 0
-
-    const createStb = () => {
-        for (let chat of listEle.querySelectorAll('.risu-chat')) {
-            chatsStb.push(new Sortable(chat, {
-                group: 'chats',
-                onEnd: async (event) => {
-                    const currentChatPage = chara.chatPage
-                    const newChats: Chat[] = []
-
-                    // const chats: HTMLElement = event.to
-                    // chats.querySelectorAll()
-                    
-                    listEle.querySelectorAll('[data-risu-chat-folder-idx]').forEach(folder => {
-                        const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
-                        folder.querySelectorAll('[data-risu-chat-idx]').forEach(chatInFolder => {
-                            const chatIdx = parseInt(chatInFolder.getAttribute('data-risu-chat-idx'))
-                            const newChat = chara.chats[chatIdx]
-                            newChat.folderId = chara.chatFolders[folderIdx].id
-                            newChats.push(newChat)
-                        })
-                    })
-
-                    listEle.querySelectorAll('[data-risu-chat-idx]').forEach(chatEle => {
-                        const idx = parseInt(chatEle.getAttribute('data-risu-chat-idx'))
-                        const newChat = chara.chats[idx]
-                        if (newChats.includes(newChat) == false) {
-                            if (newChat.folderId != null)
-                                newChat.folderId = null
-                            newChats.push(newChat)
-                        }
-                    })
-
-                    changeChatTo(newChats.indexOf(chara.chats[currentChatPage]))
-                    chara.chats = newChats
-                    syncChatOrder(newChats)
-
-                    try {
-                        this.destroy()
-                    } catch (e) {}
-                    sorted += 1
-                    await sleep(1)
-                    createStb()
-                },
-                ...sortableOptions
-            }))
+    async function handleMoveSelect(targetId: string | null) {
+        const target = moveTarget
+        moveTarget = null
+        if (!target) return
+        try {
+            if (target.kind === 'chat') {
+                const chat = chara.chats.find(c => c.id === target.id)
+                if (!chat) return
+                await updateChatMeta(chat.id, { folderId: targetId })
+                chat.folderId = targetId
+                chara.chats = chara.chats
+            } else {
+                const folder = chara.chatFolders.find(f => f.id === target.id)
+                if (!folder) return
+                await updateChatFolder(folder.id, { parentId: targetId })
+                folder.parentId = targetId
+                chara.chatFolders = chara.chatFolders
+            }
+        } catch (e) {
+            notifyError('이동할 수 없습니다 (최대 깊이 제한을 확인하세요)')
         }
-        folderStb = Sortable.create(folderEles, {
-            group: 'folders',
-            onEnd: async (event) => {
-                const newFolders: ChatFolder[] = []
-                const newChats: Chat[] = []
-                const folders: HTMLElement[] = Array.from<HTMLElement>(event.to.children)
-
-                const currentChatPage = chara.chatPage
-
-                folders.forEach(folder => {
-                    const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
-                    newFolders.push(chara.chatFolders[folderIdx])
-
-                    folder.querySelectorAll('[data-risu-chat-idx]').forEach(chatEle => {
-                        const idx = parseInt(chatEle.getAttribute('data-risu-chat-idx'))
-                        newChats.push(chara.chats[idx])
-                    })
-                })
-
-                listEle.querySelectorAll('[data-risu-chat-idx]').forEach(chatEle => {
-                    const idx = parseInt(chatEle.getAttribute('data-risu-chat-idx'))
-                    if (newChats.includes(chara.chats[idx]) == false) {
-                        newChats.push(chara.chats[idx])
-                    }
-                })
-                
-                chara.chatFolders = newFolders
-                changeChatTo(newChats.indexOf(chara.chats[currentChatPage]))
-                chara.chats = newChats
-                syncChatOrder(newChats)
-                try {
-                    folderStb.destroy()
-                } catch (e) {}
-                sorted += 1
-                await sleep(1)
-                createStb()
-            },
-            ...sortableOptions
-        })
     }
 
-    onMount(createStb)
+    // ── Drag & drop ──────────────────────────────────────────────────────────
+    // Plain (non-reactive) box threaded down through every ChatTreeItem so
+    // dragover handlers can synchronously read what's currently being
+    // dragged, mirroring Sidebar.svelte's `currentDrag` pattern.
+    const dragState: { current: { kind: 'chat' | 'folder', id: string } | null } = { current: null }
 
-    onDestroy(() => {
-        if (folderStb) {
-            try {
-                folderStb.destroy()
-            } catch (error) {}
+    function onDragStart(kind: 'chat' | 'folder', id: string) {
+        dragState.current = { kind, id }
+    }
+
+    function isDescendantFolder(candidateId: string, ancestorId: string): boolean {
+        let current = chara.chatFolders.find(f => f.id === candidateId)
+        while (current?.parentId) {
+            if (current.parentId === ancestorId) return true
+            current = chara.chatFolders.find(f => f.id === current.parentId)
         }
-        chatsStb.map(stb => {
+        return false
+    }
+
+    function persistChatOrder(folderId: string | null) {
+        const siblings = chara.chats.filter(c => (c.folderId ?? null) === folderId)
+        const updates = siblings.map((c, i) => ({ id: c.id, position: i, folderId }))
+        reorderChats(updates).catch(() => notifyError('순서를 저장하지 못했습니다'))
+    }
+
+    function moveChatToPosition(chatId: string, folderId: string | null, insertAt: (arr: Chat[]) => number) {
+        const arr = chara.chats
+        const fromIdx = arr.findIndex(c => c.id === chatId)
+        if (fromIdx === -1) return
+        const [item] = arr.splice(fromIdx, 1)
+        item.folderId = folderId
+        arr.splice(insertAt(arr), 0, item)
+        chara.chats = arr
+        void requestImmediateSave()
+        persistChatOrder(folderId)
+    }
+
+    function persistFolderOrder(parentId: string | null) {
+        const siblings = chara.chatFolders.filter(f => (f.parentId ?? null) === parentId)
+        for (const f of siblings) {
+            updateChatFolder(f.id, { parentId }).catch(() => {})
+        }
+    }
+
+    function moveFolderToPosition(folderId: string, parentId: string | null, insertAt: (arr: ChatFolder[]) => number) {
+        const arr = chara.chatFolders
+        const fromIdx = arr.findIndex(f => f.id === folderId)
+        if (fromIdx === -1) return
+        const [item] = arr.splice(fromIdx, 1)
+        item.parentId = parentId
+        arr.splice(insertAt(arr), 0, item)
+        chara.chatFolders = arr
+    }
+
+    async function onDropOn(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') {
+        const dragging = dragState.current
+        dragState.current = null
+        if (!dragging) return
+        if (dragging.kind === targetKind && dragging.id === targetId) return
+
+        if (targetKind === 'chat') {
+            // Folders always render above chats — dropping a folder onto a
+            // chat has no sensible position, so ignore it.
+            if (dragging.kind !== 'chat') return
+            const target = chara.chats.find(c => c.id === targetId)
+            if (!target) return
+            const folderId = target.folderId ?? null
+            moveChatToPosition(dragging.id, folderId, (arr) => {
+                let idx = arr.findIndex(c => c.id === targetId)
+                if (zone === 'after') idx += 1
+                return idx
+            })
+            return
+        }
+
+        // targetKind === 'folder'
+        const targetFolder = chara.chatFolders.find(f => f.id === targetId)
+        if (!targetFolder) return
+
+        if (dragging.kind === 'chat') {
+            // Chats can't reorder relative to a folder — any drop on a
+            // folder row just moves the chat into it.
+            moveChatToPosition(dragging.id, targetId, (arr) => {
+                let insertAt = arr.length
+                for (let i = arr.length - 1; i >= 0; i--) {
+                    if ((arr[i].folderId ?? null) === targetId) { insertAt = i + 1; break }
+                }
+                return insertAt
+            })
+            return
+        }
+
+        // Dragging a folder onto/around another folder.
+        if (isDescendantFolder(targetId, dragging.id)) {
+            notifyError('폴더를 자기 자신의 하위로 옮길 수 없습니다')
+            return
+        }
+
+        const newParentId = zone === 'into' ? targetId : (targetFolder.parentId ?? null)
+        const draggingFolder = chara.chatFolders.find(f => f.id === dragging.id)
+        const draggingHasChildren = chara.chatFolders.some(f => f.parentId === dragging.id)
+
+        if (newParentId !== null) {
+            const parentOfNewParent = chara.chatFolders.find(f => f.id === newParentId)
+            if (parentOfNewParent?.parentId) {
+                notifyError('이동할 수 없습니다 (최대 깊이 제한을 확인하세요)')
+                return
+            }
+            if (draggingHasChildren) {
+                notifyError('하위 폴더가 있는 폴더는 다른 폴더 안으로 이동할 수 없습니다')
+                return
+            }
+        }
+
+        if (newParentId !== (draggingFolder?.parentId ?? null)) {
             try {
-                stb.destroy()
-            } catch (error) {}
-        })
-    })
+                await updateChatFolder(dragging.id, { parentId: newParentId })
+            } catch (e) {
+                notifyError('이동할 수 없습니다 (최대 깊이 제한을 확인하세요)')
+                return
+            }
+        }
+
+        const insertAt = zone === 'into'
+            ? (arr: ChatFolder[]) => {
+                let idx = arr.length
+                for (let i = arr.length - 1; i >= 0; i--) {
+                    if ((arr[i].parentId ?? null) === targetId) { idx = i + 1; break }
+                }
+                return idx
+            }
+            : (arr: ChatFolder[]) => {
+                let idx = arr.findIndex(f => f.id === targetId)
+                if (zone === 'after') idx += 1
+                return idx
+            }
+
+        moveFolderToPosition(dragging.id, newParentId, insertAt)
+        persistFolderOrder(newParentId)
+    }
+
+    let dragOverRoot = $state(false)
+
+    async function onDropRoot() {
+        const dragging = dragState.current
+        dragState.current = null
+        if (!dragging) return
+
+        if (dragging.kind === 'chat') {
+            moveChatToPosition(dragging.id, null, (arr) => arr.length)
+            return
+        }
+
+        const folder = chara.chatFolders.find(f => f.id === dragging.id)
+        if (!folder) return
+        if ((folder.parentId ?? null) !== null) {
+            try {
+                await updateChatFolder(dragging.id, { parentId: null })
+            } catch (e) {
+                notifyError('이동할 수 없습니다')
+                return
+            }
+        }
+        moveFolderToPosition(dragging.id, null, (arr) => arr.length)
+        persistFolderOrder(null)
+    }
 </script>
 <div class="flex flex-col w-full">
     <ShButton className="relative bottom-2 w-full" onclick={() => {
@@ -172,282 +243,30 @@
         chara.chats = chats
         changeChatTo(0)
         void requestImmediateSave()
-        saveChatToServer(chara.chaId, 0, newChat.id, newChat as Chat).catch(() => {})
-        $ReloadGUIPointer += 1
+        saveChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
     }}>{language.newChat}</ShButton>
 
-    {#key sorted}
-    <div class="flex flex-col mt-2 overflow-y-auto max-h-80" bind:this={listEle}>
-        <!-- folder div -->
-        <div class="flex flex-col" bind:this={folderEles}>
-            <!-- chat folder -->
-            {#each chara.chatFolders as folder, i}
-            <div data-risu-chat-folder-idx={i}
-                class="flex flex-col mb-2 border-solid border-1 border-darkborderc cursor-pointer rounded-md">
-                <!-- folder header -->
-                <button 
-                    onclick={() => {
-                        if(!editMode) {
-                            chara.chatFolders[i].folded = !folder.folded
-                            $ReloadGUIPointer += 1
-                        }
-                    }}
-                    class="flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"
-                    class:bg-red-900={folder.color === 'red'}
-                    class:bg-yellow-900={folder.color === 'yellow'}
-                    class:bg-green-900={folder.color === 'green'}
-                    class:bg-blue-900={folder.color === 'blue'}
-                    class:bg-indigo-900={folder.color === 'indigo'}
-                    class:bg-purple-900={folder.color === 'purple'}
-                    class:bg-pink-900={folder.color === 'pink'}
-                >
-                    {#if editMode}
-                        <TextInput bind:value={chara.chatFolders[i].name} className="grow min-w-0" padding={false}/>
-                    {:else}
-                        <span>{folder.name}</span>
-                    {/if}
-                    <div class="grow flex justify-end">
-                        <div role="button" tabindex="0" onkeydown={(e) => {
-                            if(e.key === 'Enter'){
-                                e.currentTarget.click()
-                            }
-                        }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={async (e) => {
-                            e.stopPropagation()
-                            const sel = parseInt(await alertSelect([language.changeFolderColor, language.cancel]))
-                            switch (sel) {
-                                case 0:
-                                    const colors = ["red","green","blue","yellow","indigo","purple","pink","default"]
-                                    const sel = parseInt(await alertSelect(colors))
-                                    folder.color = colors[sel]
-                                    break
-                            }
-                        }}>
-                            <MenuIcon size={18}/>
-                        </div>
-                        <div role="button" tabindex="0" onkeydown={(e) => {
-                            if(e.key === 'Enter'){
-                                e.currentTarget.click()
-                            }
-                        }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={() => {
-                            editMode = !editMode
-                        }}>
-                            <PencilIcon size={18}/>
-                        </div>
-                        <div role="button" tabindex="0" onkeydown={(e) => {
-                            if(e.key === 'Enter'){
-                                e.currentTarget.click()
-                            }
-                        }} class="text-textcolor2 hover:text-red-400 cursor-pointer" onclick={async (e) => {
-                            e.stopPropagation()
-                            const d = await alertConfirm(`${language.removeConfirm}${folder.name}`)
-                            if (d) {
-                                $ReloadGUIPointer += 1
-                                const folders = chara.chatFolders
-                                folders.splice(i, 1)
-                                chara.chats.forEach(chat => {
-                                    if (chat.folderId == folder.id) {
-                                        chat.folderId = null
-                                    }
-                                })
-                                chara.chatFolders = folders
-                            }
-                        }}>
-                            <TrashIcon size={18}/>
-                        </div>
-                    </div>
-                </button>
-                <!-- chats in folder -->
-                <div class="risu-chat flex flex-col w-full text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md {folder.folded ? 'hidden' : ''}">
-                    {#if chara.chats.filter(chat => chat.folderId == chara.chatFolders[i].id).length == 0}
-                    <span class="no-sort flex justify-center text-textcolor2">Empty</span>
-                    <div></div>
-                    {:else}
-                    {#each chara.chats.filter(chat => chat.folderId == chara.chatFolders[i].id) as chat}
-                    {@const chatIdx = chara.chats.indexOf(chat)}
-                    <button data-risu-chat-idx={chatIdx} onclick={() => {
-                        if(!editMode){
-                            changeChatTo(chatIdx)
-                        }
-                    }} class="risu-chats flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"class:bg-selected={chatIdx === chara.chatPage && !$chatDeselected}>
-                        {#if editMode}
-                            <TextInput bind:value={chat.name} className="grow min-w-0" padding={false}/>
-                        {:else}
-                            <span>{chat.name}</span>
-                        {/if}
-                        <div class="grow flex justify-end">
-                            <div role="button" tabindex="0" onkeydown={(e) => {
-                                if(e.key === 'Enter'){
-                                    e.currentTarget.click()
-                                }
-                            }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={async (e) => {
-                                e.stopPropagation()
-                                const confirmed = await alertConfirm(`${language.copyChatConfirm}${chat.name}`)
-                                if(!confirmed) return
-                                const chatIdx = chara.chats.indexOf(chat)
-                                if(chara.chats[chatIdx]?._placeholder){
-                                    await ensureChatHydrated(chara.chats, chatIdx, (chara as character).chaId)
-                                }
-                                if(chara.chats[chatIdx]?._placeholder){
-                                    alertError('Failed to load chat data.')
-                                    return
-                                }
-                                const newChat = $state.snapshot(chara.chats[chatIdx])
-                                newChat.name = createChatCopyName(newChat.name, 'Copy')
-                                newChat.id = v4()
-                                chara.chats.unshift(newChat)
-                                changeChatTo(0)
-                                chara.chats = chara.chats
-                                void requestImmediateSave()
-                                saveChatToServer(chara.chaId, 0, newChat.id, newChat as Chat).catch(() => {})
-                                notifySuccess(language.copyChatSuccess)
-                            }}>
-                                <CopyIcon size={18}/>
-                            </div>
-                            <div role="button" tabindex="0" onkeydown={(e) => {
-                                if(e.key === 'Enter'){
-                                    e.currentTarget.click()
-                                }
-                            }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={() => {
-                                editMode = !editMode
-                            }}>
-                                <PencilIcon size={18}/>
-                            </div>
-                            <div role="button" tabindex="0" onkeydown={(e) => {
-                                if(e.key === 'Enter'){
-                                    e.currentTarget.click()
-                                }
-                            }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={async (e) => {
-                                e.stopPropagation()
-                                exportChat(chara.chats.indexOf(chat))
-                            }}>
-                                <DownloadIcon size={18}/>
-                            </div>
-                            <div role="button" tabindex="0" onkeydown={(e) => {
-                                if(e.key === 'Enter'){
-                                    e.currentTarget.click()
-                                }
-                            }} class="text-textcolor2 hover:text-red-400 cursor-pointer" onclick={async (e) => {
-                                e.stopPropagation()
-                                if(chara.chats.length === 1){
-                                    notifyError(language.errors.onlyOneChat)
-                                    return
-                                }
-                                const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
-                                if(d){
-                                    const deletedId = chat.id
-                                    changeChatTo(0)
-                                    $ReloadGUIPointer += 1
-                                    let chats = chara.chats
-                                    chats.splice(chara.chats.indexOf(chat), 1)
-                                    chara.chats = chats
-                                    void requestImmediateSave()
-                                    if(deletedId) deleteChatFromServer(deletedId).catch(() => {})
-                                }
-                            }}>
-                                <TrashIcon size={18}/>
-                            </div>
-                        </div>
-                    </button>
-                    {/each}
-                    {/if}
-                </div>
-            </div>
-            {/each}
-        </div>
-        <!-- chat without folder div -->
-        <div class="risu-chat flex flex-col">
-            {#each chara.chats as chat, i}
-            {#if chat.folderId == null || isOrphanFolder(chat.folderId)}
-            <button data-risu-chat-idx={i} onclick={() => {
-                if(!editMode){
-                    changeChatTo(i)
-                }
-            }}
-            class="flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"
-            class:bg-selected={i === chara.chatPage && !$chatDeselected}>
-                {#if editMode}
-                    <TextInput bind:value={chara.chats[i].name} className="grow min-w-0" padding={false}/>
-                {:else}
-                    <span>{chat.name}</span>
-                {/if}
-                <div class="grow flex justify-end">
-                    <div role="button" tabindex="0" onkeydown={(e) => {
-                        if(e.key === 'Enter'){
-                            e.currentTarget.click()
-                        }
-                    }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={async (e) => {
-                        e.stopPropagation()
-                        const confirmed = await alertConfirm(`${language.copyChatConfirm}${chat.name}`)
-                        if(!confirmed) return
-                        if(chara.chats[i]?._placeholder){
-                            await ensureChatHydrated(chara.chats, i, (chara as character).chaId)
-                        }
-                        if(chara.chats[i]?._placeholder){
-                            alertError('Failed to load chat data.')
-                            return
-                        }
-                        const newChat = $state.snapshot(chara.chats[i])
-                        newChat.name = createChatCopyName(newChat.name, 'Copy')
-                        newChat.id = v4()
-                        chara.chats.unshift(newChat)
-                        changeChatTo(0)
-                        chara.chats = chara.chats
-                        void requestImmediateSave()
-                        saveChatToServer(chara.chaId, 0, newChat.id, newChat as Chat).catch(() => {})
-                        notifySuccess(language.copyChatSuccess)
-                    }}>
-                        <CopyIcon size={18}/>
-                    </div>
-                    <div role="button" tabindex="0" onkeydown={(e) => {
-                        if(e.key === 'Enter'){
-                            e.currentTarget.click()
-                        }
-                    }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={() => {
-                        editMode = !editMode
-                    }}>
-                        <PencilIcon size={18}/>
-                    </div>
-                    <div role="button" tabindex="0" onkeydown={(e) => {
-                        if(e.key === 'Enter'){
-                            e.currentTarget.click()
-                        }
-                    }} class="text-textcolor2 hover:text-primary mr-1 cursor-pointer" onclick={async (e) => {
-                        e.stopPropagation()
-                        exportChat(i)
-                    }}>
-                        <DownloadIcon size={18}/>
-                    </div>
-                    <div role="button" tabindex="0" onkeydown={(e) => {
-                        if(e.key === 'Enter'){
-                            e.currentTarget.click()
-                        }
-                    }} class="text-textcolor2 hover:text-red-400 cursor-pointer" onclick={async (e) => {
-                        e.stopPropagation()
-                        if(chara.chats.length === 1){
-                            notifyError(language.errors.onlyOneChat)
-                            return
-                        }
-                        const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
-                        if(d){
-                            const deletedId = chat.id
-                            changeChatTo(0)
-                            $ReloadGUIPointer += 1
-                            let chats = chara.chats
-                            chats.splice(i, 1)
-                            chara.chats = chats
-                            void requestImmediateSave()
-                            if(deletedId) deleteChatFromServer(deletedId).catch(() => {})
-                        }
-                    }}>
-                        <TrashIcon size={18}/>
-                    </div>
-                </div>
-            </button>
-            {/if}
-            {/each}
-        </div>
+    <div class="flex flex-col mt-2 overflow-y-auto max-h-80">
+        {#each tree as node (node.kind === 'folder' ? node.folder.id : node.chat.id)}
+            <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDropOn={onDropOn}/>
+        {/each}
+        <div
+            role="presentation"
+            class="h-3 min-h-3 mx-1 mt-1 rounded-md transition-colors"
+            class:bg-selected={dragOverRoot}
+            ondragover={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dragOverRoot = true }}
+            ondragleave={() => { dragOverRoot = false }}
+            ondrop={(e) => { e.preventDefault(); dragOverRoot = false; void onDropRoot() }}
+        ></div>
     </div>
-    {/key}
+
+    <MoveToFolderModal
+        bind:open={moveModalOpen}
+        folders={chara.chatFolders ?? []}
+        excludeFolderId={moveTarget?.kind === 'folder' ? moveTarget.id : undefined}
+        onSelect={handleMoveSelect}
+        onClose={() => { moveModalOpen = false; moveTarget = null }}
+    />
 
     <div class="border-t border-selected mt-2">
         <div class="flex mt-2 ml-2 items-center">
@@ -462,11 +281,6 @@
                 <HardDriveUploadIcon size={18}/>
             </button>
             <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer" onclick={() => {
-                editMode = !editMode
-            }}>
-                <PencilIcon size={18}/>
-            </button>
-            <button class="text-textcolor2 hover:text-primary mr-2 cursor-pointer" onclick={() => {
                 alertStore.set({
                   type: "branches",
                   msg: ""
@@ -479,19 +293,14 @@
             }}>
                 <BookmarkCheckIcon size={18}/>
             </button>
-            <button class="ml-auto text-textcolor2 hover:text-primary mr-2 cursor-pointer" onclick={() => {
-                if (!chara.chatFolders) {
-                    chara.chatFolders = []
+            <button class="ml-auto text-textcolor2 hover:text-primary mr-2 cursor-pointer" onclick={async () => {
+                const length = (chara.chatFolders ?? []).length
+                try {
+                    const folder = await createChatFolder(chara.chaId, { name: `New Folder ${length + 1}` })
+                    chara.chatFolders = [...(chara.chatFolders ?? []), folder]
+                } catch (e) {
+                    notifyError('폴더 생성에 실패했습니다')
                 }
-                const folders = chara.chatFolders
-                const length = chara.chatFolders.length
-                folders.unshift({
-                    id: v4(),
-                    name: `New Folder ${length + 1}`,
-                    folded: false,
-                })
-                chara.chatFolders = folders
-                $ReloadGUIPointer += 1
             }}>
                 <FolderPlusIcon size={18}/>
             </button>
