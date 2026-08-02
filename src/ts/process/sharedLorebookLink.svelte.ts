@@ -28,8 +28,37 @@ export async function refreshLinkedBookIndex(force = false) {
 // content sent to the shared repo should never carry this local-only linking
 // metadata — it's meaningless (and stale) once it's someone else's copy.
 function stripLinkMeta(entry: loreBook): loreBook {
-    const { source_lorebook_id, source_updated_at, ...rest } = entry
+    const { source_lorebook_id, source_updated_at, source_synced_snapshot, ...rest } = entry
     return rest as loreBook
+}
+
+// The subset of fields that actually round-trip to the shared repo — used to
+// fingerprint "does this entry still match what's on the server". Deliberately
+// excludes alwaysActive/disabled (personal activation prefs, never uploaded),
+// folder/mode/id (local bookkeeping) and the source_* link metadata itself.
+const CONTENT_FIELDS = ['key', 'secondkey', 'comment', 'content', 'insertorder', 'selective', 'useRegex', 'activationPercent'] as const
+
+export function contentFingerprint(entry: loreBook): string {
+    const picked: Record<string, unknown> = {}
+    for (const field of CONTENT_FIELDS) picked[field] = entry[field]
+    return JSON.stringify(picked)
+}
+
+// True once a linked entry's content has been edited locally since the last
+// upload/sync — this is what brings the "업로드" button back for an entry
+// that's already linked. No snapshot yet (e.g. an entry linked before this
+// tracking existed) is treated as "not dirty" rather than forcing a spurious
+// upload prompt — see the one-time backfill in LoreBookData.svelte.
+export function isEntryDirty(entry: loreBook): boolean {
+    if (!entry.source_lorebook_id || entry.source_synced_snapshot === undefined) return false
+    return contentFingerprint(entry) !== entry.source_synced_snapshot
+}
+
+// Which entry inside a shared book's content array corresponds to a local
+// entry — normally just id equality, falling back to "the book's only entry"
+// for the entry-level 1:1 model this feature actually uses.
+export function resolveUploadEntryId(existing: SharedLorebookDetail, entry: loreBook): string {
+    return existing.content.find(e => e.id === entry.id)?.id ?? existing.content[0]?.id ?? entry.id
 }
 
 // Looks up the entry's currently-linked shared lorebook, if any. Returns null
@@ -53,7 +82,7 @@ export async function uploadEntryToSharedLorebook(entry: loreBook, existing: Sha
     const content = stripLinkMeta(entry)
 
     if (existing) {
-        const entryId = existing.content.find(e => e.id === entry.id)?.id ?? existing.content[0]?.id ?? entry.id
+        const entryId = resolveUploadEntryId(existing, entry)
         await ns.lockSharedLorebookEntry(existing.id, entryId)
         const detail = await ns.saveSharedLorebookEntry(existing.id, entryId, content)
         entry.source_lorebook_id = detail.id
@@ -64,6 +93,7 @@ export async function uploadEntryToSharedLorebook(entry: loreBook, existing: Sha
         entry.source_lorebook_id = detail.id
         entry.source_updated_at = detail.updated_at
     }
+    entry.source_synced_snapshot = contentFingerprint(entry)
     await refreshLinkedBookIndex(true)
 }
 
@@ -73,25 +103,41 @@ export async function uploadEntryToSharedLorebook(entry: loreBook, existing: Sha
 // operation in all three cases. Activation prefs (alwaysActive/disabled) are
 // personal, not part of the shared content, so an entry that's already linked
 // keeps its own local values instead of inheriting whatever the uploader had.
-export async function syncEntriesFromSharedLorebook(character: character, bookId: string): Promise<number> {
+//
+// A local entry with unpushed edits (isEntryDirty) is left untouched unless
+// force is set — overwriting it here would silently discard whatever the user
+// was in the middle of testing before they'd uploaded it. It stays linked and
+// still shows as pending (source_updated_at isn't bumped), so the caller can
+// surface the conflict instead of losing it quietly.
+export async function syncEntriesFromSharedLorebook(character: character, bookId: string, opts: { force?: boolean } = {}): Promise<{ applied: number, skipped: number }> {
     const detail = await ns.getSharedLorebook(bookId)
     const existingById = new Map(
         character.globalLore.filter(e => e.source_lorebook_id === bookId && e.id).map(e => [e.id, e])
     )
-    const kept = character.globalLore.filter(e => e.source_lorebook_id !== bookId)
-    const fresh = detail.content.map(entry => {
-        const prev = entry.id ? existingById.get(entry.id) : undefined
-        return {
-            ...entry,
-            alwaysActive: prev ? prev.alwaysActive : entry.alwaysActive,
-            disabled: prev ? prev.disabled : entry.disabled,
+    const untouched = character.globalLore.filter(e => e.source_lorebook_id !== bookId)
+    let applied = 0, skipped = 0
+    const resolved: loreBook[] = []
+    for (const serverEntry of detail.content) {
+        const prev = serverEntry.id ? existingById.get(serverEntry.id) : undefined
+        if (prev && !opts.force && isEntryDirty(prev)) {
+            resolved.push(prev)
+            skipped++
+            continue
+        }
+        const merged: loreBook = {
+            ...serverEntry,
+            alwaysActive: prev ? prev.alwaysActive : serverEntry.alwaysActive,
+            disabled: prev ? prev.disabled : serverEntry.disabled,
             source_lorebook_id: bookId,
             source_updated_at: detail.updated_at,
         }
-    })
-    character.globalLore = [...kept, ...fresh]
+        merged.source_synced_snapshot = contentFingerprint(merged)
+        resolved.push(merged)
+        applied++
+    }
+    character.globalLore = [...untouched, ...resolved]
     linkedBookIndex[bookId] = detail
-    return fresh.length
+    return { applied, skipped }
 }
 
 export function isCharacterLinkedToBook(character: character, bookId: string): boolean {
@@ -118,23 +164,29 @@ export function getPendingUpdatedBooks(character: character): SharedLorebookSumm
 // Pulls every pending new/updated book into globalLore in one shot. Sequential,
 // not parallel — syncEntriesFromSharedLorebook reassigns character.globalLore
 // from a snapshot, so concurrent calls would clobber each other.
-export async function applyAllPending(character: character): Promise<{ newBooks: number, newEntries: number, updatedBooks: number, updatedEntries: number }> {
+export async function applyAllPending(character: character): Promise<{ newBooks: number, newEntries: number, updatedBooks: number, updatedEntries: number, skippedEntries: number }> {
     const pendingNew = getPendingNewBooks(character)
     const pendingUpdated = getPendingUpdatedBooks(character)
-    let newEntries = 0, updatedEntries = 0, newBooks = 0, updatedBooks = 0
+    let newEntries = 0, updatedEntries = 0, newBooks = 0, updatedBooks = 0, skippedEntries = 0
     for (const book of pendingNew) {
         try {
-            newEntries += await syncEntriesFromSharedLorebook(character, book.id)
+            const { applied } = await syncEntriesFromSharedLorebook(character, book.id)
+            newEntries += applied
             newBooks++
         } catch { /* deleted or otherwise unreachable mid-flight — skip it */ }
     }
     for (const book of pendingUpdated) {
         try {
-            updatedEntries += await syncEntriesFromSharedLorebook(character, book.id)
+            // Never force here — a background bulk apply has no way to ask the
+            // user about a conflict, so a dirty (unpushed) entry is skipped
+            // rather than silently overwritten. See syncEntriesFromSharedLorebook.
+            const { applied, skipped } = await syncEntriesFromSharedLorebook(character, book.id)
+            updatedEntries += applied
+            skippedEntries += skipped
             updatedBooks++
         } catch { /* same */ }
     }
-    return { newBooks, newEntries, updatedBooks, updatedEntries }
+    return { newBooks, newEntries, updatedBooks, updatedEntries, skippedEntries }
 }
 
 // Background polling — keeps linkedBookIndex fresh while the character's
