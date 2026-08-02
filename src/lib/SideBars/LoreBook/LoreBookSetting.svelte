@@ -2,15 +2,17 @@
     
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from "../../../lang";
-    import { DownloadIcon, HardDriveUploadIcon, PlusIcon, SunIcon, LinkIcon, FolderPlusIcon } from "@lucide/svelte";
+    import { DownloadIcon, HardDriveUploadIcon, PlusIcon, SunIcon, LinkIcon, FolderPlusIcon, LibraryBigIcon } from "@lucide/svelte";
     import { addLorebook, addLorebookFolder, exportLoreBook, importLoreBook } from "../../../ts/process/lorebook.svelte";
     import Check from "../../UI/GUI/CheckInput.svelte";
     import NumberInput from "../../UI/GUI/NumberInput.svelte";
     import LoreBookList from "./LoreBookList.svelte";
+    import SharedLoreBookStore from "./SharedLoreBookStore.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
 
     let submenu = $state(0)
+    let openSharedStore = $state(false)
     interface Props {
         globalMode?: boolean;
     }
@@ -130,6 +132,9 @@
     }} class="hover:text-textcolor ml-2  cursor-pointer">
         <HardDriveUploadIcon />
     </button>
+    <button onclick={() => { openSharedStore = true }} class="hover:text-textcolor ml-2 cursor-pointer" title="공유 로어북 저장소">
+        <LibraryBigIcon />
+    </button>
     {#if DBState.db.bulkEnabling}
         <button onclick={() => {
             toggleCharacterLoreAlwaysActive()
@@ -153,4 +158,7 @@
         </button>
     {/if}
 </div>
+{/if}
+{#if openSharedStore}
+    <SharedLoreBookStore close={() => { openSharedStore = false }} />
 {/if}

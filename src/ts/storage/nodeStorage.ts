@@ -8,7 +8,7 @@
 import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
-import { normalizeChat, type character, type ChatStub, type ChatFolder } from "./database.svelte"
+import { normalizeChat, type character, type ChatStub, type ChatFolder, type loreBook } from "./database.svelte"
 
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
@@ -18,6 +18,45 @@ export class ConflictError extends Error {
         this.name = 'ConflictError'
         this.currentEtag = currentEtag
     }
+}
+
+// Thrown by lockSharedLorebook when someone else already holds the lock.
+export class SharedLorebookLockedError extends Error {
+    lockedByUsername: string | null
+    lockedAt: number | null
+    constructor(lockedByUsername: string | null, lockedAt: number | null) {
+        super(`Lorebook locked by ${lockedByUsername ?? 'another user'}`)
+        this.name = 'SharedLorebookLockedError'
+        this.lockedByUsername = lockedByUsername
+        this.lockedAt = lockedAt
+    }
+}
+
+export interface SharedLorebookLock {
+    locked_by: number
+    locked_by_username: string | null
+    locked_at: number
+}
+
+export interface SharedLorebookSummary {
+    id: string
+    title: string
+    updated_at: number
+    updated_by: number
+    updated_by_username: string | null
+    lock: SharedLorebookLock | null
+}
+
+export interface SharedLorebookDetail extends SharedLorebookSummary {
+    content: loreBook[]
+}
+
+export interface SharedLorebookVersion {
+    id: string
+    content: loreBook[]
+    saved_at: number
+    saved_by: number
+    saved_by_username: string | null
 }
 
 // Warning the server attaches to /api/patch responses when the most recent
@@ -793,6 +832,85 @@ export class NodeStorage{
             method: 'DELETE',
         })
         if (da.status !== 404 && !da.ok) throw new Error(`deleteChatFolder error: ${da.status}`)
+    }
+
+    // ── Shared lorebook repository ──────────────────────────────────────────
+    // rl_lorebooks / rl_lorebook_versions / rl_lorebook_locks / rl_lorebook_drafts
+    // (server/node/lorebookApi.cjs) — pessimistic-lock + personal-copy store,
+    // separate from character.globalLore. content is loreBook[], the same shape
+    // used there and by importLoreBook/exportLoreBook in
+    // src/ts/process/lorebook.svelte.ts, minus the {type,ver} file-interchange
+    // wrapper that only exists at the file boundary.
+
+    async listSharedLorebooks(): Promise<SharedLorebookSummary[]> {
+        const da = await this.authFetch('/api/lorebooks')
+        if (!da.ok) throw new Error(`listSharedLorebooks error: ${da.status}`)
+        return da.json()
+    }
+
+    async createSharedLorebook(title: string, content: loreBook[]): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch('/api/lorebooks', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ title, content }),
+        })
+        if (!da.ok) throw new Error(`createSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
+    async getSharedLorebook(id: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`)
+        if (!da.ok) throw new Error(`getSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
+    // Acquires the pessimistic lock and returns the editor's personal copy
+    // (freshly copied from the canonical content, or the requester's own
+    // still-preserved draft from an earlier expired/cancelled session).
+    // Throws SharedLorebookLockedError if another user currently holds it.
+    async lockSharedLorebook(id: string): Promise<{ content: loreBook[], locked_at: number }> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/lock`, { method: 'POST' })
+        if (da.status === 409) {
+            const data = await da.json().catch(() => ({}))
+            throw new SharedLorebookLockedError(data.locked_by_username ?? null, data.locked_at ?? null)
+        }
+        if (!da.ok) throw new Error(`lockSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
+    // Requires the caller to currently hold the lock (enforced server-side).
+    // On success the lock is released and the draft cleared.
+    async saveSharedLorebook(id: string, content: loreBook[], title?: string): Promise<SharedLorebookDetail> {
+        const body: Record<string, unknown> = { content }
+        if (title !== undefined) body.title = title
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        })
+        if (!da.ok) throw new Error(`saveSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
+    // Cancels editing: discards the personal copy and releases the lock,
+    // leaving the canonical content untouched.
+    async cancelSharedLorebookLock(id: string): Promise<void> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/lock`, { method: 'DELETE' })
+        if (da.status !== 404 && !da.ok) throw new Error(`cancelSharedLorebookLock error: ${da.status}`)
+    }
+
+    async listSharedLorebookVersions(id: string): Promise<SharedLorebookVersion[]> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/versions`)
+        if (!da.ok) throw new Error(`listSharedLorebookVersions error: ${da.status}`)
+        return da.json()
+    }
+
+    // Requires the caller to currently hold the lock. Archives the live
+    // content as a new version, then swaps in the restored one.
+    async restoreSharedLorebookVersion(id: string, versionId: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/restore/${encodeURIComponent(versionId)}`, { method: 'POST' })
+        if (!da.ok) throw new Error(`restoreSharedLorebookVersion error: ${da.status}`)
+        return da.json()
     }
 
     // ── Bulk chat migration (Phase 3) ─────────────────────────────────────────

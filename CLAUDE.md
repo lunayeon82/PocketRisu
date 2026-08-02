@@ -26,6 +26,8 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - 5단계: 채팅 폴더 UI 개선 (옵시디언 스타일) — chatTree.ts로 폴더/채팅 트리 구성, ChatTreeItem.svelte로 재귀 렌더링(접기/펼치기, 이름변경, 색상, 삭제 시 자식 승격), MoveToFolderModal.svelte로 컨텍스트 메뉴 이동, 드래그 앤 드롭(같은 종류끼리 순서 변경, 폴더로 이동, 최상위 드롭존, 최대 깊이 2 및 자기 자신 하위 이동 가드) — reorderChats/updateChatFolder API 사용
 - 단일 캐릭터 자동 진입 (autoOpenSingleCharacter 설정) — 켜면 부팅 시 캐릭터 갤러리 건너뛰고 첫 번째(휴지통 제외) 캐릭터 채팅으로 바로 진입, 사이드바 캐릭터 추가(+) 버튼도 숨김. bootstrap.ts에서 처리
 - 사이드바 "최근에 본" 목록 버그 수정 — Sidebar.svelte의 recentChars가 trashTime(휴지통) 필터링을 안 해서, 삭제(소프트 삭제) 캐릭터가 메인 그리드에서는 사라져도 최근 목록엔 3일 뒤 자동 정리 전까지 계속 표시되던 문제
+- 4단계: 공유 로어북 저장소 — rl_lorebooks/rl_lorebook_versions/rl_lorebook_locks/rl_lorebook_drafts (lorebookApi.cjs), 비관적 잠금(1시간 타임아웃, 만료 시 draft는 보존하고 lock만 해제 — 재잠금 시 자기 draft 우선 사용) + 개인 사본 + 최근 3버전 관리. 클라이언트는 LoreBookSetting.svelte 툴바에 진입점(LibraryBigIcon), SharedLoreBookStore.svelte가 목록/잠금배지/새버전뱃지(15초 폴링)/편집(LoreBookList 재사용)/버전복원 담당, 임시저장은 lorebookDraftDb.ts(순수 IndexedDB)에만
+- 채팅/폴더 트리 UX 개선 — 이름변경을 인라인 입력 대신 ShDialog 모달로 분리(행이 draggable이라 인라인 입력 드래그 시 텍스트 선택이 행 드래그로 오인식되던 문제 해결), 뎁스별 세로 가이드라인으로 폴더 소속 명시, 드래그 중 "어디로 이동하는지" 설명 배너 추가, 최상위 드롭존을 드래그 중에만 노출되는 라벨 있는 큰 영역으로 개선, ondragend로 드롭존 상태 항상 리셋
 
 ## 제약 사항
 - src/ts 함수 시그니처 변경 시 upstream 호환성 고려
@@ -34,6 +36,3 @@ RisuAI 포크. upstream 자동 머지 안 함. 필요 시 src/ts 변경분만 �
 - pm2 전체 경로 사용: /usr/bin/pm2
 - ecosystem.config.cjs (ES module 프로젝트라 .cjs 필수)
 - upstream의 서버 사이드 생성 기능을 cherry-pick할 경우, 서버 완성 경로가 chatApi.cjs의 upsertChatFull()도 호출하는지 반드시 확인할 것 (미호출 시 서버 생성 메시지가 rl_chats에 반영되지 않아 클라이언트 재접속 후 덮어씌워질 수 있음)
-
-## 다음 작업 예정
-- 4단계: 공유 로어북 저장소 (비관적 잠금, 개인 사본, 버전 관리)
