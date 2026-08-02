@@ -70,16 +70,9 @@
         }} class="p-2 flex-1" class:bg-selected={submenu === 2}>
             <span>{language.settings}</span>
         </button>
-        <button onclick={() => {
-            submenu = 3
-        }} class="p-2 flex-1 border-l border-selected" class:bg-selected={submenu === 3}>
-            <span>공유</span>
-        </button>
     </div>
 {/if}
-{#if submenu === 3}
-    <SharedLoreBookStore inline />
-{:else if submenu !== 2}
+{#if submenu !== 2}
     {#if !globalMode}
         <span class="text-textcolor2 mt-2 mb-6 text-sm">{submenu === 0 ? language.globalLoreInfo : language.localLoreInfo}</span>
     {/if}
@@ -117,7 +110,7 @@
         </div>
     {/if}
 {/if}
-{#if submenu !== 2 && submenu !== 3}
+{#if submenu !== 2}
 
 <div class="text-textcolor2 mt-2 flex">
     <button onclick={() => {addLorebook(globalMode ? -1 : submenu)}} class="hover:text-textcolor cursor-pointer">
@@ -161,4 +154,9 @@
         </button>
     {/if}
 </div>
+{/if}
+{#if submenu === 0 && !globalMode}
+    <div class="border-t border-selected mt-4 pt-4">
+        <SharedLoreBookStore inline />
+    </div>
 {/if}
