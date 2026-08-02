@@ -110,6 +110,9 @@
         </div>
     {/if}
 {/if}
+{#if submenu === 0 && !globalMode}
+    <SharedLoreBookStore inline />
+{/if}
 {#if submenu !== 2}
 
 <div class="text-textcolor2 mt-2 flex">
@@ -154,7 +157,4 @@
         </button>
     {/if}
 </div>
-{/if}
-{#if submenu === 0 && !globalMode}
-    <SharedLoreBookStore inline />
 {/if}

@@ -20,12 +20,12 @@ export class ConflictError extends Error {
     }
 }
 
-// Thrown by lockSharedLorebook when someone else already holds the lock.
+// Thrown by lockSharedLorebookEntry when someone else already holds the lock.
 export class SharedLorebookLockedError extends Error {
     lockedByUsername: string | null
     lockedAt: number | null
     constructor(lockedByUsername: string | null, lockedAt: number | null) {
-        super(`Lorebook locked by ${lockedByUsername ?? 'another user'}`)
+        super(`Entry locked by ${lockedByUsername ?? 'another user'}`)
         this.name = 'SharedLorebookLockedError'
         this.lockedByUsername = lockedByUsername
         this.lockedAt = lockedAt
@@ -57,13 +57,14 @@ export interface SharedLorebookSummary {
     updated_at: number
     updated_by: number
     updated_by_username: string | null
-    lock: SharedLorebookLock | null
 }
 
 export interface SharedLorebookDetail extends SharedLorebookSummary {
     content: loreBook[]
     /** Only present for scope === 'global' — the requester's own overrides. */
     overrides?: SharedLorebookOverride[]
+    /** Only present for scope === 'global' — live locks keyed by entry id. */
+    locks?: Record<string, SharedLorebookLock>
 }
 
 export interface SharedLorebookVersion {
@@ -851,11 +852,17 @@ export class NodeStorage{
 
     // ── Shared lorebook repository ──────────────────────────────────────────
     // rl_lorebooks / rl_lorebook_versions / rl_lorebook_locks / rl_lorebook_drafts
-    // (server/node/lorebookApi.cjs) — pessimistic-lock + personal-copy store,
-    // separate from character.globalLore. content is loreBook[], the same shape
-    // used there and by importLoreBook/exportLoreBook in
-    // src/ts/process/lorebook.svelte.ts, minus the {type,ver} file-interchange
-    // wrapper that only exists at the file boundary.
+    // (server/node/lorebookApi.cjs) — separate from character.globalLore.
+    // content is loreBook[], the same shape used there and by
+    // importLoreBook/exportLoreBook in src/ts/process/lorebook.svelte.ts,
+    // minus the {type,ver} file-interchange wrapper that only exists at the
+    // file boundary.
+    //
+    // Locking is per ENTRY, not per book — a lorebook here is just a named,
+    // scoped (global/private) grouping of entries, the same as a folder in
+    // the character's own lorebook list. Reading is always lock-free.
+    // Structural changes (add/delete/reorder/rename) are lock-free too; only
+    // actually editing one entry's content needs its lock.
 
     async listSharedLorebooks(): Promise<SharedLorebookSummary[]> {
         const da = await this.authFetch('/api/lorebooks')
@@ -873,6 +880,23 @@ export class NodeStorage{
         return da.json()
     }
 
+    async getSharedLorebook(id: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`)
+        if (!da.ok) throw new Error(`getSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
+    // Title-only rename. No lock needed (metadata, not content).
+    async renameSharedLorebook(id: string, title: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ title }),
+        })
+        if (!da.ok) throw new Error(`renameSharedLorebook error: ${da.status}`)
+        return da.json()
+    }
+
     // Owner only, one-way (private → global). There is no reverse endpoint.
     async convertSharedLorebookToGlobal(id: string): Promise<SharedLorebookDetail> {
         const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/to-global`, { method: 'POST' })
@@ -882,7 +906,7 @@ export class NodeStorage{
 
     // Copies a global lorebook into a new private one owned by the caller —
     // entry ids are regenerated server-side, so the clone never shares
-    // per-user overrides with the source.
+    // per-user overrides or locks with the source.
     async cloneSharedLorebook(id: string): Promise<SharedLorebookDetail> {
         const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/clone`, { method: 'POST' })
         if (!da.ok) throw new Error(`cloneSharedLorebook error: ${da.status}`)
@@ -908,58 +932,84 @@ export class NodeStorage{
         return (await da.json()).overrides
     }
 
-    async getSharedLorebook(id: string): Promise<SharedLorebookDetail> {
-        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`)
-        if (!da.ok) throw new Error(`getSharedLorebook error: ${da.status}`)
-        return da.json()
-    }
-
-    // Acquires the pessimistic lock and returns the editor's personal copy
-    // (freshly copied from the canonical content, or the requester's own
-    // still-preserved draft from an earlier expired/cancelled session).
-    // Throws SharedLorebookLockedError if another user currently holds it.
-    async lockSharedLorebook(id: string): Promise<{ content: loreBook[], locked_at: number }> {
-        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/lock`, { method: 'POST' })
-        if (da.status === 409) {
-            const data = await da.json().catch(() => ({}))
-            throw new SharedLorebookLockedError(data.locked_by_username ?? null, data.locked_at ?? null)
-        }
-        if (!da.ok) throw new Error(`lockSharedLorebook error: ${da.status}`)
-        return da.json()
-    }
-
-    // Requires the caller to currently hold the lock (enforced server-side).
-    // On success the lock is released and the draft cleared.
-    async saveSharedLorebook(id: string, content: loreBook[], title?: string): Promise<SharedLorebookDetail> {
-        const body: Record<string, unknown> = { content }
-        if (title !== undefined) body.title = title
-        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}`, {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-        })
-        if (!da.ok) throw new Error(`saveSharedLorebook error: ${da.status}`)
-        return da.json()
-    }
-
-    // Cancels editing: discards the personal copy and releases the lock,
-    // leaving the canonical content untouched.
-    async cancelSharedLorebookLock(id: string): Promise<void> {
-        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/lock`, { method: 'DELETE' })
-        if (da.status !== 404 && !da.ok) throw new Error(`cancelSharedLorebookLock error: ${da.status}`)
-    }
-
     async listSharedLorebookVersions(id: string): Promise<SharedLorebookVersion[]> {
         const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/versions`)
         if (!da.ok) throw new Error(`listSharedLorebookVersions error: ${da.status}`)
         return da.json()
     }
 
-    // Requires the caller to currently hold the lock. Archives the live
-    // content as a new version, then swaps in the restored one.
+    // No lock required — reverts the whole book, so there's no single entry
+    // lock to hold. private requires ownership (enforced server-side).
     async restoreSharedLorebookVersion(id: string, versionId: string): Promise<SharedLorebookDetail> {
         const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/restore/${encodeURIComponent(versionId)}`, { method: 'POST' })
         if (!da.ok) throw new Error(`restoreSharedLorebookVersion error: ${da.status}`)
+        return da.json()
+    }
+
+    // ── Shared lorebook entries ─────────────────────────────────────────────
+
+    // Structural — no lock. private requires ownership.
+    async addSharedLorebookEntry(id: string, entry: Partial<loreBook>): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(entry),
+        })
+        if (!da.ok) throw new Error(`addSharedLorebookEntry error: ${da.status}`)
+        return da.json()
+    }
+
+    // Structural — no lock to hold, but the server 409s if someone else
+    // currently holds the entry's lock (avoids yanking away a live edit).
+    async deleteSharedLorebookEntry(id: string, entryId: string): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/${encodeURIComponent(entryId)}`, { method: 'DELETE' })
+        if (!da.ok) throw new Error(`deleteSharedLorebookEntry error: ${da.status}`)
+        return da.json()
+    }
+
+    // body = the full ordered list of entry ids. Pure ordering, no lock.
+    async reorderSharedLorebookEntries(id: string, orderedEntryIds: string[]): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/reorder`, {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(orderedEntryIds),
+        })
+        if (!da.ok) throw new Error(`reorderSharedLorebookEntries error: ${da.status}`)
+        return da.json()
+    }
+
+    // Acquires the pessimistic lock on one entry and returns the editor's
+    // personal copy (freshly copied from the canonical entry, or the
+    // requester's own still-preserved draft from an earlier expired/
+    // cancelled session). Throws SharedLorebookLockedError if another user
+    // currently holds it. Global only — private has no lock endpoint.
+    async lockSharedLorebookEntry(id: string, entryId: string): Promise<{ entry: loreBook, locked_at: number }> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/${encodeURIComponent(entryId)}/lock`, { method: 'POST' })
+        if (da.status === 409) {
+            const data = await da.json().catch(() => ({}))
+            throw new SharedLorebookLockedError(data.locked_by_username ?? null, data.locked_at ?? null)
+        }
+        if (!da.ok) throw new Error(`lockSharedLorebookEntry error: ${da.status}`)
+        return da.json()
+    }
+
+    // Cancels editing: discards the personal copy and releases the lock,
+    // leaving the canonical entry untouched.
+    async cancelSharedLorebookEntryLock(id: string, entryId: string): Promise<void> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/${encodeURIComponent(entryId)}/lock`, { method: 'DELETE' })
+        if (da.status !== 404 && !da.ok) throw new Error(`cancelSharedLorebookEntryLock error: ${da.status}`)
+    }
+
+    // Requires the caller to currently hold the entry's lock (global) or own
+    // the book (private) — enforced server-side. On success the lock is
+    // released and the draft cleared.
+    async saveSharedLorebookEntry(id: string, entryId: string, entry: loreBook): Promise<SharedLorebookDetail> {
+        const da = await this.authFetch(`/api/lorebooks/${encodeURIComponent(id)}/entries/${encodeURIComponent(entryId)}`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(entry),
+        })
+        if (!da.ok) throw new Error(`saveSharedLorebookEntry error: ${da.status}`)
         return da.json()
     }
 
