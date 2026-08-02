@@ -9,6 +9,7 @@
     import ShDropdownMenuContent from "../UI/GUI/ShDropdownMenuContent.svelte"
     import ShDropdownMenuItem from "../UI/GUI/ShDropdownMenuItem.svelte"
     import ShDropdownMenuSeparator from "../UI/GUI/ShDropdownMenuSeparator.svelte"
+    import ShDialog from "../UI/GUI/ShDialog.svelte"
     import TextInput from "../UI/GUI/TextInput.svelte"
     import { chatDeselected } from "src/ts/stores.svelte"
     import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte"
@@ -28,14 +29,23 @@
         onMove: (kind: 'chat' | 'folder', id: string) => void
         dragState: { current: { kind: 'chat' | 'folder', id: string } | null }
         onDragStart: (kind: 'chat' | 'folder', id: string) => void
+        onDragEnd: () => void
         onDropOn: (targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') => void
+        onHoverChange: (targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') => void
+        onHoverClear: () => void
     }
-    let { chara = $bindable(), node, depth, onMove, dragState, onDragStart, onDropOn }: Props = $props()
+    let { chara = $bindable(), node, depth, onMove, dragState, onDragStart, onDragEnd, onDropOn, onHoverChange, onHoverClear }: Props = $props()
 
     // Native HTML5 drag & drop doesn't play well with touch scrolling — fall
     // back to the "이동" menu item on touch devices instead.
     const isTouchDevice = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches
 
+    // Renaming happens in a modal (ShDialog, portalled to <body>) instead of an
+    // inline input inside the row. It used to be inline, but the row itself is
+    // draggable=true — dragging across the input text (e.g. to select and
+    // retype the name) got hijacked as an HTML5 row-drag instead of a text
+    // selection. A portalled modal has no draggable ancestor, so that conflict
+    // can't happen regardless of where the input lives on screen.
     let editingName = $state(false)
     let editValue = $state('')
     let dropZone: 'before' | 'after' | 'into' | null = $state(null)
@@ -46,23 +56,37 @@
         onDragStart(node.kind, node.kind === 'folder' ? node.folder.id : node.chat.id)
     }
 
+    // Always fires after handleDragStart, whether the drag ended in a drop or
+    // was abandoned (dropped outside any valid target, Escape, etc.) — clears
+    // state that dragleave/drop alone can't reliably reach in the abandoned case.
+    function handleDragEnd() {
+        dropZone = null
+        onDragEnd()
+    }
+
     function handleDragOverFolder(e: DragEvent) {
         e.preventDefault()
         if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
         const dragging = dragState.current
         if (!dragging) { dropZone = null; return }
-        if (dragging.kind === 'chat') { dropZone = 'into'; return }
+        if (dragging.kind === 'chat') {
+            dropZone = 'into'
+            onHoverChange('folder', node.kind === 'folder' ? node.folder.id : '', 'into')
+            return
+        }
         const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
         const y = e.clientY - rect.top
         if (y < rect.height * 0.25) dropZone = 'before'
         else if (y > rect.height * 0.75) dropZone = 'after'
         else dropZone = 'into'
+        if (node.kind === 'folder') onHoverChange('folder', node.folder.id, dropZone)
     }
 
     function handleDropFolder(e: DragEvent) {
         e.preventDefault()
         const zone = dropZone ?? 'into'
         dropZone = null
+        onHoverClear()
         if (node.kind === 'folder') onDropOn('folder', node.folder.id, zone)
     }
 
@@ -74,18 +98,21 @@
         const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
         const y = e.clientY - rect.top
         dropZone = y < rect.height / 2 ? 'before' : 'after'
+        if (node.kind === 'chat') onHoverChange('chat', node.chat.id, dropZone)
     }
 
     function handleDropChat(e: DragEvent) {
         e.preventDefault()
         const zone = dropZone
         dropZone = null
+        onHoverClear()
         if (!zone || node.kind !== 'chat') return
         onDropOn('chat', node.chat.id, zone)
     }
 
     function handleDragLeave() {
         dropZone = null
+        onHoverClear()
     }
 
     function startRename(current: string) {
@@ -187,13 +214,21 @@
     }
 </script>
 
+{#snippet indentGuide()}
+    {#if depth > 0}
+        <!-- Vertical guide line marking folder membership — indentation alone
+             (padding-left) reads as "slightly shifted text", not "belongs to
+             the folder above it". The line makes that relationship explicit. -->
+        <span class="self-stretch border-l-2 border-textcolor2/25 shrink-0" style="width: {depth * 20}px; margin-left: {(depth - 1) * 20 + 8}px"></span>
+    {/if}
+{/snippet}
+
 {#if node.kind === 'folder'}
 <div>
     <div
         role="button"
         tabindex="0"
         draggable={!isTouchDevice}
-        style="padding-left: {depth * 16}px"
         class="flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
         class:bg-red-900={node.folder.color === 'red'}
         class:bg-yellow-900={node.folder.color === 'yellow'}
@@ -204,36 +239,23 @@
         class:bg-pink-900={node.folder.color === 'pink'}
         class:ring-2={dropZone === 'into'}
         class:ring-primary={dropZone === 'into'}
-        class:border-t-2={dropZone === 'before'}
-        class:border-b-2={dropZone === 'after'}
+        class:bg-selected={dropZone === 'into'}
+        class:border-t-4={dropZone === 'before'}
+        class:border-b-4={dropZone === 'after'}
         class:border-primary={dropZone === 'before' || dropZone === 'after'}
         onclick={toggleFold}
         onkeydown={(e) => { if (e.key === 'Enter') toggleFold() }}
         ondblclick={(e) => { e.stopPropagation(); startRename(node.folder.name ?? '') }}
         ondragstart={handleDragStart}
+        ondragend={handleDragEnd}
         ondragover={handleDragOverFolder}
         ondragleave={handleDragLeave}
         ondrop={handleDropFolder}
     >
+        {@render indentGuide()}
         {#if node.folder.folded}<ChevronRightIcon size={16} class="shrink-0"/>{:else}<ChevronDownIcon size={16} class="shrink-0"/>{/if}
         <FolderIcon size={16} class="shrink-0"/>
-        {#if editingName}
-            <TextInput
-                bind:value={editValue}
-                className="grow min-w-0"
-                padding={false}
-                onchange={commitRename}
-                onkeydown={(e) => {
-                    // Stop propagation so a global "Enter = send chat message" hotkey
-                    // (bound higher up the tree) doesn't also fire while renaming.
-                    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); commitRename() }
-                    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelRename() }
-                    else { e.stopPropagation() }
-                }}
-            />
-        {:else}
-            <span class="grow truncate">{node.folder.name}</span>
-        {/if}
+        <span class="grow truncate">{node.folder.name}</span>
         <ShDropdownMenu>
             <ShDropdownMenuTrigger>
                 {#snippet child({ props })}
@@ -261,7 +283,7 @@
     </div>
     {#if !node.folder.folded}
         {#each node.children as child (child.kind === 'folder' ? child.folder.id : child.chat.id)}
-            <ChatTreeItem chara={chara} node={child} depth={depth + 1} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDropOn={onDropOn}/>
+            <ChatTreeItem chara={chara} node={child} depth={depth + 1} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear}/>
         {/each}
     {/if}
 </div>
@@ -270,31 +292,22 @@
     role="button"
     tabindex="0"
     draggable={!isTouchDevice}
-    style="padding-left: {depth * 16}px"
     class="flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
     class:bg-selected={node.index === chara.chatPage && !$chatDeselected}
-    class:border-t-2={dropZone === 'before'}
-    class:border-b-2={dropZone === 'after'}
+    class:border-t-4={dropZone === 'before'}
+    class:border-b-4={dropZone === 'after'}
     class:border-primary={dropZone === 'before' || dropZone === 'after'}
     onclick={() => changeChatTo(node.index)}
     onkeydown={(e) => { if (e.key === 'Enter') changeChatTo(node.index) }}
     ondblclick={(e) => { e.stopPropagation(); startRename(node.chat.name) }}
     ondragstart={handleDragStart}
+    ondragend={handleDragEnd}
     ondragover={handleDragOverChat}
     ondragleave={handleDragLeave}
     ondrop={handleDropChat}
 >
-    {#if editingName}
-        <TextInput
-            bind:value={editValue}
-            className="grow min-w-0"
-            padding={false}
-            onchange={commitRename}
-            onkeydown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') cancelRename() }}
-        />
-    {:else}
-        <span class="grow truncate">{node.chat.name}</span>
-    {/if}
+    {@render indentGuide()}
+    <span class="grow truncate">{node.chat.name}</span>
     <ShDropdownMenu>
         <ShDropdownMenuTrigger>
             {#snippet child({ props })}
@@ -324,3 +337,16 @@
     </ShDropdownMenu>
 </div>
 {/if}
+
+<ShDialog bind:open={editingName} tier="base" size="sm" closeOnEscape ariaLabel="이름 변경">
+    {#snippet title()}이름 변경{/snippet}
+    <TextInput
+        bind:value={editValue}
+        fullwidth
+        onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitRename() } }}
+    />
+    {#snippet footer()}
+        <button class="px-3 py-1.5 rounded-md text-textcolor2 hover:text-textcolor cursor-pointer" onclick={cancelRename}>취소</button>
+        <button class="px-3 py-1.5 rounded-md bg-primary text-textcolor cursor-pointer" onclick={commitRename}>저장</button>
+    {/snippet}
+</ShDialog>

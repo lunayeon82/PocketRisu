@@ -70,8 +70,61 @@
     // dragged, mirroring Sidebar.svelte's `currentDrag` pattern.
     const dragState: { current: { kind: 'chat' | 'folder', id: string } | null } = { current: null }
 
+    // Reactive mirror of dragState.current plus a human-readable description
+    // of where the drop would land, shown as a status line above the tree.
+    // Added because dropZone borders/rings alone left it unclear whether a
+    // chat was landing inside a folder, being reordered next to a sibling, or
+    // popping back out to the top level — the text spells it out explicitly.
+    let isDragging = $state(false)
+    let dragHoverLabel = $state('')
+
     function onDragStart(kind: 'chat' | 'folder', id: string) {
         dragState.current = { kind, id }
+        isDragging = true
+        dragHoverLabel = ''
+    }
+
+    function onDragEnd() {
+        dragState.current = null
+        isDragging = false
+        dragHoverLabel = ''
+    }
+
+    function describeDrop(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into'): string {
+        const dragging = dragState.current
+        if (!dragging || !targetId) return ''
+        const draggingLabel = dragging.kind === 'chat'
+            ? (chara.chats.find(c => c.id === dragging.id)?.name ?? '채팅')
+            : (chara.chatFolders.find(f => f.id === dragging.id)?.name ?? '폴더')
+
+        if (targetKind === 'chat') {
+            if (dragging.kind !== 'chat') return ''
+            const target = chara.chats.find(c => c.id === targetId)
+            if (!target) return ''
+            const folder = target.folderId ? chara.chatFolders.find(f => f.id === target.folderId) : null
+            const where = folder ? `"${folder.name}" 폴더` : '최상위'
+            return `"${draggingLabel}" → ${where} · "${target.name}" ${zone === 'after' ? '아래' : '위'}`
+        }
+
+        const targetFolder = chara.chatFolders.find(f => f.id === targetId)
+        if (!targetFolder) return ''
+
+        if (dragging.kind === 'chat' || zone === 'into') {
+            return `"${draggingLabel}" → "${targetFolder.name}" 폴더 안으로`
+        }
+
+        const where = targetFolder.parentId
+            ? `"${chara.chatFolders.find(f => f.id === targetFolder.parentId)?.name ?? ''}" 폴더`
+            : '최상위'
+        return `"${draggingLabel}" → ${where} · "${targetFolder.name}" ${zone === 'after' ? '아래' : '위'}`
+    }
+
+    function onHoverChange(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') {
+        dragHoverLabel = describeDrop(targetKind, targetId, zone)
+    }
+
+    function onHoverClear() {
+        dragHoverLabel = ''
     }
 
     function isDescendantFolder(candidateId: string, ancestorId: string): boolean {
@@ -207,9 +260,20 @@
 
     let dragOverRoot = $state(false)
 
+    function onHoverRoot() {
+        const dragging = dragState.current
+        if (!dragging) { dragHoverLabel = ''; return }
+        const draggingLabel = dragging.kind === 'chat'
+            ? (chara.chats.find(c => c.id === dragging.id)?.name ?? '채팅')
+            : (chara.chatFolders.find(f => f.id === dragging.id)?.name ?? '폴더')
+        dragHoverLabel = `"${draggingLabel}" → 최상위로`
+    }
+
     async function onDropRoot() {
         const dragging = dragState.current
         dragState.current = null
+        isDragging = false
+        dragHoverLabel = ''
         if (!dragging) return
 
         if (dragging.kind === 'chat') {
@@ -246,18 +310,32 @@
         saveChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
     }}>{language.newChat}</ShButton>
 
+    {#if isDragging}
+        <!-- Explicit "where will this land" readout — dropZone borders/rings on
+             the row alone weren't enough to tell moving into vs. out of vs.
+             past a folder apart at a glance. -->
+        <div class="text-xs text-center py-1 px-2 rounded-md bg-darkbutton text-textcolor2 mt-1 truncate">
+            {dragHoverLabel || '이동할 위치 위로 드래그하세요'}
+        </div>
+    {/if}
     <div class="flex flex-col mt-2 overflow-y-auto max-h-80">
         {#each tree as node (node.kind === 'folder' ? node.folder.id : node.chat.id)}
-            <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDropOn={onDropOn}/>
+            <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear}/>
         {/each}
-        <div
-            role="presentation"
-            class="h-3 min-h-3 mx-1 mt-1 rounded-md transition-colors"
-            class:bg-selected={dragOverRoot}
-            ondragover={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dragOverRoot = true }}
-            ondragleave={() => { dragOverRoot = false }}
-            ondrop={(e) => { e.preventDefault(); dragOverRoot = false; void onDropRoot() }}
-        ></div>
+        {#if isDragging}
+            <div
+                role="presentation"
+                class={"flex items-center justify-center h-8 min-h-8 mx-1 mt-1 rounded-md border-2 border-dashed transition-colors text-xs " + (dragOverRoot ? "border-primary" : "border-textcolor2/30")}
+                class:bg-selected={dragOverRoot}
+                class:text-textcolor={dragOverRoot}
+                class:text-textcolor2={!dragOverRoot}
+                ondragover={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dragOverRoot = true; onHoverRoot() }}
+                ondragleave={() => { dragOverRoot = false; onHoverClear() }}
+                ondrop={(e) => { e.preventDefault(); dragOverRoot = false; void onDropRoot() }}
+            >
+                최상위로 이동
+            </div>
+        {/if}
     </div>
 
     <MoveToFolderModal
