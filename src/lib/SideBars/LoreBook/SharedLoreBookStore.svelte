@@ -11,7 +11,7 @@
     //   "always active" choice can't leak into everyone else's chats.
     // - private: visible only to its owner, edited directly (no lock — a
     //   private lorebook has exactly one possible editor), deletable by the owner.
-    import { XIcon, PlusIcon, LockIcon, HistoryIcon, RotateCcwIcon, RefreshCwIcon, SparklesIcon, GlobeIcon, LockKeyholeIcon, CopyIcon, TrashIcon, SlidersHorizontalIcon } from "@lucide/svelte";
+    import { XIcon, PlusIcon, LockIcon, HistoryIcon, RotateCcwIcon, RefreshCwIcon, SparklesIcon, GlobeIcon, LockKeyholeIcon, CopyIcon, TrashIcon, SlidersHorizontalIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, PencilIcon } from "@lucide/svelte";
     import {
         NodeStorage, SharedLorebookLockedError,
         type SharedLorebookSummary, type SharedLorebookDetail, type SharedLorebookVersion,
@@ -121,6 +121,7 @@
         if (!ok) return
         try {
             await ns.convertSharedLorebookToGlobal(book.id)
+            invalidateExpanded(book.id)
             notifySuccess('글로벌로 공유했습니다')
             await refreshList()
         } catch (e) {
@@ -143,6 +144,7 @@
         if (!ok) return
         try {
             await ns.deleteSharedLorebook(book.id)
+            invalidateExpanded(book.id)
             await refreshList()
         } catch (e) {
             alertError(String(e))
@@ -151,6 +153,57 @@
 
     function canDelete(book: SharedLorebookSummary): boolean {
         return book.scope === 'global' ? myIsAdmin : book.owner_id === myId
+    }
+
+    // ── Inline expand — books render as folders in the same list as the
+    // character's own lore entries, so their contents are visible without a
+    // separate "수정" click first. Entries fetched lazily on first expand.
+    let expanded = $state<Record<string, boolean>>({})
+    let expandedDetail = $state<Record<string, SharedLorebookDetail>>({})
+    let expandedLoading = $state<Record<string, boolean>>({})
+
+    async function toggleExpand(book: SharedLorebookSummary) {
+        if (expanded[book.id]) {
+            expanded = { ...expanded, [book.id]: false }
+            return
+        }
+        expanded = { ...expanded, [book.id]: true }
+        if (expandedDetail[book.id]) return
+        expandedLoading = { ...expandedLoading, [book.id]: true }
+        try {
+            const detail = await ns.getSharedLorebook(book.id)
+            expandedDetail = { ...expandedDetail, [book.id]: detail }
+        } catch (e) {
+            alertError(String(e))
+        } finally {
+            expandedLoading = { ...expandedLoading, [book.id]: false }
+        }
+    }
+
+    // Drops the cached preview — used after actions where the row either
+    // disappears (delete) or its content didn't change (scope-only changes),
+    // so a plain cache-clear is enough; the next manual expand refetches.
+    function invalidateExpanded(id: string) {
+        const { [id]: _removed, ...rest } = expandedDetail
+        expandedDetail = rest
+    }
+
+    // Like invalidateExpanded, but also refetches immediately if the row is
+    // currently expanded — used after save/restore, where leaving it expanded
+    // with no content (loading=false, detail=undefined renders nothing) would
+    // otherwise strand the user looking at an empty gap.
+    async function refreshExpandedIfOpen(id: string) {
+        invalidateExpanded(id)
+        if (!expanded[id]) return
+        expandedLoading = { ...expandedLoading, [id]: true }
+        try {
+            const detail = await ns.getSharedLorebook(id)
+            expandedDetail = { ...expandedDetail, [id]: detail }
+        } catch (e) {
+            // Best-effort refresh — leave it collapsed-looking rather than erroring.
+        } finally {
+            expandedLoading = { ...expandedLoading, [id]: false }
+        }
     }
 
     // ── Editing ──────────────────────────────────────────────────────────────
@@ -218,6 +271,7 @@
             const updated = await ns.saveSharedLorebook(id, draftContent, draftTitle)
             await clearLorebookDraftLocal(id)
             markSeen(updated)
+            void refreshExpandedIfOpen(id)
             exitEdit()
             notifySuccess('저장했습니다')
             await refreshList()
@@ -283,6 +337,7 @@
             const updated = await ns.restoreSharedLorebookVersion(id, versionId)
             await clearLorebookDraftLocal(id)
             markSeen(updated)
+            void refreshExpandedIfOpen(id)
             exitEdit()
             notifySuccess('복원했습니다')
             await refreshList()
@@ -386,88 +441,119 @@
                 {/if}
             </div>
         {:else if !editing}
-            <div class="flex items-center text-textcolor mb-4">
-                <h2 class="mt-0 mb-0">공유 로어북 저장소</h2>
-                <div class="grow flex justify-end items-center gap-1">
-                    <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={refreshList} title="새로고침">
-                        <RefreshCwIcon size={18}/>
+            <div class="flex items-center justify-end gap-1 mb-1">
+                <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={refreshList} title="새로고침">
+                    <RefreshCwIcon size={16}/>
+                </button>
+                <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={createNew} title="새 공유 로어북">
+                    <PlusIcon size={18}/>
+                </button>
+                {#if !inline}
+                    <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={close}>
+                        <XIcon size={20}/>
                     </button>
-                    <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={createNew} title="새 로어북">
-                        <PlusIcon size={20}/>
-                    </button>
-                    {#if !inline}
-                        <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={close}>
-                            <XIcon size={22}/>
-                        </button>
-                    {/if}
-                </div>
+                {/if}
             </div>
 
-            <div class="flex flex-col gap-2 overflow-y-auto">
+            <div class="flex flex-col overflow-y-auto">
                 {#if loadingList}
-                    <span class="text-textcolor2">불러오는 중...</span>
+                    <span class="text-textcolor2 p-2">불러오는 중...</span>
                 {:else if listError}
-                    <span class="text-red-400">{listError}</span>
+                    <span class="text-red-400 p-2">{listError}</span>
                 {:else if list.length === 0}
-                    <span class="text-textcolor2">아직 등록된 로어북이 없습니다</span>
+                    <span class="text-textcolor2 p-2">아직 등록된 로어북이 없습니다</span>
                 {:else}
                     {#each list as book (book.id)}
                         {@const lockedByOther = !!book.lock && book.lock.locked_by !== myId}
-                        <div class="flex items-center border border-selected rounded-md p-3 gap-3">
-                            <div class="flex flex-col min-w-0 grow">
-                                <div class="flex items-center gap-2">
-                                    {#if book.scope === 'global'}
-                                        <span class="text-xs px-1.5 py-0.5 rounded-full bg-blue-700/50 text-blue-200 flex items-center gap-1 shrink-0">
-                                            <GlobeIcon size={12}/> 글로벌
-                                        </span>
-                                    {:else}
-                                        <span class="text-xs px-1.5 py-0.5 rounded-full bg-selected text-textcolor2 flex items-center gap-1 shrink-0">
-                                            <LockKeyholeIcon size={12}/> 개인
-                                        </span>
-                                    {/if}
-                                    <span class="text-textcolor truncate">{book.title || '(제목 없음)'}</span>
-                                    {#if hasUnseenUpdate(book)}
-                                        <span class="text-xs px-1.5 py-0.5 rounded-full bg-green-700/60 text-green-200 flex items-center gap-1 shrink-0">
-                                            <SparklesIcon size={12}/> 새 버전 있음
-                                        </span>
-                                    {/if}
-                                </div>
-                                <span class="text-textcolor2 text-xs">
-                                    {book.updated_by_username ?? '알 수 없음'} · {formatTime(book.updated_at)}
-                                </span>
-                                {#if book.lock}
-                                    <span class="text-amber-400 text-xs flex items-center gap-1 mt-1">
-                                        <LockIcon size={12}/>
-                                        {lockedByOther ? `${book.lock.locked_by_username ?? '다른 사용자'}가 수정 중` : '내가 수정 중 (이어서 편집 가능)'}
+                        <div>
+                            <div
+                                role="button"
+                                tabindex="0"
+                                class="flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
+                                onclick={() => toggleExpand(book)}
+                                onkeydown={(e) => { if (e.key === 'Enter') toggleExpand(book) }}
+                            >
+                                {#if expanded[book.id]}<ChevronDownIcon size={16} class="shrink-0"/>{:else}<ChevronRightIcon size={16} class="shrink-0"/>{/if}
+                                <FolderIcon size={16} class="shrink-0"/>
+                                {#if book.scope === 'global'}
+                                    <span class="text-xs px-1.5 py-0.5 rounded-full bg-blue-700/50 text-blue-200 flex items-center gap-1 shrink-0">
+                                        <GlobeIcon size={12}/> 글로벌
+                                    </span>
+                                {:else}
+                                    <span class="text-xs px-1.5 py-0.5 rounded-full bg-selected text-textcolor2 flex items-center gap-1 shrink-0">
+                                        <LockKeyholeIcon size={12}/> 개인
                                     </span>
                                 {/if}
-                            </div>
-                            <div class="flex items-center gap-1 shrink-0">
-                                {#if book.scope === 'global'}
-                                    <button class="text-textcolor2 hover:text-primary p-1.5 cursor-pointer" onclick={() => openOverrides(book)} title="내 활성화 설정">
-                                        <SlidersHorizontalIcon size={16}/>
-                                    </button>
-                                    <button class="text-textcolor2 hover:text-primary p-1.5 cursor-pointer" onclick={() => cloneToPrivate(book)} title="내 사본 만들기">
-                                        <CopyIcon size={16}/>
-                                    </button>
-                                {:else}
-                                    <button class="text-textcolor2 hover:text-primary p-1.5 cursor-pointer" onclick={() => shareToGlobal(book)} title="글로벌로 공유">
-                                        <GlobeIcon size={16}/>
-                                    </button>
+                                <span class="grow truncate">{book.title || '(제목 없음)'}</span>
+                                {#if hasUnseenUpdate(book)}
+                                    <span class="text-xs px-1.5 py-0.5 rounded-full bg-green-700/60 text-green-200 flex items-center gap-1 shrink-0">
+                                        <SparklesIcon size={12}/> 새 버전
+                                    </span>
                                 {/if}
-                                {#if canDelete(book)}
-                                    <button class="text-textcolor2 hover:text-red-400 p-1.5 cursor-pointer" onclick={() => deleteBook(book)} title="삭제">
-                                        <TrashIcon size={16}/>
-                                    </button>
+                                {#if book.lock}
+                                    <span
+                                        class="text-amber-400 shrink-0"
+                                        title={lockedByOther ? `${book.lock.locked_by_username ?? '다른 사용자'}가 수정 중` : '내가 수정 중 (이어서 편집 가능)'}
+                                    >
+                                        <LockIcon size={14}/>
+                                    </span>
                                 {/if}
-                                <button
-                                    class="px-3 py-1.5 rounded-md bg-selected text-textcolor shrink-0 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                                    disabled={lockedByOther}
-                                    onclick={() => startEdit(book)}
-                                >
-                                    수정
-                                </button>
+                                <div class="flex items-center gap-1 shrink-0" role="presentation" onclick={(e) => e.stopPropagation()}>
+                                    {#if book.scope === 'global'}
+                                        <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={() => openOverrides(book)} title="내 활성화 설정">
+                                            <SlidersHorizontalIcon size={14}/>
+                                        </button>
+                                        <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={() => cloneToPrivate(book)} title="내 사본 만들기">
+                                            <CopyIcon size={14}/>
+                                        </button>
+                                    {:else}
+                                        <button class="text-textcolor2 hover:text-primary p-1 cursor-pointer" onclick={() => shareToGlobal(book)} title="글로벌로 공유">
+                                            <GlobeIcon size={14}/>
+                                        </button>
+                                    {/if}
+                                    {#if canDelete(book)}
+                                        <button class="text-textcolor2 hover:text-red-400 p-1 cursor-pointer" onclick={() => deleteBook(book)} title="삭제">
+                                            <TrashIcon size={14}/>
+                                        </button>
+                                    {/if}
+                                </div>
                             </div>
+                            {#if expanded[book.id]}
+                                <div class="flex flex-col" style="padding-left: 22px">
+                                    {#if expandedLoading[book.id]}
+                                        <span class="text-textcolor2 text-sm p-2">불러오는 중...</span>
+                                    {:else if expandedDetail[book.id]}
+                                        {@const entries = expandedDetail[book.id].content.filter((e) => e.mode !== 'folder')}
+                                        {#if entries.length === 0}
+                                            <div class="flex items-center gap-1.5 p-2">
+                                                <span class="text-textcolor2 text-sm grow">항목이 없습니다</span>
+                                                <button
+                                                    class="text-textcolor2 hover:text-primary p-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                                                    disabled={lockedByOther}
+                                                    onclick={() => startEdit(book)}
+                                                    title="수정"
+                                                >
+                                                    <PencilIcon size={14}/>
+                                                </button>
+                                            </div>
+                                        {:else}
+                                            {#each entries as entry (entry.id)}
+                                                <div class="flex items-center gap-1.5 p-2 rounded-md hover:bg-darkbutton">
+                                                    <span class="grow truncate text-sm text-textcolor2">{entry.comment || entry.key || '(이름 없음)'}</span>
+                                                    <button
+                                                        class="text-textcolor2 hover:text-primary p-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                                                        disabled={lockedByOther}
+                                                        onclick={() => startEdit(book)}
+                                                        title="수정"
+                                                    >
+                                                        <PencilIcon size={14}/>
+                                                    </button>
+                                                </div>
+                                            {/each}
+                                        {/if}
+                                    {/if}
+                                </div>
+                            {/if}
                         </div>
                     {/each}
                 {/if}

@@ -156,7 +156,5 @@
 </div>
 {/if}
 {#if submenu === 0 && !globalMode}
-    <div class="border-t border-selected mt-4 pt-4">
-        <SharedLoreBookStore inline />
-    </div>
+    <SharedLoreBookStore inline />
 {/if}
