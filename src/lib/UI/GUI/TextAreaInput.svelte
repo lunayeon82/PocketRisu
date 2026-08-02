@@ -37,15 +37,17 @@
     }}
 >
     <div class="relative flex-1 min-h-0 w-full">
-    {#if !highlight || $disableHighlight}
+    {#if !highlight || $disableHighlight || disabled}
         <textarea
             class="w-full h-full bg-transparent focus-within:outline-hidden resize-none absolute top-0 left-0 z-50 overflow-y-auto"
             class:px-4={padding}
             class:py-2={padding}
+            class:text-textcolor2={disabled}
             {autocomplete}
             {placeholder}
             id={id}
             bind:value={value}
+            disabled={disabled}
             oninput={(e) => {
                 if(optimaizedInput){
                     if(inpa++ > 10){
@@ -172,12 +174,14 @@
                     <CopyIcon size={16} />
                 {/if}
             </button>
-            <button type="button" class="p-1 rounded hover:text-red-500 transition-colors" title={language.reset} aria-label={language.reset} onclick={resetValue}>
-                <RefreshCwIcon size={16} />
-            </button>
-            <button type="button" class="p-1 rounded hover:text-textcolor transition-colors" title={language.hotkeyDesc.popupEditor} aria-label={language.hotkeyDesc.popupEditor} onclick={openPopupEditor}>
-                <Maximize2 size={16} />
-            </button>
+            {#if !disabled}
+                <button type="button" class="p-1 rounded hover:text-red-500 transition-colors" title={language.reset} aria-label={language.reset} onclick={resetValue}>
+                    <RefreshCwIcon size={16} />
+                </button>
+                <button type="button" class="p-1 rounded hover:text-textcolor transition-colors" title={language.hotkeyDesc.popupEditor} aria-label={language.hotkeyDesc.popupEditor} onclick={openPopupEditor}>
+                    <Maximize2 size={16} />
+                </button>
+            {/if}
         </div>
     {/if}
     <div class="hidden absolute z-100 bg-bgcolor border border-darkborderc p-2 flex-col" bind:this={autoCompleteDom}>
@@ -217,6 +221,7 @@
         onchange?: () => void;
         popupLanguage?: string;
         actionBar?: boolean;
+        disabled?: boolean;
     }
 
     let {
@@ -235,7 +240,8 @@
         highlight = false,
         onchange = () => {},
         popupLanguage = 'markdown',
-        actionBar = undefined
+        actionBar = undefined,
+        disabled = false
     }: Props = $props();
     // `actionBar` prop overrides per-field; otherwise follow the accessibility toggle.
     const showActionBar = $derived(actionBar ?? DBState.db.showInputActionBar ?? true)

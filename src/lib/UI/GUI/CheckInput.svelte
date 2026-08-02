@@ -9,6 +9,7 @@
         reverse?: boolean;
         className?: string;
         grayText?: boolean;
+        disabled?: boolean;
         children?: import('svelte').Snippet;
     }
 
@@ -21,31 +22,35 @@
         reverse = false,
         className = "",
         grayText = false,
+        disabled = false,
         children
     }: Props = $props();
 </script>
 
-<label 
+<label
     class={"flex items-center gap-2 cursor-pointer" + (className ? " " + className : "") + (grayText ? " text-textcolor2" : " text-textcolor")}
     class:mr-2={margin}
+    class:opacity-50={disabled}
+    class:cursor-not-allowed={disabled}
     aria-describedby="{name} {check ? 'abled' : 'disabled'}"
     aria-labelledby="{name} {check ? 'abled' : 'disabled'}"
 >
     {#if reverse}
         <span>{name} {@render children?.()}</span>
     {/if}
-    <input 
-        class="hidden" 
-        type="checkbox" 
+    <input
+        class="hidden"
+        type="checkbox"
         alt={name}
         bind:checked={check}
+        disabled={disabled}
         onchange={() => {
             onChange(check)
         }}
         aria-describedby="{name} {check ? 'abled' : 'disabled'}"
         aria-labelledby="{name} {check ? 'abled' : 'disabled'}"
     />
-    <span 
+    <span
         class="w-5 h-5 min-w-5 min-h-5 rounded-md border-2 border-darkborderc flex justify-center items-center {check ? 'bg-darkborderc' : 'bg-darkbutton'} transition-colors duration-200"
         aria-hidden="true"
         aria-describedby="{name} {check ? 'abled' : 'disabled'}"

@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { XIcon, LinkIcon, SunIcon, BanIcon, HistoryIcon, RotateCcwIcon, BookCopyIcon, FolderIcon, FolderOpen, PlusIcon, UploadIcon, SparklesIcon } from "@lucide/svelte";
+    import { XIcon, LinkIcon, SunIcon, BanIcon, HistoryIcon, RotateCcwIcon, BookCopyIcon, FolderIcon, FolderOpen, PlusIcon, UploadIcon, SparklesIcon, PencilIcon } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { language } from "../../../lang";
     import { getCurrentCharacter, getCurrentChat, type loreBook } from "../../../ts/storage/database.svelte";
@@ -43,6 +43,16 @@
     
     let open = $derived(isOpen)
 
+    // Shared entries can't be typed into directly — the fields below are
+    // read-only until "수정" acquires the server-side lock. editDraft is the
+    // locked personal copy being edited; contentTarget is whichever object
+    // the form fields should actually bind to right now.
+    let editingShared = $state(false)
+    let editDraft = $state<loreBook | null>(null)
+    let savingSharedEdit = $state(false)
+    let contentTarget = $derived(editingShared && editDraft ? editDraft : value)
+    let locked = $derived(!!value.source_lorebook_id && !editingShared)
+
     let tokens = $state(0)
     let tokenTimer: ReturnType<typeof setTimeout> | null = null
     let tokenSeq = 0
@@ -55,7 +65,7 @@
     // once the next debounce fires 400ms later.
     $effect(() => {
         if (!open) return
-        const content = value.content
+        const content = contentTarget.content
         const seq = ++tokenSeq
         if (tokenTimer) clearTimeout(tokenTimer)
         tokenTimer = setTimeout(() => {
@@ -197,6 +207,67 @@
         return new Date(ts).toLocaleString('ko-KR')
     }
 
+    // Shared entries are read-only until this acquires the server-side lock —
+    // mirrors the old SharedLoreBookStore edit flow, just scoped to the
+    // character's own entry instead of a separate browsable list.
+    async function startEditShared(book: loreBook){
+        if(!book.source_lorebook_id || !book.id) return
+        showVersions = false
+        try {
+            const lockRes = await ns.lockSharedLorebookEntry(book.source_lorebook_id, book.id)
+            editDraft = lockRes.entry
+            editingShared = true
+            if(!open){
+                open = true
+                onOpen(true)
+            }
+        } catch(e){
+            if(e instanceof SharedLorebookLockedError){
+                notifyError(`${e.lockedByUsername ?? '다른 사용자'}가 수정 중입니다`)
+            } else {
+                alertError(String(e))
+            }
+        }
+    }
+
+    async function saveSharedEdit(book: loreBook){
+        if(!book.source_lorebook_id || !book.id || !editDraft) return
+        savingSharedEdit = true
+        try {
+            const detail = await ns.saveSharedLorebookEntry(book.source_lorebook_id, book.id, editDraft)
+            const saved = detail.content.find(e => e.id === book.id) ?? editDraft
+            // Content fields only — alwaysActive/disabled are personal and stay untouched.
+            book.comment = saved.comment
+            book.key = saved.key
+            book.secondkey = saved.secondkey
+            book.content = saved.content
+            book.insertorder = saved.insertorder
+            book.selective = saved.selective
+            book.useRegex = saved.useRegex
+            book.activationPercent = saved.activationPercent
+            book.source_updated_at = detail.updated_at
+            editingShared = false
+            editDraft = null
+            notifySuccess('공유 로어북에 저장했습니다')
+        } catch(e){
+            alertError(String(e))
+        } finally {
+            savingSharedEdit = false
+        }
+    }
+
+    async function cancelSharedEdit(book: loreBook){
+        if(book.source_lorebook_id && book.id){
+            try {
+                await ns.cancelSharedLorebookEntryLock(book.source_lorebook_id, book.id)
+            } catch(e){
+                // Lock already gone (expired / taken elsewhere) — still fine to leave edit mode.
+            }
+        }
+        editingShared = false
+        editDraft = null
+    }
+
 </script>
 <div class={"w-full flex flex-col " + (
     isLastInContainer ? 
@@ -281,10 +352,20 @@
                 <button class="mr-1 valuer" title="버전 기록" onclick={() => openVersions(value)}>
                     <HistoryIcon size={20} />
                 </button>
+                {#if editingShared}
+                    <button class="mr-1 text-amber-400" title="편집 중 — 잠금 보유">
+                        <PencilIcon size={20} />
+                    </button>
+                {:else}
+                    <button class="mr-1 valuer" title="수정" onclick={() => startEditShared(value)}>
+                        <PencilIcon size={20} />
+                    </button>
+                {/if}
+            {:else}
+                <button class="mr-1 valuer" title="공유 로어북에 업로드" onclick={() => uploadEntry(value)}>
+                    <UploadIcon size={20} />
+                </button>
             {/if}
-            <button class="mr-1 valuer" title="공유 로어북에 업로드" onclick={() => uploadEntry(value)}>
-                <UploadIcon size={20} />
-            </button>
         {/if}
         <button class="valuer" onclick={async () => {
             let shouldRemove = true;
@@ -385,35 +466,54 @@
         </div>
         {:else}
         <div class="border-0 outline-hidden w-full mt-2 flex flex-col mb-2">
+            {#if value.source_lorebook_id}
+                <span class="text-xs text-textcolor2 mt-2">
+                    {editingShared ? '편집 중 — 저장하거나 취소할 때까지 잠금이 유지됩니다' : '공유 로어북에 연결된 항목입니다 — 수정하려면 잠금을 먼저 획득하세요'}
+                </span>
+            {/if}
             <span class="text-textcolor mt-6">{language.name} <Help key="loreName"/></span>
-            <TextInput bind:value={value.comment}/>
+            <TextInput bind:value={contentTarget.comment} disabled={locked}/>
             {#if getActivationMode(value) === 'trigger'}
                 <span class="text-textcolor mt-6">{language.activationKeys} <Help key="loreActivationKey"/></span>
                 <span class="text-xs text-textcolor2">{language.activationKeysInfo}</span>
-                <TextInput bind:value={value.key}/>
+                <TextInput bind:value={contentTarget.key} disabled={locked}/>
 
-                {#if value.selective}
+                {#if contentTarget.selective}
                     <span class="text-textcolor mt-6">{language.SecondaryKeys}</span>
                     <span class="text-xs text-textcolor2">{language.activationKeysInfo}</span>
-                    <TextInput bind:value={value.secondkey}/>
+                    <TextInput bind:value={contentTarget.secondkey} disabled={locked}/>
                 {/if}
             {/if}
-            {#if !(value.activationPercent === undefined || value.activationPercent === null)}
+            {#if !(contentTarget.activationPercent === undefined || contentTarget.activationPercent === null)}
                 <span class="text-textcolor mt-6">{language.activationProbability}</span>
-                <NumberInput bind:value={value.activationPercent} onChange={() => {
-                    if(isNaN(value.activationPercent) || !value.activationPercent || value.activationPercent < 0){
-                        value.activationPercent = 0
+                <NumberInput bind:value={contentTarget.activationPercent} disabled={locked} onChange={() => {
+                    if(isNaN(contentTarget.activationPercent) || !contentTarget.activationPercent || contentTarget.activationPercent < 0){
+                        contentTarget.activationPercent = 0
                     }
-                    if(value.activationPercent > 100){
-                        value.activationPercent = 100
+                    if(contentTarget.activationPercent > 100){
+                        contentTarget.activationPercent = 100
                     }
                 }} />
             {/if}
             <span class="text-textcolor mt-4">{language.insertOrder} <Help key="loreorder"/></span>
-            <NumberInput bind:value={value.insertorder} min={0} max={1000}/>
+            <NumberInput bind:value={contentTarget.insertorder} min={0} max={1000} disabled={locked}/>
             <span class="text-textcolor mt-4 mb-2">{language.prompt}</span>
-            <TextAreaInput highlight autocomplete="off" bind:value={value.content} />
+            <TextAreaInput highlight autocomplete="off" bind:value={contentTarget.content} disabled={locked}/>
             <span class="text-textcolor2 mt-2 mb-2 text-sm">{tokens} {language.tokens}</span>
+            {#if editingShared}
+                <div class="flex justify-end gap-2 mb-4">
+                    <button class="px-3 py-1.5 rounded-md text-textcolor2 hover:text-textcolor cursor-pointer" onclick={() => cancelSharedEdit(value)}>
+                        취소
+                    </button>
+                    <button
+                        class="px-3 py-1.5 rounded-md bg-primary text-textcolor cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                        disabled={savingSharedEdit}
+                        onclick={() => saveSharedEdit(value)}
+                    >
+                        저장
+                    </button>
+                </div>
+            {/if}
             <span class="text-textcolor mt-4 mb-2">활성화 방식</span>
             <div class="flex border border-selected rounded-md overflow-hidden w-fit">
                 {#each ([['trigger','키워드 트리거'],['always',language.alwaysActive],['disabled','비활성화']] as const) as [mode, label]}
@@ -433,15 +533,15 @@
                     <Check check={isLocallyActivated(value)} onChange={(check: boolean) => toggleLocalActive(check, value)} name={language.alwaysActiveInChat}/>
                 </div>
             {/if}
-            {#if !value.useRegex}
+            {#if !contentTarget.useRegex}
                 <div class="flex items-center mt-2">
-                    <Check bind:check={value.selective} name={language.selective}/>
+                    <Check bind:check={contentTarget.selective} disabled={locked} name={language.selective}/>
                     <Help key="loreSelective" name={language.selective}/>
                 </div>
             {/if}
             {#if getActivationMode(value) === 'trigger'}
                 <div class="flex items-center mt-2">
-                    <Check bind:check={value.useRegex} name={language.useRegexLorebook}/>
+                    <Check bind:check={contentTarget.useRegex} disabled={locked} name={language.useRegexLorebook}/>
                     <Help key="useRegexLorebook" name={language.useRegexLorebook}/>
                 </div>
             {/if}
