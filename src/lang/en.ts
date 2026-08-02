@@ -820,6 +820,7 @@ export const languageEnglish = {
     changeFolderImage: "Change Folder Image",
     fullWordMatching: "Full Word Matching",
     botSettingAtStart: "Bot Menu when Launch",
+    autoOpenSingleCharacter: "Skip to chat when only one character exists",
     triggerStart: "On chat Send",
     triggerInput: "On user's output",
     triggerOutput: "On character's output",

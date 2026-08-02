@@ -175,6 +175,7 @@ export const helpKo = {
         "showInputActionBar": "여러 줄 입력창 하단에 복사·초기화·편집기 확대 버튼이 있는 도구 모음을 표시합니다.",
         "enableDragPartialEdit": "메시지에서 텍스트를 드래그로 선택한 뒤 그 부분만 편집할 수 있게 합니다.",
         "botSettingAtStart": "앱을 새로 실행할 때마다 설정 페이지(봇 설정)부터 자동으로 엽니다.",
+        "autoOpenSingleCharacter": "계정에 캐릭터가 정확히 하나만 있을 때, 부팅 시 캐릭터 갤러리를 건너뛰고 바로 그 캐릭터의 채팅 화면을 엽니다. 캐릭터가 2개 이상이면 평소처럼 갤러리부터 시작합니다.",
         "showMenuChatList": "사이드바 메뉴에 현재 캐릭터의 채팅 목록을 직접 표시합니다.",
         "showMenuHypaMemoryModal": "사이드바 메뉴에서 하이파메모리(HypaV3) 관리 모달을 바로 열 수 있는 버튼을 표시합니다.",
         "goCharacterOnImport": "캐릭터 카드를 가져온 직후 그 캐릭터로 자동 이동합니다.",

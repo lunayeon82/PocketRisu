@@ -292,6 +292,7 @@ export const helpEn = {
         showInputActionBar: "Show a bottom toolbar on multiline text fields with copy, reset, and expand-to-editor buttons.",
         enableDragPartialEdit: "Allow editing only the text selected by dragging inside a message.",
         botSettingAtStart: "Open the bot settings page automatically whenever the app starts.",
+        autoOpenSingleCharacter: "When the account has exactly one character, skip the character gallery on boot and open straight into that character's chat. Falls back to the gallery if there are two or more characters.",
         showMenuChatList: "Show the current character's chat list directly in the sidebar menu.",
         showMenuHypaMemoryModal: "Show a sidebar button that opens the HypaMemory (HypaV3) management modal.",
         goCharacterOnImport: "After importing a character card, switch to that character automatically.",

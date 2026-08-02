@@ -106,6 +106,14 @@ export const accessibilitySettingsItems: SettingItem[] = [
         keywords: ['bot', 'setting', 'start', 'open']
     },
     {
+        id: 'acc.autoOpenSingleCharacter',
+        type: 'check',
+        labelKey: 'autoOpenSingleCharacter',
+        bindKey: 'autoOpenSingleCharacter',
+        helpKey: 'autoOpenSingleCharacter',
+        keywords: ['character', 'single', 'skip', 'landing', 'gallery', 'boot', 'start']
+    },
+    {
         id: 'acc.showMenuChatList',
         type: 'check',
         labelKey: 'showMenuChatList',
@@ -398,6 +406,7 @@ export const accessibilitySidebarItems = pick([
 
 export const accessibilityOtherItems = pick([
     'acc.botSettingAtStart',
+    'acc.autoOpenSingleCharacter',
     'acc.goCharacterOnImport',
     'acc.createFolderOnBranch',
     'acc.localActivationInGlobalLorebook',

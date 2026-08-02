@@ -1144,6 +1144,10 @@ export interface Database{
     assetWidth:number
     animationSpeed:number
     botSettingAtStart:false
+    /** Skip the character gallery/landing page on boot and open straight into
+     * the chat screen when the account has exactly one (non-playground)
+     * character. No-op if that count isn't exactly 1. */
+    autoOpenSingleCharacter?:boolean
     NAIsettings:NAISettings
     hideRealm:boolean
     colorScheme:ColorScheme

@@ -16,7 +16,7 @@ import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
-import { updateLorebooks } from "./characters";
+import { updateLorebooks, changeChar } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import {
@@ -219,7 +219,12 @@ export async function loadData() {
                 console.warn('[bootstrap] boot backup reminder failed:', err)
             }
             loadedStore.set(true)
-            selectedCharID.set(-1)
+            const realCharacters = db.characters.filter(c => c.chaId !== '§playground')
+            if (db.autoOpenSingleCharacter && realCharacters.length === 1) {
+                changeChar(db.characters.indexOf(realCharacters[0]))
+            } else {
+                selectedCharID.set(-1)
+            }
             startObserveDom()
             assignIds()
             registerModelDynamic()
