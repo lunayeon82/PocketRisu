@@ -1,6 +1,6 @@
 <script lang="ts">
     import { v4 } from "uuid"
-    import { ChevronRightIcon, ChevronDownIcon, FolderIcon, MoreVerticalIcon, PencilIcon, FolderInputIcon, TrashIcon, CopyIcon, DownloadIcon, PaletteIcon } from "@lucide/svelte"
+    import { ChevronRightIcon, ChevronDownIcon, FolderIcon, MoreVerticalIcon, PencilIcon, FolderInputIcon, TrashIcon, CopyIcon, DownloadIcon, PaletteIcon, GripVerticalIcon } from "@lucide/svelte"
 
     import type { character } from "src/ts/storage/database.svelte"
     import type { ChatTreeNode } from "src/ts/chatTree"
@@ -33,59 +33,72 @@
         onDropOn: (targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') => void
         onHoverChange: (targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') => void
         onHoverClear: () => void
+        hoverTarget: { kind: 'chat' | 'folder', id: string, zone: 'before' | 'after' | 'into' } | null
+        resolveDropTargetAtPoint: (x: number, y: number) => { kind: 'chat' | 'folder', id: string, zone: 'before' | 'after' | 'into' } | { kind: 'root' } | null
+        onDropRoot: () => void | Promise<void>
+        onPointerHoverRoot: () => void
     }
-    let { chara = $bindable(), node, depth, onMove, dragState, onDragStart, onDragEnd, onDropOn, onHoverChange, onHoverClear }: Props = $props()
+    let { chara = $bindable(), node, depth, onMove, dragState, onDragStart, onDragEnd, onDropOn, onHoverChange, onHoverClear, hoverTarget, resolveDropTargetAtPoint, onDropRoot, onPointerHoverRoot }: Props = $props()
 
-    // Native HTML5 drag & drop doesn't play well with touch scrolling — fall
-    // back to the "이동" menu item on touch devices instead.
+    // Native HTML5 drag & drop doesn't play well with touch scrolling — the
+    // grip handle below uses this to pick which interaction model it wires
+    // up: draggable+dragstart/dragend for mouse/pen, longpress+pointer
+    // events for touch (see the pointer-drag block further down).
     const isTouchDevice = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches
 
     // Renaming happens in a modal (ShDialog, portalled to <body>) instead of an
-    // inline input inside the row. It used to be inline, but the row itself is
+    // inline input inside the row. It used to be inline, but the row itself was
     // draggable=true — dragging across the input text (e.g. to select and
     // retype the name) got hijacked as an HTML5 row-drag instead of a text
-    // selection. A portalled modal has no draggable ancestor, so that conflict
-    // can't happen regardless of where the input lives on screen.
+    // selection. Drag is now scoped to the grip handle instead of the whole
+    // row, which also fixes that conflict, but the modal is kept regardless
+    // since a portalled modal has no draggable ancestor either way.
     let editingName = $state(false)
     let editValue = $state('')
-    let dropZone: 'before' | 'after' | 'into' | null = $state(null)
+
+    const selfKind = $derived(node.kind)
+    const selfId = $derived(node.kind === 'folder' ? node.folder.id : node.chat.id)
+
+    // Derived (not local) so a pointer-drag started from a *different*
+    // ChatTreeItem instance can still light up this row's highlight —
+    // hoverTarget is the shared state both native dragover and touch
+    // pointer-drag hit-testing write into (see SideChatList.svelte).
+    const dropZone = $derived(
+        hoverTarget && hoverTarget.kind === selfKind && hoverTarget.id === selfId ? hoverTarget.zone : null
+    )
 
     function handleDragStart(e: DragEvent) {
         if (isTouchDevice) { e.preventDefault(); return }
         e.dataTransfer?.setData('text/plain', '')
-        onDragStart(node.kind, node.kind === 'folder' ? node.folder.id : node.chat.id)
+        onDragStart(selfKind, selfId)
     }
 
     // Always fires after handleDragStart, whether the drag ended in a drop or
     // was abandoned (dropped outside any valid target, Escape, etc.) — clears
     // state that dragleave/drop alone can't reliably reach in the abandoned case.
     function handleDragEnd() {
-        dropZone = null
         onDragEnd()
     }
 
     function handleDragOverFolder(e: DragEvent) {
         e.preventDefault()
         if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+        if (node.kind !== 'folder') return
         const dragging = dragState.current
-        if (!dragging) { dropZone = null; return }
+        if (!dragging) { onHoverClear(); return }
         if (dragging.kind === 'chat') {
-            dropZone = 'into'
-            onHoverChange('folder', node.kind === 'folder' ? node.folder.id : '', 'into')
+            onHoverChange('folder', node.folder.id, 'into')
             return
         }
         const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
         const y = e.clientY - rect.top
-        if (y < rect.height * 0.25) dropZone = 'before'
-        else if (y > rect.height * 0.75) dropZone = 'after'
-        else dropZone = 'into'
-        if (node.kind === 'folder') onHoverChange('folder', node.folder.id, dropZone)
+        const zone = y < rect.height * 0.25 ? 'before' : y > rect.height * 0.75 ? 'after' : 'into'
+        onHoverChange('folder', node.folder.id, zone)
     }
 
     function handleDropFolder(e: DragEvent) {
         e.preventDefault()
         const zone = dropZone ?? 'into'
-        dropZone = null
         onHoverClear()
         if (node.kind === 'folder') onDropOn('folder', node.folder.id, zone)
     }
@@ -93,26 +106,113 @@
     function handleDragOverChat(e: DragEvent) {
         e.preventDefault()
         if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+        if (node.kind !== 'chat') return
         const dragging = dragState.current
-        if (!dragging || dragging.kind !== 'chat') { dropZone = null; return }
+        if (!dragging || dragging.kind !== 'chat') { onHoverClear(); return }
         const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
         const y = e.clientY - rect.top
-        dropZone = y < rect.height / 2 ? 'before' : 'after'
-        if (node.kind === 'chat') onHoverChange('chat', node.chat.id, dropZone)
+        const zone = y < rect.height / 2 ? 'before' : 'after'
+        onHoverChange('chat', node.chat.id, zone)
     }
 
     function handleDropChat(e: DragEvent) {
         e.preventDefault()
         const zone = dropZone
-        dropZone = null
         onHoverClear()
         if (!zone || node.kind !== 'chat') return
         onDropOn('chat', node.chat.id, zone)
     }
 
     function handleDragLeave() {
-        dropZone = null
         onHoverClear()
+    }
+
+    // ── Touch: long-press + pointer-events drag ─────────────────────────────
+    // Mirrors the native dragstart/dragover/drop flow above, but driven by
+    // pointer events since touch doesn't get native HTML5 DnD. Gated on
+    // e.pointerType so a stylus/mouse on a touch-capable device still uses
+    // the native path via the handle's draggable attribute.
+    const LONGPRESS_MS = 300
+    const MOVE_CANCEL_PX = 10
+
+    let longpressTimer: ReturnType<typeof setTimeout> | null = null
+    let pointerDragActive = $state(false)
+    let pointerDownPos = { x: 0, y: 0 }
+    let activePointerId: number | null = null
+
+    function clearLongpressTimer() {
+        if (longpressTimer !== null) {
+            clearTimeout(longpressTimer)
+            longpressTimer = null
+        }
+    }
+
+    function beginPointerDrag(e: PointerEvent) {
+        pointerDragActive = true
+        try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch {}
+        onDragStart(selfKind, selfId)
+    }
+
+    function onHandlePointerDown(e: PointerEvent) {
+        if (e.pointerType !== 'touch') return
+        pointerDownPos = { x: e.clientX, y: e.clientY }
+        activePointerId = e.pointerId
+        clearLongpressTimer()
+        longpressTimer = setTimeout(() => {
+            longpressTimer = null
+            beginPointerDrag(e)
+        }, LONGPRESS_MS)
+    }
+
+    function onHandlePointerMove(e: PointerEvent) {
+        if (e.pointerId !== activePointerId) return
+        if (longpressTimer !== null) {
+            // Still waiting out the long-press — a real move this early means
+            // the touch was a scroll attempt (or a miss), not a drag.
+            const dx = e.clientX - pointerDownPos.x
+            const dy = e.clientY - pointerDownPos.y
+            if (Math.hypot(dx, dy) > MOVE_CANCEL_PX) clearLongpressTimer()
+            return
+        }
+        if (!pointerDragActive) return
+        e.preventDefault()
+        const target = resolveDropTargetAtPoint(e.clientX, e.clientY)
+        if (!target) { onHoverClear(); return }
+        if (target.kind === 'root') { onPointerHoverRoot(); return }
+        onHoverChange(target.kind, target.id, target.zone)
+    }
+
+    function finishPointerDrag(e: PointerEvent) {
+        const wasDragging = pointerDragActive
+        pointerDragActive = false
+        clearLongpressTimer()
+        activePointerId = null
+        if (!wasDragging) return
+        const target = resolveDropTargetAtPoint(e.clientX, e.clientY)
+        onHoverClear()
+        if (target?.kind === 'root') {
+            void onDropRoot()
+        } else if (target) {
+            onDropOn(target.kind, target.id, target.zone)
+            onDragEnd()
+        } else {
+            onDragEnd()
+        }
+    }
+
+    function onHandlePointerUp(e: PointerEvent) {
+        if (e.pointerId !== activePointerId) return
+        e.preventDefault()
+        finishPointerDrag(e)
+    }
+
+    function onHandlePointerCancel(e: PointerEvent) {
+        if (e.pointerId !== activePointerId) return
+        const wasDragging = pointerDragActive
+        pointerDragActive = false
+        clearLongpressTimer()
+        activePointerId = null
+        if (wasDragging) { onHoverClear(); onDragEnd() }
     }
 
     function startRename(current: string) {
@@ -223,13 +323,44 @@
     {/if}
 {/snippet}
 
+{#snippet gripHandle()}
+    <!-- Sole drag source for the row: draggable+dragstart/dragend for
+         mouse/pen (native HTML5 DnD), pointerdown/move/up/cancel for touch
+         (longpress-gated custom drag). The row itself only handles
+         click/dblclick/drop from here on. -->
+    <!-- role=presentation: not keyboard-operable (dragging has no sane
+         keyboard equivalent) — the "이동" menu item is the keyboard/AT path
+         for the same action, so this is intentionally excluded from the
+         accessibility tree rather than exposed as a fake button. -->
+    <span
+        role="presentation"
+        aria-label="드래그하여 순서 변경"
+        draggable={!isTouchDevice}
+        class={"shrink-0 touch-none cursor-grab active:cursor-grabbing " +
+            (isTouchDevice
+                ? "opacity-70 text-textcolor2"
+                : "opacity-0 group-hover:opacity-100 text-textcolor2 hover:text-primary transition-opacity")}
+        onclick={(e) => e.stopPropagation()}
+        ondragstart={handleDragStart}
+        ondragend={handleDragEnd}
+        onpointerdown={onHandlePointerDown}
+        onpointermove={onHandlePointerMove}
+        onpointerup={onHandlePointerUp}
+        onpointercancel={onHandlePointerCancel}
+    >
+        <GripVerticalIcon size={14}/>
+    </span>
+{/snippet}
+
 {#if node.kind === 'folder'}
 <div>
     <div
         role="button"
         tabindex="0"
-        draggable={!isTouchDevice}
-        class="flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
+        data-chat-tree-row
+        data-tree-kind={node.kind}
+        data-tree-id={selfId}
+        class="group flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
         class:bg-red-900={node.folder.color === 'red'}
         class:bg-yellow-900={node.folder.color === 'yellow'}
         class:bg-green-900={node.folder.color === 'green'}
@@ -243,16 +374,16 @@
         class:border-t-4={dropZone === 'before'}
         class:border-b-4={dropZone === 'after'}
         class:border-primary={dropZone === 'before' || dropZone === 'after'}
+        class:opacity-50={pointerDragActive}
         onclick={toggleFold}
         onkeydown={(e) => { if (e.key === 'Enter') toggleFold() }}
         ondblclick={(e) => { e.stopPropagation(); startRename(node.folder.name ?? '') }}
-        ondragstart={handleDragStart}
-        ondragend={handleDragEnd}
         ondragover={handleDragOverFolder}
         ondragleave={handleDragLeave}
         ondrop={handleDropFolder}
     >
         {@render indentGuide()}
+        {@render gripHandle()}
         {#if node.folder.folded}<ChevronRightIcon size={16} class="shrink-0"/>{:else}<ChevronDownIcon size={16} class="shrink-0"/>{/if}
         <FolderIcon size={16} class="shrink-0"/>
         <span class="grow truncate">{node.folder.name}</span>
@@ -283,7 +414,7 @@
     </div>
     {#if !node.folder.folded}
         {#each node.children as child (child.kind === 'folder' ? child.folder.id : child.chat.id)}
-            <ChatTreeItem chara={chara} node={child} depth={depth + 1} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear}/>
+            <ChatTreeItem chara={chara} node={child} depth={depth + 1} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
         {/each}
     {/if}
 </div>
@@ -291,22 +422,24 @@
 <div
     role="button"
     tabindex="0"
-    draggable={!isTouchDevice}
-    class="flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
+    data-chat-tree-row
+    data-tree-kind={node.kind}
+    data-tree-id={selfId}
+    class="group flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
     class:bg-selected={node.index === chara.chatPage && !$chatDeselected}
     class:border-t-4={dropZone === 'before'}
     class:border-b-4={dropZone === 'after'}
     class:border-primary={dropZone === 'before' || dropZone === 'after'}
+    class:opacity-50={pointerDragActive}
     onclick={() => changeChatTo(node.index)}
     onkeydown={(e) => { if (e.key === 'Enter') changeChatTo(node.index) }}
     ondblclick={(e) => { e.stopPropagation(); startRename(node.chat.name) }}
-    ondragstart={handleDragStart}
-    ondragend={handleDragEnd}
     ondragover={handleDragOverChat}
     ondragleave={handleDragLeave}
     ondrop={handleDropChat}
 >
     {@render indentGuide()}
+    {@render gripHandle()}
     <span class="grow truncate">{node.chat.name}</span>
     <ShDropdownMenu>
         <ShDropdownMenuTrigger>

@@ -78,6 +78,13 @@
     let isDragging = $state(false)
     let dragHoverLabel = $state('')
 
+    // Shared "what's currently hovered" state — the single source of truth
+    // for per-row drop-zone highlighting (ChatTreeItem's `dropZone` is
+    // derived from this instead of tracking it locally). Native `dragover`
+    // and the touch pointer-drag hit-test both funnel through onHoverChange/
+    // onHoverClear below, so both input paths drive the same highlight.
+    let hoverTarget: { kind: 'chat' | 'folder', id: string, zone: 'before' | 'after' | 'into' } | null = $state(null)
+
     function onDragStart(kind: 'chat' | 'folder', id: string) {
         dragState.current = { kind, id }
         isDragging = true
@@ -88,6 +95,8 @@
         dragState.current = null
         isDragging = false
         dragHoverLabel = ''
+        hoverTarget = null
+        dragOverRoot = false
     }
 
     function describeDrop(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into'): string {
@@ -120,11 +129,50 @@
     }
 
     function onHoverChange(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') {
+        dragOverRoot = false
+        hoverTarget = { kind: targetKind, id: targetId, zone }
         dragHoverLabel = describeDrop(targetKind, targetId, zone)
     }
 
     function onHoverClear() {
+        hoverTarget = null
+        dragOverRoot = false
         dragHoverLabel = ''
+    }
+
+    // Touch pointer-drag hit-testing — maps a screen coordinate to whatever
+    // chat/folder row (or the root dropzone) is under it, using the same
+    // 25/50/75% zone thresholds as the native dragover handlers in
+    // ChatTreeItem. There's no native `dragover` event stream to piggyback
+    // on for a manual pointer-events drag, so this re-derives the same
+    // result from document.elementFromPoint instead.
+    function resolveDropTargetAtPoint(x: number, y: number):
+        { kind: 'chat' | 'folder', id: string, zone: 'before' | 'after' | 'into' } | { kind: 'root' } | null {
+        const el = document.elementFromPoint(x, y) as HTMLElement | null
+        if (!el) return null
+        if (el.closest('[data-chat-tree-root-drop]')) return { kind: 'root' }
+        const rowEl = el.closest('[data-chat-tree-row]') as HTMLElement | null
+        if (!rowEl) return null
+        const kind = rowEl.dataset.treeKind as 'chat' | 'folder' | undefined
+        const id = rowEl.dataset.treeId
+        const dragging = dragState.current
+        if (!kind || !id || !dragging) return null
+        const rect = rowEl.getBoundingClientRect()
+        const relY = y - rect.top
+        if (kind === 'chat') {
+            if (dragging.kind !== 'chat') return null
+            return { kind, id, zone: relY < rect.height / 2 ? 'before' : 'after' }
+        }
+        if (dragging.kind === 'chat') return { kind, id, zone: 'into' }
+        if (relY < rect.height * 0.25) return { kind, id, zone: 'before' }
+        if (relY > rect.height * 0.75) return { kind, id, zone: 'after' }
+        return { kind, id, zone: 'into' }
+    }
+
+    function onPointerHoverRoot() {
+        hoverTarget = null
+        dragOverRoot = true
+        onHoverRoot()
     }
 
     function isDescendantFolder(candidateId: string, ancestorId: string): boolean {
@@ -270,6 +318,7 @@
     }
 
     async function onDropRoot() {
+        dragOverRoot = false
         const dragging = dragState.current
         dragState.current = null
         isDragging = false
@@ -320,18 +369,19 @@
     {/if}
     <div class="flex flex-col mt-2 overflow-y-auto max-h-80">
         {#each tree as node (node.kind === 'folder' ? node.folder.id : node.chat.id)}
-            <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear}/>
+            <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
         {/each}
         {#if isDragging}
             <div
                 role="presentation"
+                data-chat-tree-root-drop
                 class={"flex items-center justify-center h-8 min-h-8 mx-1 mt-1 rounded-md border-2 border-dashed transition-colors text-xs " + (dragOverRoot ? "border-primary" : "border-textcolor2/30")}
                 class:bg-selected={dragOverRoot}
                 class:text-textcolor={dragOverRoot}
                 class:text-textcolor2={!dragOverRoot}
                 ondragover={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dragOverRoot = true; onHoverRoot() }}
                 ondragleave={() => { dragOverRoot = false; onHoverClear() }}
-                ondrop={(e) => { e.preventDefault(); dragOverRoot = false; void onDropRoot() }}
+                ondrop={(e) => { e.preventDefault(); void onDropRoot() }}
             >
                 최상위로 이동
             </div>
