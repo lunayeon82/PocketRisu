@@ -46,6 +46,14 @@
     // events for touch (see the pointer-drag block further down).
     const isTouchDevice = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches
 
+    // TEMP DEBUG (버그 A 진단용 — 확인 끝나면 이 상수와 아래 gripHandle의
+    // onpointer* 삼항식들을 원래 값으로 되돌리고 제거할 것).
+    // true로 두면 핸들의 pointer 이벤트 리스너 4개(onpointerdown/move/up/cancel)가
+    // 전혀 바인딩되지 않은 상태에서 PC 드래그를 테스트할 수 있음 — 이 상태에서도
+    // "dragstart fired" 로그가 안 찍히면 pointer 리스너는 원인이 아니라는 뜻,
+    // 반대로 이 상태에서만 찍히면 pointer 리스너 공존이 네이티브 드래그를 막고 있다는 뜻.
+    const DEBUG_DISABLE_POINTER_HANDLERS = true
+
     // Renaming happens in a modal (ShDialog, portalled to <body>) instead of an
     // inline input inside the row. It used to be inline, but the row itself was
     // draggable=true — dragging across the input text (e.g. to select and
@@ -68,6 +76,8 @@
     )
 
     function handleDragStart(e: DragEvent) {
+        // TEMP DEBUG (버그 A 진단용 — 원인 확정되면 제거)
+        console.log('dragstart fired', selfKind, selfId)
         if (isTouchDevice) { e.preventDefault(); return }
         e.dataTransfer?.setData('text/plain', '')
         onDragStart(selfKind, selfId)
@@ -189,6 +199,8 @@
         activePointerId = null
         if (!wasDragging) return
         const target = resolveDropTargetAtPoint(e.clientX, e.clientY)
+        // TEMP DEBUG (버그 B 진단용 — 원인 확정되면 제거)
+        console.log('touch drop target:', target)
         onHoverClear()
         if (target?.kind === 'root') {
             void onDropRoot()
@@ -343,10 +355,10 @@
         onclick={(e) => e.stopPropagation()}
         ondragstart={handleDragStart}
         ondragend={handleDragEnd}
-        onpointerdown={onHandlePointerDown}
-        onpointermove={onHandlePointerMove}
-        onpointerup={onHandlePointerUp}
-        onpointercancel={onHandlePointerCancel}
+        onpointerdown={DEBUG_DISABLE_POINTER_HANDLERS ? undefined : onHandlePointerDown}
+        onpointermove={DEBUG_DISABLE_POINTER_HANDLERS ? undefined : onHandlePointerMove}
+        onpointerup={DEBUG_DISABLE_POINTER_HANDLERS ? undefined : onHandlePointerUp}
+        onpointercancel={DEBUG_DISABLE_POINTER_HANDLERS ? undefined : onHandlePointerCancel}
     >
         <GripVerticalIcon size={14}/>
     </span>
