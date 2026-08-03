@@ -67,13 +67,24 @@
         hoverTarget && hoverTarget.kind === selfKind && hoverTarget.id === selfId ? hoverTarget.zone : null
     )
 
+    // draggable lives on the whole row (native HTML5 DnD is unreliable when
+    // scoped to a small child element in some engines), gated to the handle
+    // via this flag instead of inspecting dragstart's own e.target — for a
+    // native drag started on a descendant of a draggable ancestor, the
+    // browser resolves dragstart's target to the draggable element itself
+    // (the row), not the element actually pressed, so `.closest()` on
+    // dragstart's target can never reach a `data-drag-handle` that lives on
+    // a *child* of the row. mousedown's target is still the real pressed
+    // element, so the handle check has to happen there instead.
+    let dragOriginatedOnHandle = false
+
+    function handleMouseDown(e: MouseEvent) {
+        dragOriginatedOnHandle = !!(e.target as HTMLElement).closest?.('[data-drag-handle]')
+    }
+
     function handleDragStart(e: DragEvent) {
         if (isTouchDevice) { e.preventDefault(); return }
-        // draggable lives on the whole row (native HTML5 DnD is unreliable
-        // when scoped to a small child element in some engines — see git
-        // history), so gate here instead: only actually start a drag if the
-        // gesture began on the grip handle, not elsewhere in the row.
-        if (!(e.target as HTMLElement).closest('[data-drag-handle]')) {
+        if (!dragOriginatedOnHandle) {
             e.preventDefault()
             return
         }
@@ -85,6 +96,7 @@
     // was abandoned (dropped outside any valid target, Escape, etc.) — clears
     // state that dragleave/drop alone can't reliably reach in the abandoned case.
     function handleDragEnd() {
+        dragOriginatedOnHandle = false
         onDragEnd()
     }
 
@@ -386,6 +398,7 @@
         onclick={toggleFold}
         onkeydown={(e) => { if (e.key === 'Enter') toggleFold() }}
         ondblclick={(e) => { e.stopPropagation(); startRename(node.folder.name ?? '') }}
+        onmousedown={handleMouseDown}
         ondragstart={handleDragStart}
         ondragend={handleDragEnd}
         ondragover={handleDragOverFolder}
@@ -445,6 +458,7 @@
     onclick={() => changeChatTo(node.index)}
     onkeydown={(e) => { if (e.key === 'Enter') changeChatTo(node.index) }}
     ondblclick={(e) => { e.stopPropagation(); startRename(node.chat.name) }}
+    onmousedown={handleMouseDown}
     ondragstart={handleDragStart}
     ondragend={handleDragEnd}
     ondragover={handleDragOverChat}
