@@ -42,17 +42,17 @@
 
     // Native HTML5 drag & drop doesn't play well with touch scrolling — the
     // grip handle below uses this to pick which interaction model it wires
-    // up: draggable+dragstart/dragend for mouse/pen, longpress+pointer
-    // events for touch (see the pointer-drag block further down).
+    // up: mouse/pen still drag the whole row (see draggable on the row divs
+    // further down), gated to only actually start when the gesture began on
+    // the handle (see handleDragStart); touch starts its own longpress+
+    // pointer-events drag directly from the handle's pointerdown.
     const isTouchDevice = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches
 
     // Renaming happens in a modal (ShDialog, portalled to <body>) instead of an
-    // inline input inside the row. It used to be inline, but the row itself was
-    // draggable=true — dragging across the input text (e.g. to select and
-    // retype the name) got hijacked as an HTML5 row-drag instead of a text
-    // selection. Drag is now scoped to the grip handle instead of the whole
-    // row, which also fixes that conflict, but the modal is kept regardless
-    // since a portalled modal has no draggable ancestor either way.
+    // inline input inside the row, so dragging across the input text (e.g. to
+    // select and retype the name) never gets hijacked as an HTML5 row-drag —
+    // a portalled modal has no draggable ancestor regardless of where on the
+    // row dragging is allowed to start.
     let editingName = $state(false)
     let editValue = $state('')
 
@@ -69,6 +69,14 @@
 
     function handleDragStart(e: DragEvent) {
         if (isTouchDevice) { e.preventDefault(); return }
+        // draggable lives on the whole row (native HTML5 DnD is unreliable
+        // when scoped to a small child element in some engines — see git
+        // history), so gate here instead: only actually start a drag if the
+        // gesture began on the grip handle, not elsewhere in the row.
+        if (!(e.target as HTMLElement).closest('[data-drag-handle]')) {
+            e.preventDefault()
+            return
+        }
         e.dataTransfer?.setData('text/plain', '')
         onDragStart(selfKind, selfId)
     }
@@ -131,7 +139,7 @@
     // Mirrors the native dragstart/dragover/drop flow above, but driven by
     // pointer events since touch doesn't get native HTML5 DnD. Gated on
     // e.pointerType so a stylus/mouse on a touch-capable device still uses
-    // the native path via the handle's draggable attribute.
+    // the native path (row draggable, gated to the handle in handleDragStart).
     const LONGPRESS_MS = 300
     const MOVE_CANCEL_PX = 10
 
@@ -324,10 +332,11 @@
 {/snippet}
 
 {#snippet gripHandle()}
-    <!-- Sole drag source for the row: draggable+dragstart/dragend for
-         mouse/pen (native HTML5 DnD), pointerdown/move/up/cancel for touch
-         (longpress-gated custom drag). The row itself only handles
-         click/dblclick/drop from here on. -->
+    <!-- Not itself the native drag source anymore — draggable lives on the
+         row (see the two row divs below), gated by handleDragStart to only
+         actually start when the gesture originated here (data-drag-handle).
+         Touch still starts its own pointer-events drag straight from this
+         element's pointerdown. -->
     <!-- role=presentation: not keyboard-operable (dragging has no sane
          keyboard equivalent) — the "이동" menu item is the keyboard/AT path
          for the same action, so this is intentionally excluded from the
@@ -335,14 +344,12 @@
     <span
         role="presentation"
         aria-label="드래그하여 순서 변경"
-        draggable={!isTouchDevice}
+        data-drag-handle
         class={"shrink-0 cursor-grab active:cursor-grabbing " +
             (isTouchDevice
                 ? "touch-none opacity-70 text-textcolor2"
                 : "opacity-0 group-hover:opacity-100 text-textcolor2 hover:text-primary transition-opacity")}
         onclick={(e) => e.stopPropagation()}
-        ondragstart={handleDragStart}
-        ondragend={handleDragEnd}
         onpointerdown={onHandlePointerDown}
         onpointermove={onHandlePointerMove}
         onpointerup={onHandlePointerUp}
@@ -357,6 +364,7 @@
     <div
         role="button"
         tabindex="0"
+        draggable={!isTouchDevice}
         data-chat-tree-row
         data-tree-kind={node.kind}
         data-tree-id={selfId}
@@ -378,6 +386,8 @@
         onclick={toggleFold}
         onkeydown={(e) => { if (e.key === 'Enter') toggleFold() }}
         ondblclick={(e) => { e.stopPropagation(); startRename(node.folder.name ?? '') }}
+        ondragstart={handleDragStart}
+        ondragend={handleDragEnd}
         ondragover={handleDragOverFolder}
         ondragleave={handleDragLeave}
         ondrop={handleDropFolder}
@@ -422,6 +432,7 @@
 <div
     role="button"
     tabindex="0"
+    draggable={!isTouchDevice}
     data-chat-tree-row
     data-tree-kind={node.kind}
     data-tree-id={selfId}
@@ -434,6 +445,8 @@
     onclick={() => changeChatTo(node.index)}
     onkeydown={(e) => { if (e.key === 'Enter') changeChatTo(node.index) }}
     ondblclick={(e) => { e.stopPropagation(); startRename(node.chat.name) }}
+    ondragstart={handleDragStart}
+    ondragend={handleDragEnd}
     ondragover={handleDragOverChat}
     ondragleave={handleDragLeave}
     ondrop={handleDropChat}
