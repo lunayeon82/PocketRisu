@@ -711,7 +711,17 @@ export class NodeStorage{
                 ? (typeof json.chat_meta === 'string' ? JSON.parse(json.chat_meta) : json.chat_meta)
                 : {}
             if (typeof json.updated_at === 'number') chatUpdatedAtCache.set(chatId, json.updated_at)
-            return normalizeChat({ ...meta, id: json.id, name: json.title, message: messages })
+            const chat = normalizeChat({ ...meta, id: json.id, name: json.title, message: messages })
+            // folder_id is a dedicated column kept up to date by drag-and-drop
+            // moves (PATCH /meta, PATCH /reorder) — those never touch
+            // chat_meta, so meta.folderId can be stale. The column is always
+            // authoritative when present.
+            if (json.folder_id != null) {
+                chat.folderId = json.folder_id
+            } else {
+                delete chat.folderId
+            }
+            return chat
         }
         if (da.status !== 404) throw new Error(`fetchChatContent error: ${da.status}`)
 

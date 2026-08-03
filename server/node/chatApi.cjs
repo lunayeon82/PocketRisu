@@ -107,6 +107,16 @@ const stmtNextPosition = sharedDb.prepare(`
     AND ((folder_id IS NULL AND ? IS NULL) OR folder_id = ?)
 `);
 
+// Makes room at position 0 for a brand-new chat by bumping every existing
+// sibling (same user+character+folder scope) down by one. Used instead of
+// nextPosition() when a chat needs to land at the top of its list, matching
+// where the client already puts it locally (unshift).
+const stmtShiftPositionsDown = sharedDb.prepare(`
+  UPDATE rl_chats SET position = position + 1
+  WHERE user_id = ? AND character_id = ?
+    AND ((folder_id IS NULL AND ? IS NULL) OR folder_id = ?)
+`);
+
 // Metadata-only patch (folder move / reorder / rename). Takes final resolved
 // values (not COALESCE) since folder_id legitimately needs to become NULL
 // (moved out of any folder) — COALESCE can't distinguish "clear it" from
@@ -329,8 +339,10 @@ function upsertChatFull(req, res) {
         if (existing) {
             stmtUpdateChat.run(title, metaJson, folderId, now, chatId, userId);
         } else {
-            const position = nextPosition(userId, character_id, folderId);
-            stmtInsertChat.run(chatId, userId, character_id, title, metaJson, folderId, position, now, now);
+            // New chats land at the top of their list (position 0), matching
+            // the client's unshift — see stmtShiftPositionsDown above.
+            stmtShiftPositionsDown.run(userId, character_id, folderId, folderId);
+            stmtInsertChat.run(chatId, userId, character_id, title, metaJson, folderId, 0, now, now);
         }
         stmtDeleteChatMessages.run(chatId);
         if (messages.length > 0) {
