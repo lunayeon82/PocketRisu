@@ -149,8 +149,6 @@
     function resolveDropTargetAtPoint(x: number, y: number):
         { kind: 'chat' | 'folder', id: string, zone: 'before' | 'after' | 'into' } | { kind: 'root' } | null {
         const el = document.elementFromPoint(x, y) as HTMLElement | null
-        // TEMP DEBUG (버그 B 진단용 — 원인 확정되면 제거)
-        console.log('elementFromPoint:', el, el?.dataset)
         if (!el) return null
         if (el.closest('[data-chat-tree-root-drop]')) return { kind: 'root' }
         const rowEl = el.closest('[data-chat-tree-row]') as HTMLElement | null
@@ -222,8 +220,6 @@
     }
 
     async function onDropOn(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') {
-        // TEMP DEBUG (버그 B 진단용 — 원인 확정되면 제거)
-        console.log('onDropOn called:', targetKind, targetId, zone)
         const dragging = dragState.current
         dragState.current = null
         if (!dragging) return
