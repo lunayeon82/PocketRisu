@@ -359,14 +359,32 @@
         saveChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
     }}>{language.newChat}</ShButton>
 
-    {#if isDragging}
-        <!-- Explicit "where will this land" readout — dropZone borders/rings on
-             the row alone weren't enough to tell moving into vs. out of vs.
-             past a folder apart at a glance. -->
-        <div class="text-xs text-center py-1 px-2 rounded-md bg-darkbutton text-textcolor2 mt-1 truncate">
-            {dragHoverLabel || '이동할 위치 위로 드래그하세요'}
-        </div>
-    {/if}
+    <!-- Zero-height positioning anchor for the drag-hover banner below — it
+         must never push the row list (native HTML5 DnD is spec'd to abort
+         the in-progress drag if the source element's layout box moves
+         between dragstart and the next dragover; mounting an in-flow banner
+         here on `isDragging` shifted every row down a frame after dragstart
+         and Chrome cancelled the drag before a single dragover could fire,
+         which is invisible in devtools but shows up as "grab cursor, but
+         nothing actually drags" — confirmed by logging dragstart/dragend
+         timestamps + row rects: rows moved and dragend fired ~5ms later with
+         zero dragover in between). Absolute-positioning the banner inside
+         this zero-height wrapper keeps it visually in the same place without
+         touching anything else's layout. -->
+    <div class="relative">
+        {#if isDragging}
+            <!-- pointer-events-none: purely informational, must never be hit by
+                 elementFromPoint — the touch drag path (resolveDropTargetAtPoint
+                 above) hit-tests via document.elementFromPoint at the finger's
+                 coordinates, and this banner sits (via z-10) visually on top of
+                 the first row; without this it wins that hit-test and swallows
+                 every drop aimed at the top of the list, silently no-op'ing
+                 instead of reordering. -->
+            <div class="absolute inset-x-0 top-1 z-10 text-xs text-center py-1 px-2 rounded-md bg-darkbutton text-textcolor2 truncate shadow-lg pointer-events-none">
+                {dragHoverLabel || '이동할 위치 위로 드래그하세요'}
+            </div>
+        {/if}
+    </div>
     <div class="flex flex-col mt-2 overflow-y-auto max-h-80">
         {#each tree as node (node.kind === 'folder' ? node.folder.id : node.chat.id)}
             <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>

@@ -1,7 +1,7 @@
 <script lang="ts">
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors, EyeOff } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
-    import { saveChatToServer } from "src/ts/storage/chatStorage"
+    import { saveChatToServer, createChatFolder, updateChatMeta } from "src/ts/storage/chatStorage"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
@@ -864,14 +864,24 @@
         const currentChat = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]
 
         if(DBState.db.createFolderOnBranch && !currentChat.folderId){
-            const folderId = v4()
-            DBState.db.characters[selIdState.selId].chatFolders ??= []
-            DBState.db.characters[selIdState.selId].chatFolders.unshift({
-                id: folderId,
-                name: `Branches of ${currentChat.name}`,
-                folded: false,
-            })
-            currentChat.folderId = folderId
+            // Folder + folder assignment both go through their dedicated APIs
+            // (not the chat's next full-save) — chat_meta.folderId on a full
+            // save is a display-only echo now (server always preserves the
+            // existing folder_id column for updates, see upsertChatFull), so
+            // setting currentChat.folderId locally and letting autosave carry
+            // it would silently never reach the server.
+            try {
+                const folder = await createChatFolder(DBState.db.characters[selIdState.selId].chaId, {
+                    name: `Branches of ${currentChat.name}`,
+                })
+                DBState.db.characters[selIdState.selId].chatFolders ??= []
+                DBState.db.characters[selIdState.selId].chatFolders.unshift(folder)
+                currentChat.folderId = folder.id
+                await updateChatMeta(currentChat.id, { folderId: folder.id })
+            } catch (e) {
+                // Folder creation/assignment failed — proceed with the branch
+                // itself rather than blocking on a non-essential grouping step.
+            }
         }
         
         const currentMessage = currentChat.message[idx]

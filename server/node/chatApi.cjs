@@ -297,7 +297,9 @@ function updateChat(req, res) {
     const { title, chat_meta } = req.body || {};
     const newTitle = title !== undefined ? title : chat.title;
     const newMeta = chat_meta !== undefined ? toJSON(chat_meta) : chat.chat_meta;
-    const newFolderId = chat_meta !== undefined ? folderIdFromMeta(chat_meta) : chat.folder_id;
+    // folder_id is intentionally NEVER derived from chat_meta here — see the
+    // comment on upsertChatFull below for why.
+    const newFolderId = chat.folder_id;
     const now = Date.now();
 
     stmtUpdateChat.run(newTitle, newMeta, newFolderId, now, req.params.id, userId);
@@ -328,7 +330,6 @@ function upsertChatFull(req, res) {
 
     const now = Date.now();
     const metaJson = toJSON(chat_meta);
-    const folderId = folderIdFromMeta(chat_meta);
 
     const existing = stmtGetChat.get(chatId, userId);
     if (existing && expected_updated_at !== undefined && existing.updated_at !== expected_updated_at) {
@@ -337,8 +338,27 @@ function upsertChatFull(req, res) {
 
     sharedDb.transaction(() => {
         if (existing) {
-            stmtUpdateChat.run(title, metaJson, folderId, now, chatId, userId);
+            // folder_id is deliberately NOT re-derived from chat_meta here —
+            // it's preserved as-is from the DB. chat_meta.folderId is just
+            // whatever the client's in-memory chat object happened to hold
+            // when this (often slow: full message history) request was
+            // built, and folder placement has its own dedicated, fast
+            // endpoints (reorderChats, patchChatMeta) that a drag-and-drop
+            // or "move to folder" action calls directly. Those intentionally
+            // don't bump updated_at (a reorder shouldn't jump a chat to the
+            // top of a recency-sorted view), so this request's
+            // expected_updated_at check above can't detect "a reorder
+            // happened after I captured this chat_meta" — if we trusted
+            // chat_meta.folderId here, a slow in-flight full-save carrying
+            // the pre-drag folderId could land after the reorder and
+            // silently revert the move (the exact "chat escapes its folder
+            // on reload" bug). New chats (the else branch) have no existing
+            // folder_id to preserve, so they still take chat_meta's folderId
+            // — that's the only legitimate way to create a chat pre-placed
+            // in a folder (import, branch-into-new-folder, etc).
+            stmtUpdateChat.run(title, metaJson, existing.folder_id, now, chatId, userId);
         } else {
+            const folderId = folderIdFromMeta(chat_meta);
             // New chats land at the top of their list (position 0), matching
             // the client's unshift — see stmtShiftPositionsDown above.
             stmtShiftPositionsDown.run(userId, character_id, folderId, folderId);
