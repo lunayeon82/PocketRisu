@@ -1,5 +1,6 @@
 <script lang="ts">
     import { v4 } from "uuid"
+    import { flip } from "svelte/animate"
     import { ChevronRightIcon, ChevronDownIcon, FolderIcon, MoreVerticalIcon, PencilIcon, FolderInputIcon, TrashIcon, CopyIcon, DownloadIcon, PaletteIcon, GripVerticalIcon } from "@lucide/svelte"
 
     import type { character } from "src/ts/storage/database.svelte"
@@ -28,6 +29,7 @@
         depth: number
         onMove: (kind: 'chat' | 'folder', id: string) => void
         dragState: { current: { kind: 'chat' | 'folder', id: string } | null }
+        draggingId: string | null
         onDragStart: (kind: 'chat' | 'folder', id: string) => void
         onDragEnd: () => void
         onDropOn: (targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into') => void
@@ -38,7 +40,7 @@
         onDropRoot: () => void | Promise<void>
         onPointerHoverRoot: () => void
     }
-    let { chara = $bindable(), node, depth, onMove, dragState, onDragStart, onDragEnd, onDropOn, onHoverChange, onHoverClear, hoverTarget, resolveDropTargetAtPoint, onDropRoot, onPointerHoverRoot }: Props = $props()
+    let { chara = $bindable(), node, depth, onMove, dragState, draggingId, onDragStart, onDragEnd, onDropOn, onHoverChange, onHoverClear, hoverTarget, resolveDropTargetAtPoint, onDropRoot, onPointerHoverRoot }: Props = $props()
 
     // Native HTML5 drag & drop doesn't play well with touch scrolling — the
     // grip handle below uses this to pick which interaction model it wires
@@ -66,6 +68,11 @@
     const dropZone = $derived(
         hoverTarget && hoverTarget.kind === selfKind && hoverTarget.id === selfId ? hoverTarget.zone : null
     )
+
+    // True while this exact row is the one being physically carried around —
+    // covers both PC (native dragstart) and touch (pointerDragActive) since
+    // both paths funnel through the same onDragStart(selfKind, selfId) call.
+    const isBeingDragged = $derived(draggingId === selfId)
 
     // draggable lives on the whole row (native HTML5 DnD is unreliable when
     // scoped to a small child element in some engines), gated to the handle
@@ -371,8 +378,104 @@
     </span>
 {/snippet}
 
+{#snippet dropLine(edge: 'before' | 'after')}
+    <!-- Notion/editor-style insertion caret: a dot-capped line pinned to the
+         row's own top/bottom edge (not a layout-affecting border) so hovering
+         across rows during a drag never nudges neighbors' heights — only
+         opacity/scale animate in via CSS transition instead of popping in
+         instantly. Absolutely positioned against the outer `relative`
+         wrapper so it overlays between rows rather than living inside the
+         row's own padding box. -->
+    <div
+        class="absolute left-1 right-1 h-0 flex items-center pointer-events-none z-10 transition-opacity duration-150 origin-left"
+        class:opacity-100={dropZone === edge}
+        class:opacity-0={dropZone !== edge}
+        class:scale-x-100={dropZone === edge}
+        class:scale-x-90={dropZone !== edge}
+        style={edge === 'before' ? 'top: -1px;' : 'bottom: -1px;'}
+    >
+        <span class="w-1.5 h-1.5 rounded-full bg-primary shrink-0"></span>
+        <span class="flex-1 h-0.5 bg-primary rounded-full"></span>
+    </div>
+{/snippet}
+
 {#if node.kind === 'folder'}
 <div>
+    <div class="relative">
+        {@render dropLine('before')}
+        {@render dropLine('after')}
+        <div
+            role="button"
+            tabindex="0"
+            draggable={!isTouchDevice}
+            data-chat-tree-row
+            data-tree-kind={node.kind}
+            data-tree-id={selfId}
+            class="group flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton transition-[background-color,box-shadow,opacity] duration-150"
+            class:bg-red-900={node.folder.color === 'red'}
+            class:bg-yellow-900={node.folder.color === 'yellow'}
+            class:bg-green-900={node.folder.color === 'green'}
+            class:bg-blue-900={node.folder.color === 'blue'}
+            class:bg-indigo-900={node.folder.color === 'indigo'}
+            class:bg-purple-900={node.folder.color === 'purple'}
+            class:bg-pink-900={node.folder.color === 'pink'}
+            class:ring-2={dropZone === 'into'}
+            class:ring-primary={dropZone === 'into'}
+            class:bg-selected={dropZone === 'into'}
+            class:opacity-40={isBeingDragged}
+            onclick={toggleFold}
+            onkeydown={(e) => { if (e.key === 'Enter') toggleFold() }}
+            ondblclick={(e) => { e.stopPropagation(); startRename(node.folder.name ?? '') }}
+            onmousedown={handleMouseDown}
+            ondragstart={handleDragStart}
+            ondragend={handleDragEnd}
+            ondragover={handleDragOverFolder}
+            ondragleave={handleDragLeave}
+            ondrop={handleDropFolder}
+        >
+            {@render indentGuide()}
+            {@render gripHandle()}
+            {#if node.folder.folded}<ChevronRightIcon size={16} class="shrink-0"/>{:else}<ChevronDownIcon size={16} class="shrink-0"/>{/if}
+            <FolderIcon size={16} class="shrink-0"/>
+            <span class="grow truncate">{node.folder.name}</span>
+            <ShDropdownMenu>
+                <ShDropdownMenuTrigger>
+                    {#snippet child({ props })}
+                        <button {...props} class="text-textcolor2 hover:text-primary cursor-pointer" onclick={(e) => e.stopPropagation()}>
+                            <MoreVerticalIcon size={16}/>
+                        </button>
+                    {/snippet}
+                </ShDropdownMenuTrigger>
+                <ShDropdownMenuContent>
+                    <ShDropdownMenuItem onSelect={() => startRename(node.kind === 'folder' ? node.folder.name ?? '' : '')}>
+                        <PencilIcon/><span>이름 변경</span>
+                    </ShDropdownMenuItem>
+                    <ShDropdownMenuItem onSelect={() => node.kind === 'folder' && onMove('folder', node.folder.id)}>
+                        <FolderInputIcon/><span>이동</span>
+                    </ShDropdownMenuItem>
+                    <ShDropdownMenuItem onSelect={() => node.kind === 'folder' && changeFolderColor(node.folder.id)}>
+                        <PaletteIcon/><span>{language.changeFolderColor}</span>
+                    </ShDropdownMenuItem>
+                    <ShDropdownMenuSeparator/>
+                    <ShDropdownMenuItem class="text-red-400" onSelect={() => node.kind === 'folder' && deleteFolder(node)}>
+                        <TrashIcon/><span>삭제</span>
+                    </ShDropdownMenuItem>
+                </ShDropdownMenuContent>
+            </ShDropdownMenu>
+        </div>
+    </div>
+    {#if !node.folder.folded}
+        {#each node.children as child (child.kind === 'folder' ? child.folder.id : child.chat.id)}
+            <div animate:flip={{ duration: 200 }}>
+                <ChatTreeItem chara={chara} node={child} depth={depth + 1} onMove={onMove} dragState={dragState} draggingId={draggingId} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
+            </div>
+        {/each}
+    {/if}
+</div>
+{:else}
+<div class="relative">
+    {@render dropLine('before')}
+    {@render dropLine('after')}
     <div
         role="button"
         tabindex="0"
@@ -380,36 +483,22 @@
         data-chat-tree-row
         data-tree-kind={node.kind}
         data-tree-id={selfId}
-        class="group flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
-        class:bg-red-900={node.folder.color === 'red'}
-        class:bg-yellow-900={node.folder.color === 'yellow'}
-        class:bg-green-900={node.folder.color === 'green'}
-        class:bg-blue-900={node.folder.color === 'blue'}
-        class:bg-indigo-900={node.folder.color === 'indigo'}
-        class:bg-purple-900={node.folder.color === 'purple'}
-        class:bg-pink-900={node.folder.color === 'pink'}
-        class:ring-2={dropZone === 'into'}
-        class:ring-primary={dropZone === 'into'}
-        class:bg-selected={dropZone === 'into'}
-        class:border-t-4={dropZone === 'before'}
-        class:border-b-4={dropZone === 'after'}
-        class:border-primary={dropZone === 'before' || dropZone === 'after'}
-        class:opacity-50={pointerDragActive}
-        onclick={toggleFold}
-        onkeydown={(e) => { if (e.key === 'Enter') toggleFold() }}
-        ondblclick={(e) => { e.stopPropagation(); startRename(node.folder.name ?? '') }}
+        class="group flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton transition-[background-color,opacity] duration-150"
+        class:bg-selected={node.index === chara.chatPage && !$chatDeselected}
+        class:opacity-40={isBeingDragged}
+        onclick={() => changeChatTo(node.index)}
+        onkeydown={(e) => { if (e.key === 'Enter') changeChatTo(node.index) }}
+        ondblclick={(e) => { e.stopPropagation(); startRename(node.chat.name) }}
         onmousedown={handleMouseDown}
         ondragstart={handleDragStart}
         ondragend={handleDragEnd}
-        ondragover={handleDragOverFolder}
+        ondragover={handleDragOverChat}
         ondragleave={handleDragLeave}
-        ondrop={handleDropFolder}
+        ondrop={handleDropChat}
     >
         {@render indentGuide()}
         {@render gripHandle()}
-        {#if node.folder.folded}<ChevronRightIcon size={16} class="shrink-0"/>{:else}<ChevronDownIcon size={16} class="shrink-0"/>{/if}
-        <FolderIcon size={16} class="shrink-0"/>
-        <span class="grow truncate">{node.folder.name}</span>
+        <span class="grow truncate">{node.chat.name}</span>
         <ShDropdownMenu>
             <ShDropdownMenuTrigger>
                 {#snippet child({ props })}
@@ -419,82 +508,25 @@
                 {/snippet}
             </ShDropdownMenuTrigger>
             <ShDropdownMenuContent>
-                <ShDropdownMenuItem onSelect={() => startRename(node.kind === 'folder' ? node.folder.name ?? '' : '')}>
+                <ShDropdownMenuItem onSelect={() => startRename(node.kind === 'chat' ? node.chat.name : '')}>
                     <PencilIcon/><span>이름 변경</span>
                 </ShDropdownMenuItem>
-                <ShDropdownMenuItem onSelect={() => node.kind === 'folder' && onMove('folder', node.folder.id)}>
+                <ShDropdownMenuItem onSelect={() => node.kind === 'chat' && onMove('chat', node.chat.id)}>
                     <FolderInputIcon/><span>이동</span>
                 </ShDropdownMenuItem>
-                <ShDropdownMenuItem onSelect={() => node.kind === 'folder' && changeFolderColor(node.folder.id)}>
-                    <PaletteIcon/><span>{language.changeFolderColor}</span>
+                <ShDropdownMenuItem onSelect={() => node.kind === 'chat' && copyChat(node.chat)}>
+                    <CopyIcon/><span>복사</span>
+                </ShDropdownMenuItem>
+                <ShDropdownMenuItem onSelect={() => node.kind === 'chat' && exportChat(node.index)}>
+                    <DownloadIcon/><span>내보내기</span>
                 </ShDropdownMenuItem>
                 <ShDropdownMenuSeparator/>
-                <ShDropdownMenuItem class="text-red-400" onSelect={() => node.kind === 'folder' && deleteFolder(node)}>
+                <ShDropdownMenuItem class="text-red-400" onSelect={() => node.kind === 'chat' && deleteChat(node.chat)}>
                     <TrashIcon/><span>삭제</span>
                 </ShDropdownMenuItem>
             </ShDropdownMenuContent>
         </ShDropdownMenu>
     </div>
-    {#if !node.folder.folded}
-        {#each node.children as child (child.kind === 'folder' ? child.folder.id : child.chat.id)}
-            <ChatTreeItem chara={chara} node={child} depth={depth + 1} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
-        {/each}
-    {/if}
-</div>
-{:else}
-<div
-    role="button"
-    tabindex="0"
-    draggable={!isTouchDevice}
-    data-chat-tree-row
-    data-tree-kind={node.kind}
-    data-tree-id={selfId}
-    class="group flex items-center gap-1.5 p-2 rounded-md cursor-pointer text-textcolor hover:bg-darkbutton"
-    class:bg-selected={node.index === chara.chatPage && !$chatDeselected}
-    class:border-t-4={dropZone === 'before'}
-    class:border-b-4={dropZone === 'after'}
-    class:border-primary={dropZone === 'before' || dropZone === 'after'}
-    class:opacity-50={pointerDragActive}
-    onclick={() => changeChatTo(node.index)}
-    onkeydown={(e) => { if (e.key === 'Enter') changeChatTo(node.index) }}
-    ondblclick={(e) => { e.stopPropagation(); startRename(node.chat.name) }}
-    onmousedown={handleMouseDown}
-    ondragstart={handleDragStart}
-    ondragend={handleDragEnd}
-    ondragover={handleDragOverChat}
-    ondragleave={handleDragLeave}
-    ondrop={handleDropChat}
->
-    {@render indentGuide()}
-    {@render gripHandle()}
-    <span class="grow truncate">{node.chat.name}</span>
-    <ShDropdownMenu>
-        <ShDropdownMenuTrigger>
-            {#snippet child({ props })}
-                <button {...props} class="text-textcolor2 hover:text-primary cursor-pointer" onclick={(e) => e.stopPropagation()}>
-                    <MoreVerticalIcon size={16}/>
-                </button>
-            {/snippet}
-        </ShDropdownMenuTrigger>
-        <ShDropdownMenuContent>
-            <ShDropdownMenuItem onSelect={() => startRename(node.kind === 'chat' ? node.chat.name : '')}>
-                <PencilIcon/><span>이름 변경</span>
-            </ShDropdownMenuItem>
-            <ShDropdownMenuItem onSelect={() => node.kind === 'chat' && onMove('chat', node.chat.id)}>
-                <FolderInputIcon/><span>이동</span>
-            </ShDropdownMenuItem>
-            <ShDropdownMenuItem onSelect={() => node.kind === 'chat' && copyChat(node.chat)}>
-                <CopyIcon/><span>복사</span>
-            </ShDropdownMenuItem>
-            <ShDropdownMenuItem onSelect={() => node.kind === 'chat' && exportChat(node.index)}>
-                <DownloadIcon/><span>내보내기</span>
-            </ShDropdownMenuItem>
-            <ShDropdownMenuSeparator/>
-            <ShDropdownMenuItem class="text-red-400" onSelect={() => node.kind === 'chat' && deleteChat(node.chat)}>
-                <TrashIcon/><span>삭제</span>
-            </ShDropdownMenuItem>
-        </ShDropdownMenuContent>
-    </ShDropdownMenu>
 </div>
 {/if}
 

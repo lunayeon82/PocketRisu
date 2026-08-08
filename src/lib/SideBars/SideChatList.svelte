@@ -1,5 +1,6 @@
 <script lang="ts">
     import { v4 } from "uuid";
+    import { flip } from "svelte/animate";
     import { DownloadIcon, PencilIcon, HardDriveUploadIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon, PackageIcon } from "@lucide/svelte";
 
     import type { character, Chat, ChatFolder } from "src/ts/storage/database.svelte";
@@ -78,6 +79,13 @@
     let isDragging = $state(false)
     let dragHoverLabel = $state('')
 
+    // The id of whatever's currently being physically picked up — mirrors
+    // dragState.current.id but reactively, purely so the dragged row itself
+    // can dim (PC drag previously gave zero feedback that anything had
+    // started; touch already had this via pointerDragActive, now both paths
+    // share the same signal).
+    let draggingId: string | null = $state(null)
+
     // Shared "what's currently hovered" state — the single source of truth
     // for per-row drop-zone highlighting (ChatTreeItem's `dropZone` is
     // derived from this instead of tracking it locally). Native `dragover`
@@ -89,6 +97,7 @@
         dragState.current = { kind, id }
         isDragging = true
         dragHoverLabel = ''
+        draggingId = id
     }
 
     function onDragEnd() {
@@ -97,6 +106,7 @@
         dragHoverLabel = ''
         hoverTarget = null
         dragOverRoot = false
+        draggingId = null
     }
 
     function describeDrop(targetKind: 'chat' | 'folder', targetId: string, zone: 'before' | 'after' | 'into'): string {
@@ -387,7 +397,9 @@
     </div>
     <div class="flex flex-col mt-2 overflow-y-auto max-h-80">
         {#each tree as node (node.kind === 'folder' ? node.folder.id : node.chat.id)}
-            <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
+            <div animate:flip={{ duration: 200 }}>
+                <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} draggingId={draggingId} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
+            </div>
         {/each}
         {#if isDragging}
             <div
