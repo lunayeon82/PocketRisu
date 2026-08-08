@@ -6,7 +6,7 @@ const path = require('path');
 const net = require('net');
 const compression = require('compression');
 const htmlparser = require('node-html-parser');
-const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync } = require('fs');
+const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, renameSync } = require('fs');
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
 const zlib = require('zlib')
@@ -31,6 +31,28 @@ const {
     setSessionCookie, clearSessionCookie, requireLogin, requireAdmin, loginPageHtml, adminPageHtml,
     isAdmin, listUsers, getUserById, getUserByUsername, countAdmins, createUser, deleteUserById, updateUserPassword,
 } = require('./authGate.cjs');
+
+// ─── Per-account kv scoping ───────────────────────────────────────────────────
+// Every per-account kv key (database.bin, assets, coldstorage, etc.) is stored
+// under `u/<userId>/<original key>` so accounts never see each other's data.
+// See CLAUDE.md task notes / commit history for the full migration story.
+function resolveUserId(req) {
+    const session = getSession(req);
+    if (!session) return null;
+    const user = getUserByUsername(session.username);
+    return user ? user.id : null;
+}
+const USER_KEY_PREFIX = 'u/';
+function scopedKey(userId, key) {
+    return `${USER_KEY_PREFIX}${userId}/${key}`;
+}
+// Strip the scoping prefix back off before echoing key names to the client —
+// the client's generic storage adapter has no concept of accounts and expects
+// the exact key names it originally wrote (e.g. `assets/abc`), not `u/3/assets/abc`.
+function unscopedKey(userId, key) {
+    const prefix = scopedKey(userId, '');
+    return key.startsWith(prefix) ? key.slice(prefix.length) : key;
+}
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -40,8 +62,6 @@ const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasR
 const { mountChatApi } = require('./chatApi.cjs');
 const { mountChatFolderApi } = require('./chatFolderApi.cjs');
 const { mountLorebookApi } = require('./lorebookApi.cjs');
-let gdriveBackup;
-try { gdriveBackup = require('./gdrive-backup.cjs'); } catch { /* gdrive module unavailable */ }
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -65,8 +85,13 @@ let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
 
-// ETag for database.bin
-let dbEtag = null;
+// ETag for database.bin — per account.
+let dbEtagByUser = new Map();
+function getDbEtag(userId) { return dbEtagByUser.get(userId) ?? null; }
+function setDbEtag(userId, value) {
+    if (value === null || value === undefined) dbEtagByUser.delete(userId);
+    else dbEtagByUser.set(userId, value);
+}
 
 function computeBufferEtag(buffer) {
     return nodeCrypto.createHash('md5').update(buffer).digest('hex');
@@ -83,17 +108,28 @@ function queueStorageOperation(operation) {
     return operationRun;
 }
 
-const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
+// Per-account hex key for the in-memory dbCache/saveTimers maps. These maps
+// are indexed by the CLIENT's hex-encoded (unscoped) key, which collides
+// across accounts (two users' database.bin both hex-encode identically) —
+// so every dbCache/saveTimers lookup must go through this (or dbHexKeyFor,
+// its database.bin-specific alias) instead of the raw client `file-path`.
+function scopedHexKeyFor(userId, key) {
+    return Buffer.from(scopedKey(userId, key), 'utf-8').toString('hex');
+}
+function dbHexKeyFor(userId) {
+    return scopedHexKeyFor(userId, 'database/database.bin');
+}
 
 // ─── Persist failure tracking (Stage 1 visibility) ───────────────────────────
 // Debounced persist runs in setTimeout, so failures cannot be returned in the
 // triggering response. Record the latest failure here and surface it on the
-// next /api/patch response. Cleared on next successful persist.
-let lastPersistFailure = null;
+// next /api/patch response. Cleared on next successful persist. Per account.
+let lastPersistFailureByUser = new Map();
 
-function recordPersistFailure(error, source) {
+function recordPersistFailure(userId, error, source) {
     const message = String(error?.message || error || 'unknown error');
     const attemptedSize = typeof error?.attemptedSize === 'number' ? error.attemptedSize : null;
+    const lastPersistFailure = lastPersistFailureByUser.get(userId) || null;
     // Preserve timestamp when the failure is identical to the last one — every
     // debounce cycle re-records the same failure, and clients dedupe by ts.
     // Without this guard a fresh ts every 5s would re-fire the toast.
@@ -103,20 +139,20 @@ function recordPersistFailure(error, source) {
         && lastPersistFailure.attemptedSize === attemptedSize) {
         return;
     }
-    lastPersistFailure = {
+    lastPersistFailureByUser.set(userId, {
         timestamp: Date.now(),
         message,
         attemptedSize,
         source,
-    };
+    });
 }
 
-function clearPersistFailure() {
-    lastPersistFailure = null;
+function clearPersistFailure(userId) {
+    lastPersistFailureByUser.delete(userId);
 }
 
-function currentPersistWarning() {
-    return lastPersistFailure;
+function currentPersistWarning(userId) {
+    return lastPersistFailureByUser.get(userId) || null;
 }
 
 // ─── Server-side database backup (DB-only snapshots) ────────────────────────
@@ -136,8 +172,12 @@ const SNAPSHOT_LIMIT_MAX_BYTES = 50 * 1024 * 1024 * 1024; // 50 GB
 const BACKUP_INTERVAL_MS = process.env.POCKETRISU_BACKUP_INTERVAL_MS
     ? Number(process.env.POCKETRISU_BACKUP_INTERVAL_MS)
     : 5 * 60 * 1000; // 5 minutes (override for tests to force snapshot creation)
-let lastBackupTime = null;
+// Per-account cooldown tracking for createBackupAndRotate().
+let lastBackupTimeByUser = new Map();
 
+// Snapshot count/byte limits are intentionally GLOBAL config (not per account) —
+// confirmed with the project owner. config/snapshot-max-count and
+// config/snapshot-max-bytes are never scoped.
 function readSnapshotConfigInt(key, fallback, min, max) {
     try {
         const raw = kvGet(key);
@@ -164,14 +204,16 @@ function getSnapshotLimits() {
 // Walk newest → oldest; keep within both limits, delete the rest. The most
 // recent snapshot is always kept (even if it alone exceeds the byte limit) so
 // we never end up with zero backups after a config change.
-function trimSnapshotsToLimits() {
+function trimSnapshotsToLimits(userId) {
     const { maxCount, maxBytes } = getSnapshotLimits();
+    const scopedPrefix = scopedKey(userId, DB_BACKUP_PREFIX);
     // Size each snapshot by its marginal disk cost (chunks not shared with the
     // live blob), not its logical size — chunked snapshots share chunks, so a
     // logical measure would over-trim ones that cost almost nothing on disk.
-    const entries = kvList(DB_BACKUP_PREFIX)
+    const entries = kvList(scopedPrefix)
         .map((key) => {
-            const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
+            const unscoped = unscopedKey(userId, key);
+            const tsRaw = parseInt(unscoped.slice(DB_BACKUP_PREFIX.length, -4), 10);
             return { key, size: snapshotFootprint(key), ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
         })
         .sort((a, b) => b.ts - a.ts);
@@ -200,8 +242,8 @@ function trimSnapshotsToLimits() {
 //   logicalBytes — sum of each snapshot's full logical size (kvSize), i.e. what
 //                  the snapshots would cost WITHOUT dedup. Drives the "saved by
 //                  deduplication" figure; never used for trimming.
-function snapshotUsage() {
-    const keys = kvList(DB_BACKUP_PREFIX);
+function snapshotUsage(userId) {
+    const keys = kvList(scopedKey(userId, DB_BACKUP_PREFIX));
     let bytes = 0, logicalBytes = 0;
     for (const k of keys) {
         bytes += snapshotFootprint(k);
@@ -210,36 +252,39 @@ function snapshotUsage() {
     return { count: keys.length, bytes, logicalBytes };
 }
 
-function createBackupAndRotate() {
+function createBackupAndRotate(userId) {
     const now = Date.now();
+    const lastBackupTime = lastBackupTimeByUser.get(userId);
     if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
         return;
     }
-    lastBackupTime = now;
+    lastBackupTimeByUser.set(userId, now);
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
-    kvCopyValue('database/database.bin', backupKey);
-    trimSnapshotsToLimits();
+    kvCopyValue(scopedKey(userId, 'database/database.bin'), scopedKey(userId, backupKey));
+    trimSnapshotsToLimits(userId);
 }
 
-async function flushPendingDb() {
-    if (saveTimers[DB_HEX_KEY]) {
-        clearTimeout(saveTimers[DB_HEX_KEY]);
-        delete saveTimers[DB_HEX_KEY];
-        if (dbCache[DB_HEX_KEY]) {
-            await persistDbCache(DB_HEX_KEY, 'database/database.bin');
+async function flushPendingDb(userId) {
+    const hexKey = dbHexKeyFor(userId);
+    if (saveTimers[hexKey]) {
+        clearTimeout(saveTimers[hexKey]);
+        delete saveTimers[hexKey];
+        if (dbCache[hexKey]) {
+            await persistDbCache(userId, hexKey, 'database/database.bin');
         }
-        createBackupAndRotate();
+        createBackupAndRotate(userId);
     }
 }
 
-function invalidateDbCache() {
-    delete dbCache[DB_HEX_KEY];
-    if (saveTimers[DB_HEX_KEY]) {
-        clearTimeout(saveTimers[DB_HEX_KEY]);
-        delete saveTimers[DB_HEX_KEY];
+function invalidateDbCache(userId) {
+    const hexKey = dbHexKeyFor(userId);
+    delete dbCache[hexKey];
+    if (saveTimers[hexKey]) {
+        clearTimeout(saveTimers[hexKey]);
+        delete saveTimers[hexKey];
     }
-    dbEtag = null;
+    setDbEtag(userId, null);
 }
 
 // ─── Chat runtime lazy load helpers ─────────────────────────────────────────
@@ -266,14 +311,14 @@ function normalizeOrphanFolderIds(dbObj) {
     return changed;
 }
 
-async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
+async function decodeDatabaseWithPersistentChatIds(userId, raw, options = {}) {
     const { createBackup = false, migrationResult = null } = options;
     // Convert legacy REMOTE-block layouts to inline format before decoding.
     // If migration ran it overwrote database.bin, so the caller's `raw` is
     // stale and we re-read from KV. Idempotent on the no-op path.
-    const migration = await migrateRemoteBlocksIfNeeded();
+    const migration = await migrateRemoteBlocksIfNeeded(userId);
     if (migration.ran) {
-        const fresh = kvGet('database/database.bin');
+        const fresh = kvGet(scopedKey(userId, 'database/database.bin'));
         if (fresh) raw = fresh;
     }
     const dbObj = normalizeJSON(await decodeRisuSave(raw));
@@ -286,7 +331,7 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     // This runs when upstream data first enters NodeOnly (backup import or save folder copy).
     // After restore, the coldstorage field is removed and the clean DB is persisted.
     // Failed characters are promoted to safe blank characters — their KV data is preserved for manual recovery.
-    const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
+    const coldRestoreResult = restoreColdStorageCharactersInDb(userId, dbObj);
     if (coldRestoreResult.restored > 0 || coldRestoreResult.failed > 0) needsPersist = true;
     if (coldRestoreResult.failed > 0) {
         logger.error(`[ColdStorage] ${coldRestoreResult.failed} character(s) could not be restored and were converted to safe blank characters. Cold storage KV data is preserved.`);
@@ -296,9 +341,9 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     }
 
     if (needsPersist) {
-        kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
+        kvSet(scopedKey(userId, 'database/database.bin'), Buffer.from(encodeRisuSaveLegacy(dbObj)));
         if (createBackup) {
-            createBackupAndRotate();
+            createBackupAndRotate(userId);
         }
     }
     if (migrationResult) {
@@ -345,37 +390,39 @@ function stripChatsFromDb(dbObj) {
 // import — which wipes most KV prefixes and INSERTs a new database.bin — naturally
 // clears it, letting the new contents be re-evaluated.
 
+// Per-account marker key — each account's own database.bin independently
+// needs this one-time check (unlike config/* keys, which stay global).
 const REMOTE_MIGRATION_MARKER_KEY = 'migration/disable-remote-saving';
 const REMOTE_MIGRATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
 
-function isRemoteMigrationDone() {
-    const value = kvGet(REMOTE_MIGRATION_MARKER_KEY);
+function isRemoteMigrationDone(userId) {
+    const value = kvGet(scopedKey(userId, REMOTE_MIGRATION_MARKER_KEY));
     return value !== null && value.length > 0;
 }
 
-function markRemoteMigrationDone() {
-    kvSet(REMOTE_MIGRATION_MARKER_KEY, REMOTE_MIGRATION_MARKER_VALUE);
+function markRemoteMigrationDone(userId) {
+    kvSet(scopedKey(userId, REMOTE_MIGRATION_MARKER_KEY), REMOTE_MIGRATION_MARKER_VALUE);
 }
 
 /**
  * Convert any leftover REMOTE blocks in database.bin into inline raw blocks.
  * Safe to call repeatedly: idempotent via KV marker.
  */
-async function migrateRemoteBlocksIfNeeded() {
-    if (isRemoteMigrationDone()) return { ran: false, reason: 'already-done' };
+async function migrateRemoteBlocksIfNeeded(userId) {
+    if (isRemoteMigrationDone(userId)) return { ran: false, reason: 'already-done' };
 
-    const raw = kvGet('database/database.bin');
+    const raw = kvGet(scopedKey(userId, 'database/database.bin'));
     if (!raw) {
-        markRemoteMigrationDone();
+        markRemoteMigrationDone(userId);
         return { ran: false, reason: 'no-database' };
     }
 
     if (!hasRemoteBlocks(raw)) {
-        markRemoteMigrationDone();
+        markRemoteMigrationDone(userId);
         return { ran: false, reason: 'no-remote-blocks' };
     }
 
-    logger.info('[Migration] REMOTE blocks detected in database.bin; converting to inline format');
+    logger.info(`[Migration] REMOTE blocks detected in database.bin (user ${userId}); converting to inline format`);
 
     // Pre-migration backup so a botched migration can be rolled back manually.
     // Use a dedicated prefix — `database/dbbackup-` is on a 20-snapshot rotation
@@ -383,11 +430,11 @@ async function migrateRemoteBlocksIfNeeded() {
     // non-numeric suffix), making it the first to evict. The migration safety
     // net must outlive ordinary backup churn.
     const backupKey = `migration-backup/pre-remote-fix-${Date.now()}.bin`;
-    kvCopyValue('database/database.bin', backupKey);
+    kvCopyValue(scopedKey(userId, 'database/database.bin'), scopedKey(userId, backupKey));
 
     const dbObj = await decodeRisuSave(raw, {
         resolveRemote: async (name) => {
-            const value = kvGet(`remotes/${name}.local.bin`);
+            const value = kvGet(scopedKey(userId, `remotes/${name}.local.bin`));
             return value || null;
         },
     });
@@ -405,32 +452,34 @@ async function migrateRemoteBlocksIfNeeded() {
     // (NodeOnly's disableRemoteSaving = true on writes), so leaving them
     // costs a few MB of disk for full backup recoverability.
     sqliteDb.transaction(() => {
-        kvSet('database/database.bin', Buffer.from(reEncoded));
-        markRemoteMigrationDone();
+        kvSet(scopedKey(userId, 'database/database.bin'), Buffer.from(reEncoded));
+        markRemoteMigrationDone(userId);
     })();
 
     // Reset in-memory caches whose contents were derived from the pre-migration
     // bytes — next reader recomputes from the migrated database.bin.
-    invalidateDbCache();
-    dbEtag = null;
+    invalidateDbCache(userId);
+    setDbEtag(userId, null);
 
     const characterCount = Array.isArray(dbObj.characters) ? dbObj.characters.length : 0;
-    logger.info(`[Migration] Remote-block migration complete. Inlined ${characterCount} character(s); pre-migration backup at ${backupKey}`);
+    logger.info(`[Migration] Remote-block migration complete for user ${userId}. Inlined ${characterCount} character(s); pre-migration backup at ${backupKey}`);
     return { ran: true, characterCount, backupKey };
 }
 
 /**
  * Persist dbCache to disk. database.bin no longer carries chats (see
  * stripChatsFromDb), so dbCache already holds exactly what should land on
- * disk — no reassemble/merge step needed.
+ * disk — no reassemble/merge step needed. `decodedKey` is the UNSCOPED
+ * logical key (e.g. 'database/database.bin'); the caller's userId scopes it.
  */
-async function persistDbCache(filePath, decodedKey) {
+async function persistDbCache(userId, filePath, decodedKey) {
     const db = dbCache[filePath];
     if (!db) return;
 
     const data = Buffer.from(encodeRisuSaveLegacy(db));
+    const scopedDecodedKey = scopedKey(userId, decodedKey);
     try {
-        kvSet(decodedKey, data);
+        kvSet(scopedDecodedKey, data);
     } catch (err) {
         // Tag with BLOB size so the visibility layer can surface it to the user.
         // The dominant failure mode (better-sqlite3 INT_MAX) is size-driven.
@@ -556,6 +605,11 @@ if(!existsSync(backupsDir)){
 }
 writeBackupPathMarker(backupsDir);
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
+// Per-account server-backup subdirectory. `config/server-backup-path` (the
+// parent path) stays global config — the files under it are per-account.
+function backupsDirFor(userId) {
+    return path.join(backupsDir, String(userId));
+}
 
 const passwordPath = path.join(process.cwd(), 'save', '__password')
 if(existsSync(passwordPath)){
@@ -764,33 +818,43 @@ function normalizeInlayExt(ext) {
 
 const resolvedInlayDir = path.resolve(inlayDir) + path.sep;
 
+// Per-account inlay directory: save/inlays/<userId>/. `userId === null` is
+// reserved for the legacy one-time migrateInlaysToFilesystem() boot migration,
+// which predates accounts and still operates on the flat top-level inlayDir —
+// those files get relocated into the admin's subdirectory by the new one-time
+// per-account migration (see migratePerAccountData()).
+function inlayDirFor(userId) {
+    return (userId === null || userId === undefined) ? inlayDir : path.join(inlayDir, String(userId));
+}
+
 function assertInsideInlayDir(filePath) {
     if (!path.resolve(filePath).startsWith(resolvedInlayDir)) {
         throw new Error(`Path escapes inlay directory: ${filePath}`);
     }
 }
 
-function getInlayFilePath(id, ext) {
+function getInlayFilePath(userId, id, ext) {
     if (!isSafeInlayId(id)) throw new Error(`Invalid inlay id: ${id}`);
-    const p = path.join(inlayDir, `${id}.${normalizeInlayExt(ext)}`);
+    const p = path.join(inlayDirFor(userId), `${id}.${normalizeInlayExt(ext)}`);
     assertInsideInlayDir(p);
     return p;
 }
 
-function getInlaySidecarPath(id) {
+function getInlaySidecarPath(userId, id) {
     if (!isSafeInlayId(id)) throw new Error(`Invalid inlay id: ${id}`);
-    const p = path.join(inlayDir, `${id}.meta.json`);
+    const p = path.join(inlayDirFor(userId), `${id}.meta.json`);
     assertInsideInlayDir(p);
     return p;
 }
 
-async function ensureInlayDir() {
-    await fs.mkdir(inlayDir, { recursive: true });
+async function ensureInlayDir(userId) {
+    await fs.mkdir(inlayDirFor(userId), { recursive: true });
 }
 
-function ensureInlayDirSync() {
-    if (!existsSync(inlayDir)) {
-        mkdirSync(inlayDir, { recursive: true });
+function ensureInlayDirSync(userId) {
+    const dir = inlayDirFor(userId);
+    if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
     }
 }
 
@@ -817,9 +881,9 @@ function encodeDataUri(buffer, mime) {
     return `data:${mime || 'application/octet-stream'};base64,${Buffer.from(buffer).toString('base64')}`;
 }
 
-async function readInlaySidecar(id) {
+async function readInlaySidecar(userId, id) {
     try {
-        const raw = await fs.readFile(getInlaySidecarPath(id), 'utf-8');
+        const raw = await fs.readFile(getInlaySidecarPath(userId, id), 'utf-8');
         const parsed = JSON.parse(raw);
         return {
             ext: normalizeInlayExt(parsed?.ext),
@@ -833,52 +897,54 @@ async function readInlaySidecar(id) {
     }
 }
 
-async function resolveInlayFilePath(id) {
+async function resolveInlayFilePath(userId, id) {
     if (!isSafeInlayId(id)) return null;
-    const sidecar = await readInlaySidecar(id);
+    const dir = inlayDirFor(userId);
+    const sidecar = await readInlaySidecar(userId, id);
     if (sidecar) {
-        const candidate = getInlayFilePath(id, sidecar.ext);
+        const candidate = getInlayFilePath(userId, id, sidecar.ext);
         try { await fs.access(candidate); return candidate; } catch {}
     }
     // Fallback: scan directory (covers pre-sidecar files or mismatched ext)
     try {
-        const entries = await fs.readdir(inlayDir, { withFileTypes: true });
+        const entries = await fs.readdir(dir, { withFileTypes: true });
         const match = entries.find((entry) => (
             entry.isFile() &&
             entry.name.startsWith(`${id}.`) &&
             entry.name !== `${id}.meta.json`
         ));
-        return match ? path.join(inlayDir, match.name) : null;
+        return match ? path.join(dir, match.name) : null;
     } catch {
         return null;
     }
 }
 
-function resolveInlayFilePathSync(id) {
+function resolveInlayFilePathSync(userId, id) {
     if (!isSafeInlayId(id)) return null;
+    const dir = inlayDirFor(userId);
     try {
-        const raw = readFileSync(getInlaySidecarPath(id), 'utf-8');
+        const raw = readFileSync(getInlaySidecarPath(userId, id), 'utf-8');
         const parsed = JSON.parse(raw);
         const ext = normalizeInlayExt(parsed?.ext);
-        const candidate = getInlayFilePath(id, ext);
+        const candidate = getInlayFilePath(userId, id, ext);
         if (existsSync(candidate)) return candidate;
     } catch {}
     // Fallback: scan directory
     try {
-        const entries = readdirSync(inlayDir, { withFileTypes: true });
+        const entries = readdirSync(dir, { withFileTypes: true });
         const match = entries.find((entry) => (
             entry.isFile() &&
             entry.name.startsWith(`${id}.`) &&
             entry.name !== `${id}.meta.json`
         ));
-        return match ? path.join(inlayDir, match.name) : null;
+        return match ? path.join(dir, match.name) : null;
     } catch {
         return null;
     }
 }
 
-async function readInlayFile(id) {
-    const filePath = await resolveInlayFilePath(id);
+async function readInlayFile(userId, id) {
+    const filePath = await resolveInlayFilePath(userId, id);
     if (!filePath) return null;
     const ext = normalizeInlayExt(path.extname(filePath).slice(1));
     const buffer = await fs.readFile(filePath);
@@ -892,8 +958,8 @@ async function readInlayFile(id) {
     };
 }
 
-async function writeInlaySidecar(id, info) {
-    await ensureInlayDir();
+async function writeInlaySidecar(userId, id, info) {
+    await ensureInlayDir(userId);
     const sidecar = {
         ext: normalizeInlayExt(info?.ext),
         name: typeof info?.name === 'string' ? info.name : id,
@@ -901,11 +967,11 @@ async function writeInlaySidecar(id, info) {
         height: typeof info?.height === 'number' ? info.height : undefined,
         width: typeof info?.width === 'number' ? info.width : undefined,
     };
-    await fs.writeFile(getInlaySidecarPath(id), JSON.stringify(sidecar));
+    await fs.writeFile(getInlaySidecarPath(userId, id), JSON.stringify(sidecar));
 }
 
-function writeInlaySidecarSync(id, info) {
-    ensureInlayDirSync();
+function writeInlaySidecarSync(userId, id, info) {
+    ensureInlayDirSync(userId);
     const sidecar = {
         ext: normalizeInlayExt(info?.ext),
         name: typeof info?.name === 'string' ? info.name : id,
@@ -913,39 +979,39 @@ function writeInlaySidecarSync(id, info) {
         height: typeof info?.height === 'number' ? info.height : undefined,
         width: typeof info?.width === 'number' ? info.width : undefined,
     };
-    writeFileSync(getInlaySidecarPath(id), JSON.stringify(sidecar));
+    writeFileSync(getInlaySidecarPath(userId, id), JSON.stringify(sidecar));
 }
 
-async function writeInlayFile(id, ext, buffer, info = null) {
-    await ensureInlayDir();
-    await deleteInlayRawFile(id);
+async function writeInlayFile(userId, id, ext, buffer, info = null) {
+    await ensureInlayDir(userId);
+    await deleteInlayRawFile(userId, id);
     const normalizedExt = normalizeInlayExt(ext);
-    await fs.writeFile(getInlayFilePath(id, normalizedExt), Buffer.from(buffer));
-    await writeInlaySidecar(id, {
+    await fs.writeFile(getInlayFilePath(userId, id, normalizedExt), Buffer.from(buffer));
+    await writeInlaySidecar(userId, id, {
         ...(info || {}),
         ext: normalizedExt,
     });
 }
 
-function writeInlayFileSync(id, ext, buffer, info = null) {
-    ensureInlayDirSync();
-    deleteInlayRawFileSync(id);
+function writeInlayFileSync(userId, id, ext, buffer, info = null) {
+    ensureInlayDirSync(userId);
+    deleteInlayRawFileSync(userId, id);
     const normalizedExt = normalizeInlayExt(ext);
-    writeFileSync(getInlayFilePath(id, normalizedExt), Buffer.from(buffer));
-    writeInlaySidecarSync(id, {
+    writeFileSync(getInlayFilePath(userId, id, normalizedExt), Buffer.from(buffer));
+    writeInlaySidecarSync(userId, id, {
         ...(info || {}),
         ext: normalizedExt,
     });
 }
 
-async function deleteInlayRawFile(id) {
-    const filePath = await resolveInlayFilePath(id);
+async function deleteInlayRawFile(userId, id) {
+    const filePath = await resolveInlayFilePath(userId, id);
     if (!filePath) return;
     await fs.unlink(filePath).catch(() => {});
 }
 
-function deleteInlayRawFileSync(id) {
-    const filePath = resolveInlayFilePathSync(id);
+function deleteInlayRawFileSync(userId, id) {
+    const filePath = resolveInlayFilePathSync(userId, id);
     if (!filePath) return;
     try {
         unlinkSync(filePath);
@@ -954,23 +1020,24 @@ function deleteInlayRawFileSync(id) {
     }
 }
 
-async function deleteInlayFile(id) {
-    await deleteInlayRawFile(id);
-    await fs.unlink(getInlaySidecarPath(id)).catch(() => {});
+async function deleteInlayFile(userId, id) {
+    await deleteInlayRawFile(userId, id);
+    await fs.unlink(getInlaySidecarPath(userId, id)).catch(() => {});
 }
 
-function deleteInlayFileSync(id) {
-    deleteInlayRawFileSync(id);
+function deleteInlayFileSync(userId, id) {
+    deleteInlayRawFileSync(userId, id);
     try {
-        unlinkSync(getInlaySidecarPath(id));
+        unlinkSync(getInlaySidecarPath(userId, id));
     } catch {
         // ignore
     }
 }
 
-async function listInlayFiles() {
-    await ensureInlayDir();
-    const entries = await fs.readdir(inlayDir, { withFileTypes: true });
+async function listInlayFiles(userId) {
+    await ensureInlayDir(userId);
+    const dir = inlayDirFor(userId);
+    const entries = await fs.readdir(dir, { withFileTypes: true });
     return entries
         .filter((entry) => (
             entry.isFile() &&
@@ -980,13 +1047,16 @@ async function listInlayFiles() {
         .map((entry) => {
             const ext = normalizeInlayExt(path.extname(entry.name).slice(1));
             const id = entry.name.slice(0, -(ext.length + 1));
-            return { id, ext, filePath: path.join(inlayDir, entry.name) };
+            return { id, ext, filePath: path.join(dir, entry.name) };
         })
         .filter((entry) => isSafeInlayId(entry.id));
 }
 
-async function readInlayLegacyInfo(id) {
-    const value = kvGet(`inlay_info/${id}`);
+// userId === null reads the legacy unscoped `inlay_info/<id>` key — used only
+// by the boot-time migrateInlaysToFilesystem() pre-account migration.
+async function readInlayLegacyInfo(userId, id) {
+    const key = (userId === null || userId === undefined) ? `inlay_info/${id}` : scopedKey(userId, `inlay_info/${id}`);
+    const value = kvGet(key);
     if (!value) return null;
     try {
         const parsed = JSON.parse(value.toString('utf-8'));
@@ -1002,18 +1072,18 @@ async function readInlayLegacyInfo(id) {
     }
 }
 
-async function readInlayInfoPayload(id) {
-    const sidecar = await readInlaySidecar(id);
+async function readInlayInfoPayload(userId, id) {
+    const sidecar = await readInlaySidecar(userId, id);
     if (sidecar) return Buffer.from(JSON.stringify(sidecar));
-    const legacy = await readInlayLegacyInfo(id);
+    const legacy = await readInlayLegacyInfo(userId, id);
     if (legacy) return Buffer.from(JSON.stringify(legacy));
-    return kvGet(`inlay_info/${id}`);
+    return kvGet(scopedKey(userId, `inlay_info/${id}`));
 }
 
-async function readInlayAssetPayload(id) {
-    const file = await readInlayFile(id);
+async function readInlayAssetPayload(userId, id) {
+    const file = await readInlayFile(userId, id);
     if (!file) return null;
-    const sidecar = (await readInlaySidecar(id)) || (await readInlayLegacyInfo(id));
+    const sidecar = (await readInlaySidecar(userId, id)) || (await readInlayLegacyInfo(userId, id));
     const info = {
         ext: sidecar?.ext || file.ext,
         name: sidecar?.name || id,
@@ -1030,15 +1100,19 @@ async function readInlayAssetPayload(id) {
     }));
 }
 
+// Legacy one-time migration (kv 'inlay/' blobs → flat top-level filesystem),
+// predates per-account accounts entirely. Operates on the flat/unscoped
+// inlayDir (userId=null) — the new per-account migration below relocates
+// whatever this leaves at the top level into the admin's subdirectory.
 async function migrateInlaysToFilesystem() {
-    await ensureInlayDir();
+    await ensureInlayDir(null);
     if (existsSync(inlayMigrationMarker)) return;
 
     const keys = kvList('inlay/');
     for (const key of keys) {
         const id = key.slice('inlay/'.length);
         if (!isSafeInlayId(id)) continue;
-        const fileAlreadyExists = await readInlayFile(id);
+        const fileAlreadyExists = await readInlayFile(null, id);
         if (fileAlreadyExists) {
             kvDel(key);
             kvDel(`inlay_thumb/${id}`);
@@ -1057,14 +1131,14 @@ async function migrateInlaysToFilesystem() {
             } else {
                 buffer = decodeDataUri(parsed?.data).buffer;
             }
-            const info = (await readInlayLegacyInfo(id)) || {
+            const info = (await readInlayLegacyInfo(null, id)) || {
                 ext,
                 name: typeof parsed?.name === 'string' ? parsed.name : id,
                 type,
                 height: typeof parsed?.height === 'number' ? parsed.height : undefined,
                 width: typeof parsed?.width === 'number' ? parsed.width : undefined,
             };
-            await writeInlayFile(id, ext, buffer, info);
+            await writeInlayFile(null, id, ext, buffer, info);
             kvDel(key);
             kvDel(`inlay_thumb/${id}`);
             kvDel(`inlay_info/${id}`);
@@ -1175,13 +1249,19 @@ async function checkDiskSpace(requiredBytes) {
 // ── Active writer session (single-writer lock) ────────────────────────────────
 // Mirrors the BroadcastChannel-based tab lock on the server side so that the
 // same protection extends across devices. The last client to call /api/session
-// becomes the active writer; older sessions receive 423 on write attempts.
-let activeSessionId = null // string | null
+// becomes that ACCOUNT's active writer; older sessions of the SAME account
+// receive 423 on write attempts. Per-account (Map<userId, sessionId>) since
+// the per-account kv split — a single shared lock here would let one account
+// opening a new tab 423-lock a completely unrelated account's writes, exactly
+// the cross-account interference CLAUDE.md already warned against doing to
+// chatApi.cjs for the same reason.
+let activeSessionIdByUser = new Map() // userId -> string
 
-function checkActiveSession(req, res) {
+function checkActiveSession(req, res, userId) {
     const clientSessionId = req.headers['x-session-id']
     if (!clientSessionId) return true  // client without session support
-    if (!activeSessionId) return true  // no session registered yet
+    const activeSessionId = activeSessionIdByUser.get(userId)
+    if (!activeSessionId) return true  // no session registered yet for this account
     if (clientSessionId === activeSessionId) return true
     res.status(423).json({ error: 'Session deactivated' })
     return false
@@ -1762,16 +1842,20 @@ function encodeColdStorageCanonicalBuffer(coldData) {
     return Buffer.from(zlib.gzipSync(Buffer.from(JSON.stringify(coldData), 'utf-8')));
 }
 
-function readColdStorageJsonEntry(nameOrKey, options = {}) {
+function readColdStorageJsonEntry(userId, nameOrKey, options = {}) {
     const { migrateLegacy = false, allowPlainJsonFallback = false } = options;
     const canonicalKey = normalizeColdStorageStorageKey(nameOrKey);
     const legacyBackupKey = `${canonicalKey}.json`;
+    const scopedCanonicalKey = scopedKey(userId, canonicalKey);
+    const scopedLegacyBackupKey = scopedKey(userId, legacyBackupKey);
 
     let storageKey = canonicalKey;
-    let value = kvGet(canonicalKey);
+    let scopedStorageKey = scopedCanonicalKey;
+    let value = kvGet(scopedCanonicalKey);
     if (!value) {
         storageKey = legacyBackupKey;
-        value = kvGet(legacyBackupKey);
+        scopedStorageKey = scopedLegacyBackupKey;
+        value = kvGet(scopedLegacyBackupKey);
     }
     if (!value) {
         return null;
@@ -1782,9 +1866,9 @@ function readColdStorageJsonEntry(nameOrKey, options = {}) {
     });
 
     if (migrateLegacy && (storageKey !== canonicalKey || parsed.format !== 'gzip')) {
-        kvSet(canonicalKey, encodeColdStorageCanonicalBuffer(parsed.coldData));
+        kvSet(scopedCanonicalKey, encodeColdStorageCanonicalBuffer(parsed.coldData));
         if (storageKey !== canonicalKey) {
-            kvDel(storageKey);
+            kvDel(scopedStorageKey);
         }
     }
 
@@ -1796,13 +1880,13 @@ function readColdStorageJsonEntry(nameOrKey, options = {}) {
     };
 }
 
-function listColdStorageBackupEntries() {
+function listColdStorageBackupEntries(userId) {
     const canonicalKeys = Array.from(new Set(
-        kvList('coldstorage/').map((key) => normalizeColdStorageStorageKey(key))
+        kvList(scopedKey(userId, 'coldstorage/')).map((key) => normalizeColdStorageStorageKey(unscopedKey(userId, key)))
     )).sort((a, b) => a.localeCompare(b));
 
     return canonicalKeys.map((storageKey) => {
-        const entry = readColdStorageJsonEntry(storageKey, {
+        const entry = readColdStorageJsonEntry(userId, storageKey, {
             migrateLegacy: true,
             allowPlainJsonFallback: true,
         });
@@ -1895,7 +1979,8 @@ function parseBackupChunk(buffer, onEntry) {
 
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
-async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
+// Wipes and restores ONLY `userId`'s own namespace — never another account's.
+async function importBackupFromSource(userId, dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
     const BATCH_SIZE = 5000;
     // Defer Buffer.concat until enough bytes for the next entry are buffered.
     // Concatenating on every chunk arrival is O(n²) when a single entry (e.g.
@@ -1913,8 +1998,10 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     const explicitSidecarMap = new Map();
     const legacyInlayInfoMap = new Map();
 
-    const stagingDir = path.join(savePath, 'inlays_import_staging');
-    const backupInlayDir = path.join(savePath, 'inlays_import_backup');
+    // Per-account staging directories so concurrent imports by different
+    // accounts never collide.
+    const stagingDir = path.join(savePath, `inlays_import_staging_${userId}`);
+    const backupInlayDir = path.join(savePath, `inlays_import_backup_${userId}`);
     await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.rm(backupInlayDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
@@ -1948,32 +2035,37 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         writeFileSync(stagingSidecarPath(id), JSON.stringify(sidecar));
     }
 
-    await flushPendingDb();
-    createBackupAndRotate();
+    await flushPendingDb(userId);
+    createBackupAndRotate(userId);
 
     sqliteDb.pragma('synchronous = OFF');
 
     sqliteDb.exec('BEGIN');
-    kvDelPrefix('assets/');
-    kvDelPrefix('inlay/');
-    kvDelPrefix('inlay_thumb/');
-    kvDelPrefix('inlay_meta/');
-    kvDelPrefix('inlay_info/');
-    kvDelPrefix('coldstorage/');
+    kvDelPrefix(scopedKey(userId, 'assets/'));
+    kvDelPrefix(scopedKey(userId, 'inlay/'));
+    kvDelPrefix(scopedKey(userId, 'inlay_thumb/'));
+    kvDelPrefix(scopedKey(userId, 'inlay_meta/'));
+    kvDelPrefix(scopedKey(userId, 'inlay_info/'));
+    kvDelPrefix(scopedKey(userId, 'coldstorage/'));
     // Composer drafts are session/device-local and not carried in the backup;
     // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
-    kvDelPrefix('drafts/');
+    kvDelPrefix(scopedKey(userId, 'drafts/'));
     // Same reasoning as clearExistingData (save-folder import path): wipe stale
     // remote payloads from the prior user before this backup's contents land.
     // .bin backups never carry REMOTE blocks today, so the migration won't
     // resolveRemote on them — but keeping the two import paths consistent
     // avoids a contamination regression if that ever changes (upstream sync,
     // plugin-generated buffers, etc.).
-    kvDelPrefix('remotes/');
+    kvDelPrefix(scopedKey(userId, 'remotes/'));
     // Allow remote-block migration to re-evaluate against the new database.bin.
     // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
     // format only — but a fresh import is a clear "data changed" signal.)
-    kvDel(REMOTE_MIGRATION_MARKER_KEY);
+    kvDel(scopedKey(userId, REMOTE_MIGRATION_MARKER_KEY));
+    // NOTE: clearEntities() clears orphaned legacy entity tables (characters/
+    // chats/settings/presets/modules) shared across the whole DB file, not a
+    // per-account kv prefix. Those tables are pre-kv-migration leftovers with
+    // no per-account data ever written to them (see db.cjs) — safe to leave
+    // as a global, harmless no-op clear.
     clearEntities();
 
     try {
@@ -2067,7 +2159,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                             parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
                         )
                         : data;
-                    kvSet(storageKey, storageValue);
+                    kvSet(scopedKey(userId, storageKey), storageValue);
                     if (storageKey === 'database/database.bin') {
                         hasDatabase = true;
                     } else {
@@ -2124,31 +2216,34 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         sqliteDb.pragma('synchronous = NORMAL');
     }
 
-    await ensureInlayDir();
+    const userInlayDir = inlayDirFor(userId);
+    await ensureInlayDir(userId);
     try {
-        if (existsSync(inlayDir)) {
-            await fs.rename(inlayDir, backupInlayDir);
+        if (existsSync(userInlayDir)) {
+            await fs.rename(userInlayDir, backupInlayDir);
         }
-        await fs.rename(stagingDir, inlayDir);
+        await fs.rename(stagingDir, userInlayDir);
+        // Global marker: confirms the (unrelated, pre-account) legacy kv→fs
+        // migration is done, so it never re-runs against a per-account layout.
         await fs.writeFile(inlayMigrationMarker, new Date().toISOString(), 'utf-8');
         await fs.rm(backupInlayDir, { recursive: true, force: true }).catch(() => {});
     } catch (swapError) {
         if (existsSync(backupInlayDir)) {
-            await fs.rm(inlayDir, { recursive: true, force: true }).catch(() => {});
-            await fs.rename(backupInlayDir, inlayDir).catch(() => {});
+            await fs.rm(userInlayDir, { recursive: true, force: true }).catch(() => {});
+            await fs.rename(backupInlayDir, userInlayDir).catch(() => {});
         }
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
         throw swapError;
     }
 
-    invalidateDbCache();
+    invalidateDbCache(userId);
 
     // Trigger cold storage migration now so import result includes failure count.
-    const dbRaw = kvGet('database/database.bin');
+    const dbRaw = kvGet(scopedKey(userId, 'database/database.bin'));
     let coldStorageFailed = 0;
     if (dbRaw) {
         const migration = {};
-        await decodeDatabaseWithPersistentChatIds(dbRaw, {
+        await decodeDatabaseWithPersistentChatIds(userId, dbRaw, {
             createBackup: false,
             migrationResult: migration,
         });
@@ -2819,10 +2914,12 @@ app.post('/api/token/refresh', async (req, res) => {
 // <img src="/api/asset/..."> requests can be authenticated without JS.
 app.post('/api/session', async (req, res) => {
     if (!await checkAuth(req, res)) return
+    const userId = resolveUserId(req)
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' })
     const clientSessionId = req.headers['x-session-id']
     if (clientSessionId) {
-        activeSessionId = clientSessionId
-        console.log('[Session] Active writer session updated')
+        activeSessionIdByUser.set(userId, clientSessionId)
+        console.log(`[Session] Active writer session updated for user ${userId}`)
     }
     const token = nodeCrypto.randomBytes(32).toString('hex')
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000
@@ -2897,13 +2994,19 @@ async function generateThumbnail(buffer) {
     }
 }
 
+// Gated by BOTH sessionAuthMiddleware (unrelated single-writer-lock cookie)
+// AND the real rl_auth account session — the former was the only check here
+// before, which meant any logged-in-anywhere session could fetch any other
+// account's assets by guessing/observing hex keys.
 app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
     try {
+        const userId = resolveUserId(req);
+        if (!userId) return res.status(401).end();
         const key = Buffer.from(req.params.hexKey, 'hex').toString('utf-8')
 
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
-            const file = await readInlayFile(id)
+            const file = await readInlayFile(userId, id)
             if (file) {
                 const etag = `"${Math.floor(file.mtimeMs)}"`
                 if (req.headers['if-none-match'] === etag) {
@@ -2921,11 +3024,11 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
 
         if (key.startsWith('inlay_thumb/')) {
             const id = key.slice('inlay_thumb/'.length)
-            const sidecar = await readInlaySidecar(id);
+            const sidecar = await readInlaySidecar(userId, id);
             if (!sidecar || sidecar.type !== 'image' || !THUMB_IMAGE_EXTS.has(sidecar.ext)) {
                 return res.status(404).end()
             }
-            const file = await readInlayFile(id)
+            const file = await readInlayFile(userId, id)
             if (!file) return res.status(404).set('Cache-Control', 'no-store').end()
             const etag = `"thumb-${Math.floor(file.mtimeMs)}"`
             if (req.headers['if-none-match'] === etag) {
@@ -2940,8 +3043,10 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
             return res.send(thumb)
         }
 
+        const scopedAssetKey = scopedKey(userId, key);
+
         // Fast-path 304: check updated_at BEFORE loading the blob.
-        const updatedAt = kvGetUpdatedAt(key)
+        const updatedAt = kvGetUpdatedAt(scopedAssetKey)
         if (updatedAt === null) return res.status(404).set('Cache-Control', 'no-store').end()
 
         const etag = `"${updatedAt}"`
@@ -2949,7 +3054,7 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
             return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
         }
 
-        const data = kvGet(key)
+        const data = kvGet(scopedAssetKey)
         if (!data) return res.status(404).set('Cache-Control', 'no-store').end()
 
         const { binary, contentType } = resolveAssetPayload(key, data)
@@ -3078,6 +3183,8 @@ app.get('/api/read', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     const filePath = req.headers['file-path'];
     if (!filePath) {
         console.log('no path')
@@ -3090,31 +3197,33 @@ app.get('/api/read', async (req, res, next) => {
     }
     try {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
+        const cacheKey = scopedHexKeyFor(userId, key);
         // Flush pending patches before reading database.bin
         if (key === 'database/database.bin') {
-            await flushPendingDb();
+            await flushPendingDb(userId);
         }
         let value = null;
         if (key.startsWith('inlay/')) {
-            value = await readInlayAssetPayload(key.slice('inlay/'.length));
+            value = await readInlayAssetPayload(userId, key.slice('inlay/'.length));
         } else if (key.startsWith('inlay_info/')) {
-            value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
+            value = await readInlayInfoPayload(userId, key.slice('inlay_info/'.length));
         }
         if (value === null) {
-            value = kvGet(key);
+            value = kvGet(scopedKey(userId, key));
         }
         if(value === null){
             res.send();
         } else {
             // Strip any chat payloads from database.bin — chats live in rl_chats only
             if (key === 'database/database.bin') {
+                let dbEtag;
                 try {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(value, {
+                    const dbObj = await decodeDatabaseWithPersistentChatIds(userId, value, {
                         createBackup: true,
                     });
                     const stripped = normalizeJSON(stripChatsFromDb(dbObj));
                     // Populate dbCache so patch endpoint uses the same data
-                    dbCache[filePath] = stripped;
+                    dbCache[cacheKey] = stripped;
                     value = Buffer.from(encodeRisuSaveLegacy(stripped));
                 } catch (e) {
                     // Log the Error itself (not just e.message) so logger.*
@@ -3123,6 +3232,7 @@ app.get('/api/read', async (req, res, next) => {
                     return next(e);
                 }
                 dbEtag = computeBufferEtag(value);
+                setDbEtag(userId, dbEtag);
                 if (req.headers['if-none-match'] === dbEtag) {
                     return res.status(304).end();
                 }
@@ -3140,6 +3250,8 @@ app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     const filePath = req.headers['file-path'];
     if (!filePath) {
         res.status(400).send({ error:'File path required' });
@@ -3153,16 +3265,16 @@ app.get('/api/remove', async (req, res, next) => {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
-            await deleteInlayFile(id)
-            kvDel(key);
-            kvDel(`inlay_thumb/${id}`);
-            kvDel(`inlay_info/${id}`);
+            await deleteInlayFile(userId, id)
+            kvDel(scopedKey(userId, key));
+            kvDel(scopedKey(userId, `inlay_thumb/${id}`));
+            kvDel(scopedKey(userId, `inlay_info/${id}`));
             return res.send({ success: true });
         }
         if (key.startsWith('inlay_info/')) {
-            await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+            await fs.unlink(getInlaySidecarPath(userId, key.slice('inlay_info/'.length))).catch(() => {});
         }
-        kvDel(key);
+        kvDel(scopedKey(userId, key));
         res.send({ success: true });
     } catch (error) {
         next(error);
@@ -3173,17 +3285,19 @@ app.get('/api/list', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     try {
         const keyPrefix = req.headers['key-prefix'] || '';
         let data;
         if (keyPrefix === 'inlay/') {
-            const fileKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
+            const fileKeys = (await listInlayFiles(userId)).map((entry) => `inlay/${entry.id}`);
             data = [...new Set([
                 ...fileKeys,
-                ...kvList('inlay/'),
+                ...kvList(scopedKey(userId, 'inlay/')).map((k) => unscopedKey(userId, k)),
             ])];
         } else {
-            data = kvList(keyPrefix || undefined);
+            data = kvList(scopedKey(userId, keyPrefix || '')).map((k) => unscopedKey(userId, k));
         }
         res.send({ success: true, content: data });
     } catch (error) {
@@ -3251,7 +3365,7 @@ app.get('/api/logs', async (req, res, next) => {
 
 app.delete('/api/logs', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         clearLogs();
         res.send({ success: true });
@@ -3264,7 +3378,9 @@ app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     const filePath = req.headers['file-path'];
     const fileContent = req.body;
     if (!filePath || !fileContent) {
@@ -3278,14 +3394,16 @@ app.post('/api/write', async (req, res, next) => {
     try {
         await queueStorageOperation(async () => {
             const key = Buffer.from(filePath, 'hex').toString('utf-8');
+            const scopedFileKey = scopedKey(userId, key);
 
             // ETag conflict detection for database.bin
             if (key === 'database/database.bin') {
                 const ifMatch = req.headers['x-if-match'];
-                if (ifMatch && dbEtag && ifMatch !== dbEtag) {
+                const currentEtag = getDbEtag(userId);
+                if (ifMatch && currentEtag && ifMatch !== currentEtag) {
                     res.status(409).send({
                         error: 'ETag mismatch - concurrent modification detected',
-                        currentEtag: dbEtag
+                        currentEtag
                     });
                     return;
                 }
@@ -3299,21 +3417,21 @@ app.post('/api/write', async (req, res, next) => {
                 const buffer = type === 'signature'
                     ? Buffer.from(typeof parsed?.data === 'string' ? parsed.data : '', 'utf-8')
                     : decodeDataUri(parsed?.data).buffer;
-                await writeInlayFile(id, ext, buffer, {
+                await writeInlayFile(userId, id, ext, buffer, {
                     ext,
                     name: typeof parsed?.name === 'string' ? parsed.name : id,
                     type,
                     height: typeof parsed?.height === 'number' ? parsed.height : undefined,
                     width: typeof parsed?.width === 'number' ? parsed.width : undefined,
                 });
-                kvDel(key);
-                kvDel(`inlay_thumb/${id}`);
-                kvDel(`inlay_info/${id}`);
+                kvDel(scopedFileKey);
+                kvDel(scopedKey(userId, `inlay_thumb/${id}`));
+                kvDel(scopedKey(userId, `inlay_info/${id}`));
             } else if (key.startsWith('inlay_info/')) {
                 const id = key.slice('inlay_info/'.length)
                 const parsed = JSON.parse(Buffer.from(fileContent).toString('utf-8'));
-                await writeInlaySidecar(id, parsed);
-                kvDel(key);
+                await writeInlaySidecar(userId, id, parsed);
+                kvDel(scopedFileKey);
             } else if (key === 'database/database.bin') {
                 // Defensive strip: a stale/pre-migration client could still send
                 // chats embedded in the payload. Chats live in rl_chats only —
@@ -3321,26 +3439,29 @@ app.post('/api/write', async (req, res, next) => {
                 try {
                     const incomingDb = await decodeRisuSave(fileContent);
                     const cleaned = normalizeJSON(stripChatsFromDb(incomingDb));
-                    kvSet(key, Buffer.from(encodeRisuSaveLegacy(cleaned)));
+                    kvSet(scopedFileKey, Buffer.from(encodeRisuSaveLegacy(cleaned)));
                 } catch (e) {
                     logger.error('[Write] Failed to process database.bin:', e.message);
                     res.status(500).json({ error: 'Database write failed' });
                     return;
                 }
             } else {
-                kvSet(key, fileContent);
+                kvSet(scopedFileKey, fileContent);
             }
 
             // Update ETag, backup, and invalidate cache after database.bin write
+            let dbEtag;
             if (key === 'database/database.bin') {
-                delete dbCache[DB_HEX_KEY];
-                if (saveTimers[DB_HEX_KEY]) {
-                    clearTimeout(saveTimers[DB_HEX_KEY]);
-                    delete saveTimers[DB_HEX_KEY];
+                const hexKey = dbHexKeyFor(userId);
+                delete dbCache[hexKey];
+                if (saveTimers[hexKey]) {
+                    clearTimeout(saveTimers[hexKey]);
+                    delete saveTimers[hexKey];
                 }
                 // ETag based on stripped version (what client sees)
                 dbEtag = computeBufferEtag(fileContent);
-                createBackupAndRotate();
+                setDbEtag(userId, dbEtag);
+                createBackupAndRotate(userId);
             }
 
             res.send({
@@ -3354,13 +3475,15 @@ app.post('/api/write', async (req, res, next) => {
 });
 
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     try {
         await queueStorageOperation(async () => {
-            await flushPendingDb();
+            await flushPendingDb(userId);
             res.send({
                 success: true,
-                etag: dbEtag ?? undefined
+                etag: getDbEtag(userId) ?? undefined
             });
         });
     } catch (error) {
@@ -3377,7 +3500,9 @@ app.post('/api/patch', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     const filePath = req.headers['file-path'];
     const patch = req.body.patch;
     const expectedHash = req.body.expectedHash;
@@ -3394,33 +3519,35 @@ app.post('/api/patch', async (req, res, next) => {
     try {
         await queueStorageOperation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
+            const cacheKey = scopedHexKeyFor(userId, decodedKey);
+            const scopedDecodedKey = scopedKey(userId, decodedKey);
 
             // Load database into memory if not already cached.
             // database.bin never carries chats (see stripChatsFromDb) — a patch
             // op that still targets /characters/N/chats/... has nothing to
             // resolve against and fails applyPatch's own validation below.
-            if (!dbCache[filePath]) {
-                const fileContent = kvGet(decodedKey);
+            if (!dbCache[cacheKey]) {
+                const fileContent = kvGet(scopedDecodedKey);
                 if (fileContent) {
                     const decoded = decodedKey === 'database/database.bin'
-                        ? await decodeDatabaseWithPersistentChatIds(fileContent)
+                        ? await decodeDatabaseWithPersistentChatIds(userId, fileContent)
                         : normalizeJSON(await decodeRisuSave(fileContent));
-                    dbCache[filePath] = decodedKey === 'database/database.bin'
+                    dbCache[cacheKey] = decodedKey === 'database/database.bin'
                         ? normalizeJSON(stripChatsFromDb(decoded))
                         : decoded;
                 } else {
-                    dbCache[filePath] = {};
+                    dbCache[cacheKey] = {};
                 }
             }
 
-            const serverHash = calculateHash(dbCache[filePath]).toString(16);
+            const serverHash = calculateHash(dbCache[cacheKey]).toString(16);
 
             if (expectedHash !== serverHash) {
                 console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
                 let currentEtag = undefined;
                 if (decodedKey === 'database/database.bin') {
-                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
-                    dbEtag = currentEtag;
+                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[cacheKey])));
+                    setDbEtag(userId, currentEtag);
                 }
                 res.status(409).send({
                     error: 'Hash mismatch - data out of sync',
@@ -3430,29 +3557,29 @@ app.post('/api/patch', async (req, res, next) => {
             }
 
             // Apply patch to in-memory database (clone first to prevent partial mutation on failure)
-            const snapshot = JSON.parse(JSON.stringify(dbCache[filePath]));
+            const snapshot = JSON.parse(JSON.stringify(dbCache[cacheKey]));
             let result;
             try {
                 result = applyPatch(snapshot, patch, true);
             } catch (patchErr) {
                 // Invalidate corrupted cache entry to force reload on next request
-                delete dbCache[filePath];
+                delete dbCache[cacheKey];
                 throw patchErr;
             }
-            dbCache[filePath] = snapshot;
+            dbCache[cacheKey] = snapshot;
 
             // Schedule save to KV (debounced) — merge full chats back for database.bin
-            if (saveTimers[filePath]) {
-                clearTimeout(saveTimers[filePath]);
+            if (saveTimers[cacheKey]) {
+                clearTimeout(saveTimers[cacheKey]);
             }
-            saveTimers[filePath] = setTimeout(async () => {
+            saveTimers[cacheKey] = setTimeout(async () => {
                 try {
                     if (decodedKey === 'database/database.bin') {
-                        await persistDbCache(filePath, decodedKey);
+                        await persistDbCache(userId, cacheKey, decodedKey);
                     } else {
-                        const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
+                        const data = Buffer.from(encodeRisuSaveLegacy(dbCache[cacheKey]));
                         try {
-                            kvSet(decodedKey, data);
+                            kvSet(scopedDecodedKey, data);
                         } catch (err) {
                             if (err && typeof err === 'object') {
                                 try { err.attemptedSize = data.length; } catch {}
@@ -3462,25 +3589,27 @@ app.post('/api/patch', async (req, res, next) => {
                     }
                     // Persist succeeded — clear before backup so a backup-only
                     // failure isn't attributed to data loss.
-                    clearPersistFailure();
+                    clearPersistFailure(userId);
                     if (decodedKey === 'database/database.bin') {
                         try {
-                            createBackupAndRotate();
+                            createBackupAndRotate(userId);
                         } catch (backupErr) {
                             logger.warn(`[Patch] Backup rotation failed for ${decodedKey}:`, backupErr);
                         }
                     }
                 } catch (error) {
                     logger.error(`[Patch] Error saving ${decodedKey}:`, error);
-                    recordPersistFailure(error, `patch:${decodedKey}`);
+                    recordPersistFailure(userId, error, `patch:${decodedKey}`);
                 } finally {
-                    delete saveTimers[filePath];
+                    delete saveTimers[cacheKey];
                 }
             }, SAVE_INTERVAL);
 
             // Update ETag after successful patch (based on stripped version)
+            let dbEtag;
             if (decodedKey === 'database/database.bin') {
-                dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[cacheKey])));
+                setDbEtag(userId, dbEtag);
             }
 
             const responsePayload = {
@@ -3488,7 +3617,7 @@ app.post('/api/patch', async (req, res, next) => {
                 appliedOperations: result.length,
                 etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
             };
-            const persistWarning = currentPersistWarning();
+            const persistWarning = currentPersistWarning(userId);
             if (persistWarning) {
                 responsePayload.persistWarning = persistWarning;
             }
@@ -3507,6 +3636,8 @@ const BULK_BATCH = 50;
 
 app.post('/api/assets/bulk-read', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     try {
         const keys = req.body; // string[] — decoded key strings
         if(!Array.isArray(keys)){
@@ -3526,10 +3657,10 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
                 for (const key of batch) {
                     let value = null;
                     if (typeof key === 'string' && key.startsWith('inlay_info/')) {
-                        value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
+                        value = await readInlayInfoPayload(userId, key.slice('inlay_info/'.length));
                     }
                     if (value === null) {
-                        value = kvGet(key);
+                        value = kvGet(scopedKey(userId, key));
                     }
                     if (value !== null) {
                         const keyBuf = Buffer.from(key, 'utf-8');
@@ -3558,10 +3689,10 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
                 for (const key of batch) {
                     let value = null;
                     if (typeof key === 'string' && key.startsWith('inlay_info/')) {
-                        value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
+                        value = await readInlayInfoPayload(userId, key.slice('inlay_info/'.length));
                     }
                     if (value === null) {
-                        value = kvGet(key);
+                        value = kvGet(scopedKey(userId, key));
                     }
                     if (value !== null) {
                         results.push({ key, value: Buffer.from(value).toString('base64') });
@@ -3575,7 +3706,9 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
 
 app.post('/api/assets/bulk-write', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     try {
         const entries = req.body; // {key: string, value: base64}[]
         if(!Array.isArray(entries)){
@@ -3586,7 +3719,7 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
             const batch = entries.slice(i, i + BULK_BATCH);
             const writeBatch = sqliteDb.transaction(() => {
                 for(const { key, value } of batch){
-                    kvSet(key, Buffer.from(value, 'base64'));
+                    kvSet(scopedKey(userId, key), Buffer.from(value, 'base64'));
                 }
             });
             writeBatch();
@@ -3597,6 +3730,8 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).send({ error: 'Unauthorized' });
     try {
         // ?target=upstream excludes NodeOnly-only inlay namespaces (inlay/,
         // inlay_sidecar/, inlay_meta/). Their entry names contain a slash,
@@ -3605,8 +3740,8 @@ app.get('/api/backup/export', async (req, res, next) => {
         // imports cleanly into upstream.
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
         // Flush any pending patches to ensure export includes latest data
-        await flushPendingDb();
-        const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
+        await flushPendingDb(userId);
+        const inlayFiles = target === 'upstream' ? [] : await listInlayFiles(userId);
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
             return {
@@ -3618,7 +3753,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             };
         }));
         const sidecarEntries = await Promise.all(inlayFiles.map(async (entry) => {
-            const sidecarPath = getInlaySidecarPath(entry.id);
+            const sidecarPath = getInlaySidecarPath(userId, entry.id);
             try {
                 const stat = await fs.stat(sidecarPath);
                 return {
@@ -3632,27 +3767,30 @@ app.get('/api/backup/export', async (req, res, next) => {
                 return null;
             }
         }));
-        const inlayMetaEntries = target === 'upstream' ? [] : kvListWithSizes('inlay_meta/').map((entry) => ({
-            kind: 'kv',
-            key: entry.key,
-            backupName: entry.key,
-            sortKey: entry.key,
-            size: entry.size,
-        }));
+        const inlayMetaEntries = target === 'upstream' ? [] : kvListWithSizes(scopedKey(userId, 'inlay_meta/')).map((entry) => {
+            const unscoped = unscopedKey(userId, entry.key);
+            return {
+                kind: 'kv',
+                key: entry.key,
+                backupName: unscoped,
+                sortKey: unscoped,
+                size: entry.size,
+            };
+        });
         const namespacedEntries = [
-            ...kvListWithSizes('assets/').map((entry) => ({
+            ...kvListWithSizes(scopedKey(userId, 'assets/')).map((entry) => ({
                 kind: 'kv',
                 key: entry.key,
                 backupName: path.basename(entry.key),
-                sortKey: entry.key,
+                sortKey: unscopedKey(userId, entry.key),
                 size: entry.size,
             })),
-            ...listColdStorageBackupEntries(),
+            ...listColdStorageBackupEntries(userId),
             ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        const dbSize = kvSize('database/database.bin');
+        const dbSize = kvSize(scopedKey(userId, 'database/database.bin'));
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
@@ -3697,7 +3835,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
 
         if (!closed && dbSize) {
-            const dbValue = kvGet('database/database.bin');
+            const dbValue = kvGet(scopedKey(userId, 'database/database.bin'));
             if (dbValue) {
                 const ok = res.write(encodeBackupEntry('database.risudat', dbValue));
                 if (!ok) {
@@ -3714,7 +3852,7 @@ app.get('/api/backup/export', async (req, res, next) => {
 // Pre-flight check: auth + size + disk space before client starts uploading
 app.post('/api/backup/import/prepare', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         if (importInProgress) {
             res.status(409).json({ error: 'Another import is already in progress' });
@@ -3747,7 +3885,9 @@ app.post('/api/backup/import/prepare', async (req, res, next) => {
 
 app.post('/api/backup/import', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     if (importInProgress) {
         res.status(409).json({ error: 'Another import is already in progress' });
@@ -3796,7 +3936,7 @@ app.post('/api/backup/import', async (req, res, next) => {
 
             let lastProgressWrite = 0;
             const totalBytes = Number.isFinite(contentLength) ? contentLength : 0;
-            const result = await importBackupFromSource(req, {
+            const result = await importBackupFromSource(userId, req, {
                 maxBytes: BACKUP_IMPORT_MAX_BYTES,
                 totalBytes,
                 onProgress: (received, total) => {
@@ -3814,7 +3954,7 @@ app.post('/api/backup/import', async (req, res, next) => {
             }) + '\n');
             res.end();
         } else {
-            const result = await importBackupFromSource(req, { maxBytes: BACKUP_IMPORT_MAX_BYTES });
+            const result = await importBackupFromSource(userId, req, { maxBytes: BACKUP_IMPORT_MAX_BYTES });
             res.json({
                 ok: true,
                 assetsRestored: result.assetsRestored,
@@ -3844,16 +3984,21 @@ app.post('/api/backup/import', async (req, res, next) => {
 // Save current data as a .bin backup file on the server
 app.post('/api/backup/server/save', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
-        await flushPendingDb();
+        await flushPendingDb(userId);
+
+        const userBackupsDir = backupsDirFor(userId);
+        await fs.mkdir(userBackupsDir, { recursive: true });
 
         // Pre-flight disk check — bail before streaming if the target dir
         // can't fit the backup. Avoids wasted minutes + half-written tmp files.
         try {
-            const estimate = await estimateServerBackupSize();
+            const estimate = await estimateServerBackupSize(userId);
             const required = Math.ceil(estimate * 1.05); // 5% safety margin
-            const sf = await fs.statfs(backupsDir);
+            const sf = await fs.statfs(userBackupsDir);
             const free = sf.bsize * sf.bavail;
             if (estimate > 0 && free < required) {
                 return res.status(400).json({
@@ -3869,13 +4014,13 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             console.warn('[Backup] pre-flight disk check failed:', e?.message || e);
         }
 
-        const inlayFiles = await listInlayFiles();
+        const inlayFiles = await listInlayFiles(userId);
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
             return { kind: 'file', sourcePath: entry.filePath, backupName: `inlay/${entry.id}.${entry.ext}`, size: stat.size };
         }));
         const sidecarEntries = (await Promise.all(inlayFiles.map(async (entry) => {
-            const sidecarPath = getInlaySidecarPath(entry.id);
+            const sidecarPath = getInlaySidecarPath(userId, entry.id);
             try {
                 const stat = await fs.stat(sidecarPath);
                 return { kind: 'sidecar', sourcePath: sidecarPath, backupName: `inlay_sidecar/${entry.id}`, size: stat.size };
@@ -3883,9 +4028,9 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         }))).filter(Boolean);
 
         const namespacedEntries = [
-            ...kvListWithSizes('assets/').map((e) => ({ kind: 'kv', key: e.key, backupName: path.basename(e.key), size: e.size })),
-            ...listColdStorageBackupEntries(),
-            ...kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
+            ...kvListWithSizes(scopedKey(userId, 'assets/')).map((e) => ({ kind: 'kv', key: e.key, backupName: path.basename(e.key), size: e.size })),
+            ...listColdStorageBackupEntries(userId),
+            ...kvListWithSizes(scopedKey(userId, 'inlay_meta/')).map((e) => ({ kind: 'kv', key: e.key, backupName: unscopedKey(userId, e.key), size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
         ];
@@ -3898,7 +4043,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         res.flushHeaders();
 
         const filename = `risu-backup-${Date.now()}.bin`;
-        const finalPath = path.join(backupsDir, filename);
+        const finalPath = path.join(userBackupsDir, filename);
         const tmpPath = finalPath + '.tmp';
         const { createWriteStream: createFsWriteStream } = require('fs');
         const writeStream = createFsWriteStream(tmpPath);
@@ -3932,7 +4077,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                         }
                     }
                     if (closed) throw new Error('Client disconnected during backup save');
-                    const dbValue = kvGet('database/database.bin');
+                    const dbValue = kvGet(scopedKey(userId, 'database/database.bin'));
                     if (dbValue) {
                         const ok = writeStream.write(encodeBackupEntry('database.risudat', dbValue));
                         if (!ok) await new Promise(r => writeStream.once('drain', r));
@@ -3971,10 +4116,13 @@ app.post('/api/backup/server/save', async (req, res, next) => {
 // List backup files on the server
 app.get('/api/backup/server/list', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
+        const userBackupsDir = backupsDirFor(userId);
         let entries;
         try {
-            entries = await fs.readdir(backupsDir, { withFileTypes: true });
+            entries = await fs.readdir(userBackupsDir, { withFileTypes: true });
         } catch {
             res.json({ backups: [] });
             return;
@@ -3982,7 +4130,7 @@ app.get('/api/backup/server/list', async (req, res, next) => {
         const backups = [];
         for (const entry of entries) {
             if (!entry.isFile() || !BACKUP_FILENAME_REGEX.test(entry.name)) continue;
-            const stat = await fs.stat(path.join(backupsDir, entry.name));
+            const stat = await fs.stat(path.join(userBackupsDir, entry.name));
             const tsMatch = entry.name.match(/^risu-backup-(\d+)\.bin$/);
             backups.push({
                 filename: entry.name,
@@ -4000,7 +4148,9 @@ app.get('/api/backup/server/list', async (req, res, next) => {
 // Restore from a server backup file
 app.post('/api/backup/server/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     if (importInProgress) {
         res.status(409).json({ error: 'Another import is already in progress' });
@@ -4014,7 +4164,9 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
             res.status(400).json({ error: 'Invalid backup filename' });
             return;
         }
-        const filePath = path.join(backupsDir, filename);
+        // BACKUP_FILENAME_REGEX rejects any path separator, so this can never
+        // escape the caller's own subdirectory.
+        const filePath = path.join(backupsDirFor(userId), filename);
         let fileStat;
         try {
             fileStat = await fs.stat(filePath);
@@ -4039,7 +4191,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         let lastProgressWrite = 0;
         const { createReadStream } = require('fs');
         const stream = createReadStream(filePath, { highWaterMark: 256 * 1024 });
-        const result = await importBackupFromSource(stream, {
+        const result = await importBackupFromSource(userId, stream, {
             totalBytes: fileStat.size,
             onProgress: (received, total) => {
                 const now = Date.now();
@@ -4070,14 +4222,16 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
 // Delete a server backup file
 app.delete('/api/backup/server/:filename', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const filename = req.params.filename;
         if (!BACKUP_FILENAME_REGEX.test(filename)) {
             res.status(400).json({ error: 'Invalid backup filename' });
             return;
         }
-        const filePath = path.join(backupsDir, filename);
+        const filePath = path.join(backupsDirFor(userId), filename);
         try {
             await fs.unlink(filePath);
         } catch (err) {
@@ -4096,13 +4250,15 @@ app.delete('/api/backup/server/:filename', async (req, res, next) => {
 // Download a server backup file
 app.get('/api/backup/server/download/:filename', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const filename = req.params.filename;
         if (!BACKUP_FILENAME_REGEX.test(filename)) {
             res.status(400).json({ error: 'Invalid backup filename' });
             return;
         }
-        const filePath = path.join(backupsDir, filename);
+        const filePath = path.join(backupsDirFor(userId), filename);
         let stat;
         try {
             stat = await fs.stat(filePath);
@@ -4125,10 +4281,10 @@ app.get('/api/backup/server/download/:filename', async (req, res, next) => {
 // Cold storage compatibility: restore data stored in coldstorage/ KV entries
 // (COLD_STORAGE_HEADER removed with the legacy chat-content endpoints below)
 
-function restoreColdStorageCharacter(character) {
+function restoreColdStorageCharacter(userId, character) {
     if (!character?.coldstorage) return true;
     const key = character.coldstorage;
-    const entry = readColdStorageJsonEntry(key, {
+    const entry = readColdStorageJsonEntry(userId, key, {
         migrateLegacy: true,
     });
     if (!entry) {
@@ -4193,13 +4349,13 @@ function promoteFailedColdStorageStub(char) {
     delete char.coldStoragedChats;
 }
 
-function restoreColdStorageCharactersInDb(dbObj) {
+function restoreColdStorageCharactersInDb(userId, dbObj) {
     const result = { restored: 0, failed: 0, failedNames: [] };
     if (!Array.isArray(dbObj?.characters)) return result;
     for (let i = 0; i < dbObj.characters.length; i++) {
         const char = dbObj.characters[i];
         if (!char?.coldstorage) continue;
-        if (restoreColdStorageCharacter(char)) {
+        if (restoreColdStorageCharacter(userId, char)) {
             result.restored++;
         } else {
             result.failed++;
@@ -4241,37 +4397,37 @@ function scanHexFilesInDir(dirPath) {
     return { hexFiles, count: hexFiles.length, totalSize, hasDatabase };
 }
 
-function clearExistingData() {
-    kvDelPrefix('assets/');
-    kvDelPrefix('inlay/');
-    kvDelPrefix('inlay_thumb/');
-    kvDelPrefix('inlay_meta/');
-    kvDelPrefix('inlay_info/');
+function clearExistingData(userId) {
+    kvDelPrefix(scopedKey(userId, 'assets/'));
+    kvDelPrefix(scopedKey(userId, 'inlay/'));
+    kvDelPrefix(scopedKey(userId, 'inlay_thumb/'));
+    kvDelPrefix(scopedKey(userId, 'inlay_meta/'));
+    kvDelPrefix(scopedKey(userId, 'inlay_info/'));
     // Composer drafts aren't part of a save folder; clear stale ones on import.
-    kvDelPrefix('drafts/');
+    kvDelPrefix(scopedKey(userId, 'drafts/'));
     // Drop the previous user's remote payloads. The new save folder usually
     // brings its own remotes/<id>.local.bin files (INSERT OR REPLACE), but if
     // the imported character ids reuse names from the prior user without
     // shipping a matching payload, the migration's resolveRemote would silently
     // stitch in stale cross-user data. Wiping here ensures only payloads
     // that arrived in this import survive.
-    kvDelPrefix('remotes/');
+    kvDelPrefix(scopedKey(userId, 'remotes/'));
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration
     // to re-evaluate against the new contents on the next decode pass.
-    kvDel(REMOTE_MIGRATION_MARKER_KEY);
+    kvDel(scopedKey(userId, REMOTE_MIGRATION_MARKER_KEY));
     clearEntities();
 }
 
-async function importHexFilesFromDir(dirPath) {
+async function importHexFilesFromDir(userId, dirPath) {
     const { hexFiles, hasDatabase } = scanHexFilesInDir(dirPath);
     if (hexFiles.length === 0) return { imported: 0 };
     if (!hasDatabase) throw new Error('Save folder does not contain database/database.bin');
 
-    await flushPendingDb();
-    createBackupAndRotate();
-    invalidateDbCache();
+    await flushPendingDb(userId);
+    createBackupAndRotate(userId);
+    invalidateDbCache(userId);
 
     const insert = sqliteDb.prepare(
         `INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
@@ -4279,14 +4435,15 @@ async function importHexFilesFromDir(dirPath) {
     const now = Date.now();
 
     const run = sqliteDb.transaction(() => {
-        clearExistingData();
+        clearExistingData(userId);
         for (const hexFile of hexFiles) {
             const key = Buffer.from(hexFile, 'hex').toString('utf-8');
             const value = readFileSync(path.join(dirPath, hexFile));
+            const scopedFileKey = scopedKey(userId, key);
             // Chunk the DB blob so an oversized database.bin imports instead of
             // failing the BLOB bind limit; other keys keep the bulk fast path.
-            if (key === DB_BLOB_KEY) { kvSet(key, value); continue; }
-            insert.run(key, value, now);
+            if (key === DB_BLOB_KEY) { kvSet(scopedFileKey, value); continue; }
+            insert.run(scopedFileKey, value, now);
         }
     });
     run();
@@ -4295,14 +4452,14 @@ async function importHexFilesFromDir(dirPath) {
     return { imported: hexFiles.length };
 }
 
-async function importHexEntries(entries) {
+async function importHexEntries(userId, entries) {
     if (entries.length === 0) return { imported: 0 };
     const hasDb = entries.some(e => e.key === 'database/database.bin');
     if (!hasDb) throw new Error('Data does not contain database/database.bin');
 
-    await flushPendingDb();
-    createBackupAndRotate();
-    invalidateDbCache();
+    await flushPendingDb(userId);
+    createBackupAndRotate(userId);
+    invalidateDbCache(userId);
 
     const insert = sqliteDb.prepare(
         `INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
@@ -4310,12 +4467,13 @@ async function importHexEntries(entries) {
     const now = Date.now();
 
     const run = sqliteDb.transaction(() => {
-        clearExistingData();
+        clearExistingData(userId);
         for (const { key, value } of entries) {
+            const scopedFileKey = scopedKey(userId, key);
             // Chunk the DB blob so an oversized database.bin imports instead of
             // failing the BLOB bind limit; other keys keep the bulk fast path.
-            if (key === DB_BLOB_KEY) { kvSet(key, value); continue; }
-            insert.run(key, value, now);
+            if (key === DB_BLOB_KEY) { kvSet(scopedFileKey, value); continue; }
+            insert.run(scopedFileKey, value, now);
         }
     });
     run();
@@ -4326,7 +4484,7 @@ async function importHexEntries(entries) {
 
 app.post('/api/migrate/save-folder/scan', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         const folderPath = req.body?.path || savePath;
         const resolved = path.resolve(folderPath);
@@ -4349,7 +4507,9 @@ app.post('/api/migrate/save-folder/scan', async (req, res, next) => {
 
 app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     if (importInProgress) {
         res.status(409).json({ error: 'Another import is already in progress' });
         return;
@@ -4368,7 +4528,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
             res.status(400).json({ error: 'Cannot access directory' });
             return;
         }
-        const result = await importHexFilesFromDir(resolved);
+        const result = await importHexFilesFromDir(userId, resolved);
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Import failed' });
@@ -4379,7 +4539,9 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
 
 app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     if (importInProgress) {
         res.status(409).json({ error: 'Another import is already in progress' });
         return;
@@ -4429,7 +4591,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             return;
         }
 
-        const result = await importHexEntries(entries);
+        const result = await importHexEntries(userId, entries);
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Import failed' });
@@ -4443,7 +4605,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
 
 app.post('/api/migrate/save-folder/cleanup/scan', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         if (!existsSync(migrationMarkerPath)) {
             res.status(400).json({ error: 'Migration has not been completed yet' });
@@ -4458,7 +4620,7 @@ app.post('/api/migrate/save-folder/cleanup/scan', async (req, res, next) => {
 
 app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         if (!existsSync(migrationMarkerPath)) {
             res.status(400).json({ error: 'Migration has not been completed yet' });
@@ -4540,17 +4702,17 @@ async function diskFreeStat(dirPath) {
 // Returns 0 if the directory is missing. Used by both the backup-size
 // estimator and the dashboard inlay total — kv inlay/* prefixes don't
 // reflect filesystem bytes after the inlay→fs migration.
-async function sumInlayFsBytes() {
+async function sumInlayFsBytes(userId) {
     let total = 0;
     try {
-        const inlayFiles = await listInlayFiles();
+        const inlayFiles = await listInlayFiles(userId);
         await Promise.all(inlayFiles.map(async (entry) => {
             try {
                 const st = await fs.stat(entry.filePath);
                 total += st.size;
             } catch { /* missing — skip */ }
             try {
-                const sst = await fs.stat(getInlaySidecarPath(entry.id));
+                const sst = await fs.stat(getInlaySidecarPath(userId, entry.id));
                 total += sst.size;
             } catch { /* sidecar may not exist */ }
         }));
@@ -4562,24 +4724,31 @@ async function sumInlayFsBytes() {
 // /api/backup/server/save without writing anything. Inlay files live on the
 // filesystem (post-migration), so we have to fs.stat them rather than read
 // kvSize. Cost: ~5-50 ms typical, ~200 ms for users with thousands of inlays.
-async function estimateServerBackupSize() {
+async function estimateServerBackupSize(userId) {
     let total = 0;
-    total += kvSize(DB_BLOB_KEY) || 0;
-    for (const it of kvListWithSizes('assets/')) total += it.size;
-    for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
-    for (const e of listColdStorageBackupEntries()) total += e.size;
-    total += await sumInlayFsBytes();
+    total += kvSize(scopedKey(userId, DB_BLOB_KEY)) || 0;
+    for (const it of kvListWithSizes(scopedKey(userId, 'assets/'))) total += it.size;
+    for (const it of kvListWithSizes(scopedKey(userId, 'inlay_meta/'))) total += it.size;
+    for (const e of listColdStorageBackupEntries(userId)) total += e.size;
+    total += await sumInlayFsBytes(userId);
     return total;
 }
 
 app.get('/api/db/stats', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const saveDir = path.join(process.cwd(), 'save');
         const dbFilePath = path.join(saveDir, 'risuai.db');
         const walPath = dbFilePath + '-wal';
         const shmPath = dbFilePath + '-shm';
 
+        // NOTE: files/disk/sqlite pragmas/chunks/kvRows/kvTotalBytes below are
+        // whole-physical-database infra metrics (one shared SQLite file
+        // underlies every account) — intentionally left un-scoped, same
+        // category as config/snapshot-max-count. They report aggregate disk
+        // usage only, never another account's character/asset content.
         const files = {
             db: statSafe(dbFilePath)?.size ?? 0,
             wal: statSafe(walPath)?.size ?? 0,
@@ -4587,6 +4756,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         };
 
         const disk = await diskFreeStat(saveDir);
+        const userBackupsDir = backupsDirFor(userId);
         // Backup destination disk — same as save/ in the default config but
         // can diverge when the user points backupsDir at a different mount.
         // Surfaced separately so backup-side warnings target the right disk.
@@ -4595,7 +4765,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         // count file backups against the save/ disk in the storage chart.
         let backupDisk;
         if (backupsDir === DEFAULT_BACKUPS_DIR) {
-            backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
+            backupDisk = { ...disk, path: userBackupsDir, sameAsSaveDir: true };
         } else {
             const bDisk = await diskFreeStat(backupsDir);
             let sameAsSaveDir = false;
@@ -4604,7 +4774,7 @@ app.get('/api/db/stats', async (req, res, next) => {
                 const bStat = require('fs').statSync(backupsDir);
                 sameAsSaveDir = saveStat.dev === bStat.dev;
             } catch { /* non-fatal */ }
-            backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
+            backupDisk = { ...bDisk, path: userBackupsDir, sameAsSaveDir };
         }
 
         const pageSize = sqliteDb.pragma('page_size', { simple: true });
@@ -4614,7 +4784,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         const autoVacuum = sqliteDb.pragma('auto_vacuum', { simple: true });
         const reclaimable = freelistCount * pageSize;
 
-        const dbBlobSize = kvSize(DB_BLOB_KEY) || 0;
+        const dbBlobSize = kvSize(scopedKey(userId, DB_BLOB_KEY)) || 0;
 
         // Physical storage of the chunked DB blob (and all snapshots, which share
         // chunks). This is where the blob bytes actually live post-chunking — kv
@@ -4626,15 +4796,17 @@ app.get('/api/db/stats', async (req, res, next) => {
         const liveChunked = isDbBlobChunked();
 
         // Prefix breakdown — split database/ into the live blob vs rotated backups.
+        // Scoped to the caller's own account.
         const prefixes = {};
         prefixes[DB_BLOB_KEY] = { totalSize: dbBlobSize, count: dbBlobSize > 0 ? 1 : 0 };
-        const backupKeys = kvList(DB_BACKUP_PREFIX);
+        const backupKeys = kvList(scopedKey(userId, DB_BACKUP_PREFIX));
         let backupTotal = 0;
         let backupOldest = null, backupNewest = null;
         for (const k of backupKeys) {
             const sz = kvSize(k) || 0;
             backupTotal += sz;
-            const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
+            const unscopedBackupKey = unscopedKey(userId, k);
+            const tsRaw = parseInt(unscopedBackupKey.slice(DB_BACKUP_PREFIX.length, -4), 10);
             if (Number.isFinite(tsRaw)) {
                 const ts = tsRaw * 100;
                 if (!backupOldest || ts < backupOldest) backupOldest = ts;
@@ -4643,7 +4815,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         }
         prefixes[DB_BACKUP_PREFIX] = { totalSize: backupTotal, count: backupKeys.length };
         for (const p of ASSET_PREFIXES) {
-            const items = kvListWithSizes(p);
+            const items = kvListWithSizes(scopedKey(userId, p));
             let total = 0;
             for (const it of items) total += it.size;
             prefixes[p] = { totalSize: total, count: items.length };
@@ -4654,10 +4826,10 @@ app.get('/api/db/stats', async (req, res, next) => {
 
         let fileBackups = { count: 0, totalSize: 0, oldest: null, newest: null };
         try {
-            const entries = await fs.readdir(backupsDir, { withFileTypes: true });
+            const entries = await fs.readdir(userBackupsDir, { withFileTypes: true });
             for (const e of entries) {
                 if (!e.isFile() || !BACKUP_FILENAME_REGEX.test(e.name)) continue;
-                const st = await fs.stat(path.join(backupsDir, e.name));
+                const st = await fs.stat(path.join(userBackupsDir, e.name));
                 fileBackups.count++;
                 fileBackups.totalSize += st.size;
                 const ts = st.mtimeMs;
@@ -4669,7 +4841,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         // Quick estimates from in-memory cache only — never decode the BLOB just for stats.
         let trashed = { count: 0, expiredCount: 0, available: false };
         let orphan = { count: 0, totalSize: 0, available: false };
-        const stripped = dbCache[DB_HEX_KEY];
+        const stripped = dbCache[dbHexKeyFor(userId)];
         if (stripped?.characters) {
             const now = Date.now();
             const GRACE = 1000 * 60 * 60 * 24 * 3;
@@ -4683,7 +4855,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         }
         if (stripped) {
             const uncleanable = buildUncleanableSet(stripped);
-            for (const it of kvListWithSizes('assets/')) {
+            for (const it of kvListWithSizes(scopedKey(userId, 'assets/'))) {
                 if (!uncleanable.has(statsBasename(it.key))) {
                     orphan.count++;
                     orphan.totalSize += it.size;
@@ -4692,11 +4864,11 @@ app.get('/api/db/stats', async (req, res, next) => {
             orphan.available = true;
         }
 
-        const estimatedBackupSize = await estimateServerBackupSize();
+        const estimatedBackupSize = await estimateServerBackupSize(userId);
         // Inlay payload now lives on the filesystem (post-migration) rather
         // than in kv `inlay/*` prefixes. Surface explicitly so the dashboard
         // chart can include it in the inlay slice instead of underreporting.
-        const inlayFsBytes = await sumInlayFsBytes();
+        const inlayFsBytes = await sumInlayFsBytes(userId);
 
         res.json({
             files,
@@ -4715,15 +4887,17 @@ app.get('/api/db/stats', async (req, res, next) => {
             },
             trashed,
             orphan,
-            etag: dbEtag,
+            etag: getDbEtag(userId),
         });
     } catch (err) { next(err); }
 });
 
 app.get('/api/db/stats/characters', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
-        const raw = kvGet(DB_BLOB_KEY);
+        const raw = kvGet(scopedKey(userId, DB_BLOB_KEY));
         if (!raw) {
             res.json({ characters: [], orphan: { count: 0, totalSize: 0 }, chatBytesNote: 'estimate' });
             return;
@@ -4731,12 +4905,12 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         const dbObj = await decodeRisuSave(raw);
 
         const assetSize = new Map();
-        for (const it of kvListWithSizes('assets/')) {
+        for (const it of kvListWithSizes(scopedKey(userId, 'assets/'))) {
             assetSize.set(statsBasename(it.key), it.size);
         }
         // remotes/<chaId>.local.bin (+ optional .meta sidecar) → bucket by chaId.
         const remoteSize = new Map();
-        for (const it of kvListWithSizes('remotes/')) {
+        for (const it of kvListWithSizes(scopedKey(userId, 'remotes/'))) {
             const bn = statsBasename(it.key).replace(/\.meta$/, '');
             const chaId = bn.replace(/\.local\.bin$/, '');
             if (chaId) remoteSize.set(chaId, (remoteSize.get(chaId) || 0) + it.size);
@@ -4795,7 +4969,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
 
         const uncleanable = buildUncleanableSet(dbObj);
         let orphanCount = 0, orphanTotal = 0;
-        for (const it of kvListWithSizes('assets/')) {
+        for (const it of kvListWithSizes(scopedKey(userId, 'assets/'))) {
             if (!uncleanable.has(statsBasename(it.key))) {
                 orphanCount++;
                 orphanTotal += it.size;
@@ -4807,7 +4981,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
             characters,
             orphan: { count: orphanCount, totalSize: orphanTotal },
             chatBytesNote: 'JSON.stringify estimate; on-disk msgpack ~0.6×',
-            etag: dbEtag,
+            etag: getDbEtag(userId),
         });
     } catch (err) { next(err); }
 });
@@ -4818,8 +4992,10 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
 // asset shared between a character and a module would be counted in both.
 app.get('/api/db/stats/modules', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
-        const raw = kvGet(DB_BLOB_KEY);
+        const raw = kvGet(scopedKey(userId, DB_BLOB_KEY));
         if (!raw) {
             res.json({ modules: [] });
             return;
@@ -4828,7 +5004,7 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
         const list = Array.isArray(dbObj.modules) ? dbObj.modules : [];
 
         const assetSize = new Map();
-        for (const it of kvListWithSizes('assets/')) {
+        for (const it of kvListWithSizes(scopedKey(userId, 'assets/'))) {
             assetSize.set(statsBasename(it.key), it.size);
         }
 
@@ -4864,13 +5040,15 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
         }
 
         modules.sort((a, b) => b.totalBytes - a.totalBytes);
-        res.json({ modules, etag: dbEtag });
+        res.json({ modules, etag: getDbEtag(userId) });
     } catch (err) { next(err); }
 });
 
 app.post('/api/db/optimize', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const saveDir = path.join(process.cwd(), 'save');
         const dbFilePath = path.join(saveDir, 'risuai.db');
@@ -4886,7 +5064,11 @@ app.post('/api/db/optimize', async (req, res, next) => {
         }
 
         const result = await queueStorageOperation(async () => {
-            await flushPendingDb();
+            // VACUUM/checkpoint operate on the whole shared physical SQLite
+            // file, so this only flushes the caller's own pending debounced
+            // save — other accounts' pending saves (if any) simply aren't
+            // vacuumed away yet and land normally on their own timer.
+            await flushPendingDb(userId);
             const t0 = Date.now();
             // Reclaim chunks orphaned by edits/snapshot rotation before VACUUM, so
             // their pages get compacted in the same pass. Serialized with saves by
@@ -4915,14 +5097,16 @@ app.post('/api/db/optimize', async (req, res, next) => {
 
 app.post('/api/db/wal-checkpoint', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const saveDir = path.join(process.cwd(), 'save');
         const walFilePath = path.join(saveDir, 'risuai.db-wal');
         const preWalSize = statSafe(walFilePath)?.size ?? 0;
 
         const result = await queueStorageOperation(async () => {
-            await flushPendingDb();
+            await flushPendingDb(userId);
             const t0 = Date.now();
             checkpointWal('TRUNCATE');
             const elapsed = Date.now() - t0;
@@ -4943,9 +5127,11 @@ app.post('/api/db/wal-checkpoint', async (req, res, next) => {
 
 app.get('/api/db/snapshots/limits', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const { maxCount, maxBytes } = getSnapshotLimits();
-        const usage = snapshotUsage();
+        const usage = snapshotUsage(userId);
         res.json({
             maxCount,
             maxBytes,
@@ -4968,7 +5154,9 @@ app.get('/api/db/snapshots/limits', async (req, res, next) => {
 
 app.put('/api/db/snapshots/limits', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const rawCount = Number(req.body?.maxCount);
         const rawBytes = Number(req.body?.maxBytes);
@@ -4980,10 +5168,11 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
         }
         const maxCount = Math.floor(rawCount);
         const maxBytes = Math.floor(rawBytes);
+        // config/snapshot-max-* are intentionally GLOBAL, not per-account.
         kvSet(SNAPSHOT_LIMIT_COUNT_KEY, Buffer.from(String(maxCount), 'utf-8'));
         kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
-        const trim = trimSnapshotsToLimits();
-        const usage = snapshotUsage();
+        const trim = trimSnapshotsToLimits(userId);
+        const usage = snapshotUsage(userId);
         res.json({
             maxCount, maxBytes,
             currentCount: usage.count,
@@ -4996,9 +5185,12 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
 
 app.get('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
-        const out = kvList(DB_BACKUP_PREFIX).map((key) => {
-            const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
+        const out = kvList(scopedKey(userId, DB_BACKUP_PREFIX)).map((key) => {
+            const unscoped = unscopedKey(userId, key);
+            const tsRaw = parseInt(unscoped.slice(DB_BACKUP_PREFIX.length, -4), 10);
             const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
             // Logical size — the full data this snapshot represents (the whole DB),
             // not its marginal on-disk cost. Users expect "this backup = my 53 MB
@@ -5006,7 +5198,9 @@ app.get('/api/db/snapshots', async (req, res, next) => {
             // (kvSize reassembles via the manifest; the marker's 13 bytes are not
             // what a user wants to see for a full backup.) Trimming still sizes by
             // snapshotFootprint in db.cjs, so this display change can't over-trim.
-            return { key, size: kvSize(key) || 0, timestamp: ts };
+            // `key` returned to the client is the UNSCOPED key — the client's
+            // generic storage adapter and delete/restore calls below expect it.
+            return { key: unscoped, size: kvSize(key) || 0, timestamp: ts };
         }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
         res.json({ snapshots: out });
     } catch (err) { next(err); }
@@ -5014,14 +5208,16 @@ app.get('/api/db/snapshots', async (req, res, next) => {
 
 app.delete('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const key = typeof req.query?.key === 'string' ? req.query.key : '';
         // Restrict to snapshot prefix — never let this endpoint touch other kv keys.
         if (!key.startsWith(DB_BACKUP_PREFIX)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
-        kvDel(key);
+        kvDel(scopedKey(userId, key));
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5032,13 +5228,16 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
 // before the snapshot data lands on disk.
 app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!key.startsWith(DB_BACKUP_PREFIX)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
-        const blob = kvGet(key);
+        const scopedSnapshotKey = scopedKey(userId, key);
+        const blob = kvGet(scopedSnapshotKey);
         if (!blob) {
             return res.status(404).json({ error: 'Snapshot not found' });
         }
@@ -5046,33 +5245,33 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // Drain any pending debounced persist first — same pattern as
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
-            await flushPendingDb();
+            await flushPendingDb(userId);
             // Save a pre-restore snapshot so the user can undo.
             const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
-            kvCopyValue(DB_BLOB_KEY, preKey);
-            trimSnapshotsToLimits();
-            lastBackupTime = Date.now();
-            kvCopyValue(key, DB_BLOB_KEY);
-            invalidateDbCache();
+            kvCopyValue(scopedKey(userId, DB_BLOB_KEY), scopedKey(userId, preKey));
+            trimSnapshotsToLimits(userId);
+            lastBackupTimeByUser.set(userId, Date.now());
+            kvCopyValue(scopedSnapshotKey, scopedKey(userId, DB_BLOB_KEY));
+            invalidateDbCache(userId);
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
             // bytes instead of skipping based on the prior post-migration state.
-            kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            kvDel(scopedKey(userId, REMOTE_MIGRATION_MARKER_KEY));
             // Pre-warm chat store from the just-restored blob so subsequent
             // /api/read fetches and patch-sync baselines see the new data.
             // Use decodeDatabaseWithPersistentChatIds so it runs the migration
             // (now unmarked) and refreshes stale raw if the snapshot was a
             // REMOTE-block format.
             try {
-                const raw = kvGet(DB_BLOB_KEY);
+                const raw = kvGet(scopedKey(userId, DB_BLOB_KEY));
                 if (raw) {
-                    await decodeDatabaseWithPersistentChatIds(raw, {
+                    await decodeDatabaseWithPersistentChatIds(userId, raw, {
                         createBackup: false,
                     });
                     // Migration may have rewritten database.bin — etag must
                     // reflect the post-migration bytes the next /api/read sends.
-                    const finalRaw = kvGet(DB_BLOB_KEY);
-                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                    const finalRaw = kvGet(scopedKey(userId, DB_BLOB_KEY));
+                    if (finalRaw) setDbEtag(userId, computeBufferEtag(Buffer.from(finalRaw)));
                 }
             } catch (e) {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
@@ -5103,7 +5302,7 @@ app.get('/api/backup/boot-reminder', async (req, res, next) => {
 
 app.put('/api/backup/boot-reminder', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         const enabled = !!req.body?.enabled;
         kvSet(BOOT_REMINDER_KEY, Buffer.from(enabled ? '1' : '0', 'utf-8'));
@@ -5126,7 +5325,7 @@ app.get('/api/backup/server/path', async (req, res, next) => {
 
 app.put('/api/backup/server/path', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
     try {
         const next = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
         if (!next) {
@@ -5167,7 +5366,9 @@ app.put('/api/backup/server/path', async (req, res, next) => {
 const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
 
 app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
-    if (!checkActiveSession(req, res)) return;
+    if (!checkActiveSession(req, res, resolveUserId(req))) return;
+    const userId = resolveUserId(req);
+    if (!userId) return res.status(401).end();
     const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
 
     res.writeHead(200, {
@@ -5181,12 +5382,12 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
     };
 
     try {
-        const files = await listInlayFiles();
+        const files = await listInlayFiles(userId);
         const imageFiles = [];
 
         for (const entry of files) {
             if (!COMPRESS_IMAGE_EXTS.has(entry.ext)) continue;
-            const sidecar = await readInlaySidecar(entry.id);
+            const sidecar = await readInlaySidecar(userId, entry.id);
             if (sidecar && sidecar.type !== 'image') continue;
             imageFiles.push(entry);
         }
@@ -5212,11 +5413,11 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
                 }
 
                 if (webpBuf.length < original.length) {
-                    const sidecar = await readInlaySidecar(entry.id);
+                    const sidecar = await readInlaySidecar(userId, entry.id);
                     const info = sidecar || {};
-                    await writeInlayFile(entry.id, 'webp', webpBuf, { ...info, ext: 'webp' });
+                    await writeInlayFile(userId, entry.id, 'webp', webpBuf, { ...info, ext: 'webp' });
                     // invalidate thumbnail cache
-                    kvDel(`inlay_thumb/${entry.id}`);
+                    kvDel(scopedKey(userId, `inlay_thumb/${entry.id}`));
                     const saved = original.length - webpBuf.length;
                     totalSaved += saved;
                     compressed++;
@@ -5513,7 +5714,7 @@ app.post('/api/self-update', async (req, res) => {
         setTimeout(async () => {
             try {
             console.log(`[Update] Self-update to v${targetVersion} complete. Restarting...`);
-            try { await flushPendingDb(); } catch {}
+            try { await flushAllPendingDb(); } catch {}
             try { checkpointWal('TRUNCATE'); } catch {}
 
             const port = process.env.PORT || 6001;
@@ -5736,129 +5937,6 @@ app.post('/api/tunnel/stop', async (req, res) => {
     res.json({ status: 'off' });
 });
 
-// ─── Google Drive backup routes ──────────────────────────────────────────────
-
-app.get('/api/gdrive/status', async (req, res) => {
-    if (!await checkAuth(req, res)) return;
-    if (!gdriveBackup) return res.json({ configured: false, connected: false, lastBackup: null });
-    res.json(await gdriveBackup.getStatus());
-});
-
-app.get('/api/gdrive/auth-url', async (req, res) => {
-    if (!await checkAuth(req, res)) return;
-    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
-    const redirectUri = gdriveBackup.getRedirectUri(req);
-    kvSet('config/gdrive-pending-redirect', Buffer.from(redirectUri));
-    res.json({ url: gdriveBackup.buildAuthUrl(redirectUri) });
-});
-
-app.get('/api/gdrive/callback', async (req, res) => {
-    if (!gdriveBackup?.isConfigured()) return res.status(501).send('Google Drive not configured');
-    const { code, error } = req.query;
-    if (error || !code) {
-        return res.redirect('/?gdriveError=' + encodeURIComponent(error || 'no_code'));
-    }
-    try {
-        // Use the stored redirectUri so it exactly matches what was sent to Google
-        const pendingRaw = kvGet('config/gdrive-pending-redirect');
-        const redirectUri = pendingRaw ? pendingRaw.toString('utf-8') : gdriveBackup.getRedirectUri(req);
-        kvDel('config/gdrive-pending-redirect');
-        const tokens = await gdriveBackup.exchangeCode(String(code), redirectUri);
-        if (!tokens.refresh_token) {
-            return res.redirect('/?gdriveError=no_refresh_token');
-        }
-        gdriveBackup.saveTokens({
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expiry_date: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-        });
-        res.redirect('/?gdriveConnected=1');
-    } catch (err) {
-        logger.error('[GDrive] OAuth callback error:', err?.message || err);
-        res.redirect('/?gdriveError=' + encodeURIComponent(err?.message || 'unknown'));
-    }
-});
-
-app.post('/api/gdrive/backup', async (req, res) => {
-    if (!await checkAuth(req, res)) return;
-    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
-    try {
-        const result = await gdriveBackup.performBackup(async () => {
-            await flushPendingDb();
-            return kvGet('database/database.bin');
-        });
-        res.json({ ok: true, ...result });
-    } catch (err) {
-        logger.error('[GDrive] Manual backup error:', err?.message || err);
-        res.status(500).json({ error: err?.message || 'Backup failed' });
-    }
-});
-
-app.delete('/api/gdrive/disconnect', async (req, res) => {
-    if (!await checkAuth(req, res)) return;
-    if (!gdriveBackup) return res.json({ ok: true });
-    gdriveBackup.deleteTokens();
-    res.json({ ok: true });
-});
-
-app.get('/api/gdrive/files', async (req, res) => {
-    if (!await checkAuth(req, res)) return;
-    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
-    try {
-        const accessToken = await gdriveBackup.getValidAccessToken();
-        // Ensure folder exists (creates it if needed) so listing always works
-        const folderId = await gdriveBackup.getOrCreateFolder(accessToken);
-        const files = await gdriveBackup.listBackupFiles(accessToken, folderId);
-        res.json({ files });
-    } catch (err) {
-        res.status(500).json({ error: err?.message || 'Failed to list files' });
-    }
-});
-
-app.post('/api/gdrive/restore', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
-    if (!gdriveBackup?.isConfigured()) return res.status(501).json({ error: 'Google Drive not configured' });
-    try {
-        const fileId = typeof req.body?.fileId === 'string' ? req.body.fileId.trim() : '';
-        if (!fileId) return res.status(400).json({ error: 'fileId required' });
-        const accessToken = await gdriveBackup.getValidAccessToken();
-        const data = await gdriveBackup.downloadFile(accessToken, fileId);
-        if (!data || data.length < 10) return res.status(400).json({ error: 'Downloaded file appears empty or invalid' });
-
-        if (isBackupArchiveFormat(data)) {
-            // Full archive format (same as local backup export) — route through import logic.
-            // importBackupFromSource handles its own pre-restore snapshot + transaction.
-            async function* singleChunk() { yield data; }
-            const result = await queueStorageOperation(() => importBackupFromSource(singleChunk()));
-            res.json({ ok: true, format: 'archive', coldStorageFailed: result?.coldStorageFailed ?? 0 });
-        } else {
-            // Raw DB bytes format (GDrive-native backup)
-            await queueStorageOperation(async () => {
-                await flushPendingDb();
-                const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
-                kvCopyValue(DB_BLOB_KEY, preKey);
-                trimSnapshotsToLimits();
-                lastBackupTime = Date.now();
-                kvSet(DB_BLOB_KEY, data);
-                invalidateDbCache();
-                kvDel(REMOTE_MIGRATION_MARKER_KEY);
-                try {
-                    const raw = kvGet(DB_BLOB_KEY);
-                    if (raw) {
-                        await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
-                        const finalRaw = kvGet(DB_BLOB_KEY);
-                        if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
-                    }
-                } catch (e) {
-                    logger.warn('[GDrive restore] post-restore decode failed:', e?.message || e);
-                }
-            });
-            res.json({ ok: true, format: 'raw-db' });
-        }
-    } catch (err) { next(err); }
-});
-
 // ─── Admin force-restore (token-protected, one-shot recovery tool) ──────────
 // Usage: curl -X POST https://pocketrisu.fly.dev/api/admin/force-restore \
 //          -H "X-Admin-Token: $TOKEN" \
@@ -5870,36 +5948,51 @@ app.post('/api/admin/force-restore', async (req, res, next) => {
     if (!token) return res.status(501).json({ error: 'ADMIN_RESTORE_TOKEN not set' });
     if (req.headers['x-admin-token'] !== token) return res.status(403).json({ error: 'Forbidden' });
     try {
+        // This hatch bypasses rl_auth entirely, so there's no session to infer
+        // a target account from — require an explicit username and resolve it.
+        // Never default to the admin account or guess.
+        const username = typeof req.headers['x-target-username'] === 'string'
+            ? req.headers['x-target-username']
+            : (typeof req.query?.username === 'string' ? req.query.username : '');
+        if (!username) {
+            return res.status(400).json({ error: 'username required (X-Target-Username header or ?username= query param)' });
+        }
+        const targetUser = getUserByUsername(username);
+        if (!targetUser) {
+            return res.status(400).json({ error: `No account found for username '${username}'` });
+        }
+        const userId = targetUser.id;
+
         const data = req.body;
         if (!Buffer.isBuffer(data) || data.length < 10) return res.status(400).json({ error: 'Body must be raw binary (Content-Type: application/octet-stream), min 10 bytes' });
 
         if (isBackupArchiveFormat(data)) {
             async function* singleChunk() { yield data; }
-            const result = await queueStorageOperation(() => importBackupFromSource(singleChunk()));
-            logger.info('[Force restore] Restored archive format', data.length, 'bytes via admin endpoint');
+            const result = await queueStorageOperation(() => importBackupFromSource(userId, singleChunk()));
+            logger.info(`[Force restore] Restored archive format ${data.length} bytes via admin endpoint for user '${username}' (${userId})`);
             res.json({ ok: true, format: 'archive', bytes: data.length, coldStorageFailed: result?.coldStorageFailed ?? 0 });
         } else {
             await queueStorageOperation(async () => {
-                await flushPendingDb();
+                await flushPendingDb(userId);
                 const preKey = `${DB_BACKUP_PREFIX}${(Date.now() / 100).toFixed()}.bin`;
-                kvCopyValue(DB_BLOB_KEY, preKey);
-                trimSnapshotsToLimits();
-                lastBackupTime = Date.now();
-                kvSet(DB_BLOB_KEY, data);
-                invalidateDbCache();
-                kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                kvCopyValue(scopedKey(userId, DB_BLOB_KEY), scopedKey(userId, preKey));
+                trimSnapshotsToLimits(userId);
+                lastBackupTimeByUser.set(userId, Date.now());
+                kvSet(scopedKey(userId, DB_BLOB_KEY), data);
+                invalidateDbCache(userId);
+                kvDel(scopedKey(userId, REMOTE_MIGRATION_MARKER_KEY));
                 try {
-                    const raw = kvGet(DB_BLOB_KEY);
+                    const raw = kvGet(scopedKey(userId, DB_BLOB_KEY));
                     if (raw) {
-                        await decodeDatabaseWithPersistentChatIds(raw, { createBackup: false });
-                        const finalRaw = kvGet(DB_BLOB_KEY);
-                        if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                        await decodeDatabaseWithPersistentChatIds(userId, raw, { createBackup: false });
+                        const finalRaw = kvGet(scopedKey(userId, DB_BLOB_KEY));
+                        if (finalRaw) setDbEtag(userId, computeBufferEtag(Buffer.from(finalRaw)));
                     }
                 } catch (e) {
                     logger.warn('[Force restore] post-restore decode failed:', e?.message || e);
                 }
             });
-            logger.info('[Force restore] Restored raw-db format', data.length, 'bytes via admin endpoint');
+            logger.info(`[Force restore] Restored raw-db format ${data.length} bytes via admin endpoint for user '${username}' (${userId})`);
             res.json({ ok: true, format: 'raw-db', bytes: data.length });
         }
     } catch (err) { next(err); }
@@ -5942,11 +6035,105 @@ async function getHttpsOptions() {
     }
 }
 
+// ─── One-time per-account kv/filesystem split ───────────────────────────────
+// Historically every kv key and every inlay file was one big shared blob
+// across the whole deployment. This runs exactly once (guarded by a genuinely
+// global, unscoped marker) to move all pre-existing unscoped per-account data
+// under the bootstrapped admin account's scope. Must run AFTER bootstrapAdmin()
+// (needs an admin to target) and AFTER migrateInlaysToFilesystem() (that
+// legacy migration writes flat, unscoped inlay files — this migration's job
+// is to relocate whatever it left at the top level, not redo the kv→fs step).
+const PER_ACCOUNT_MIGRATION_MARKER_KEY = 'migration/per-account-kv-split-done';
+// Same per-account key set documented at the top of this file (scopedKey
+// call-sites) — database.bin, its rotated snapshots, and every per-account
+// kv namespace. rl_chats/rl_chat_folders/rl_lorebooks* and config/* are
+// intentionally excluded (already correctly scoped, or genuinely global).
+const PER_ACCOUNT_KV_PREFIXES = [
+    'assets/', 'remotes/', 'coldstorage/', 'drafts/', 'migration-backup/',
+    'inlay_meta/', 'inlay_info/', 'inlay_thumb/',
+];
+
+function isPerAccountUnscopedKey(key) {
+    if (key === 'database/database.bin') return true;
+    if (key.startsWith('database/dbbackup-')) return true;
+    if (key === REMOTE_MIGRATION_MARKER_KEY) return true;
+    return PER_ACCOUNT_KV_PREFIXES.some((p) => key.startsWith(p));
+}
+
+async function migratePerAccountData() {
+    const already = kvGet(PER_ACCOUNT_MIGRATION_MARKER_KEY);
+    if (already !== null && already.length > 0) return;
+
+    const admins = listUsers().filter((u) => !!u.is_admin);
+    if (admins.length === 0) {
+        logger.error('[Migration] Per-account kv/filesystem split SKIPPED: no admin account exists yet. Data stays in its old unscoped location — safe to re-run automatically on next boot once an admin account is created.');
+        return;
+    }
+    if (admins.length > 1) {
+        logger.error(`[Migration] Per-account kv/filesystem split SKIPPED: multiple admin accounts found (${admins.map((u) => u.username).join(', ')}) — need exactly one unambiguous target and won't guess. Will retry automatically on next boot once resolved.`);
+        return;
+    }
+
+    const adminId = admins[0].id;
+    const adminUsername = admins[0].username;
+    const startedAt = Date.now();
+    logger.info(`[Migration] Starting one-time per-account kv/filesystem split — target admin account '${adminUsername}' (id ${adminId})...`);
+
+    // ── 1) Move matching kv rows: oldKey -> u/<adminId>/oldKey ──────────────
+    const allKeys = kvList();
+    const keysToMove = allKeys.filter(isPerAccountUnscopedKey);
+    let movedKeys = 0;
+    try {
+        const moveKv = sqliteDb.transaction(() => {
+            for (const key of keysToMove) {
+                const newKey = scopedKey(adminId, key);
+                kvCopyValue(key, newKey);
+                kvDel(key);
+                movedKeys++;
+            }
+        });
+        moveKv();
+    } catch (e) {
+        logger.error(`[Migration] Per-account kv split FAILED after moving ${movedKeys}/${keysToMove.length} key(s) — NOT marking done, will retry next boot:`, e);
+        return;
+    }
+
+    // ── 2) Move top-level inlay files into save/inlays/<adminId>/ ──────────
+    // Only files directly inside inlayDir (id.ext / id.meta.json) — NOT
+    // already-numeric subdirectories (which would mean this already ran, or
+    // another account already has scoped data — never touch those).
+    let movedFiles = 0;
+    try {
+        await ensureInlayDir(adminId);
+        let entries = [];
+        try { entries = readdirSync(inlayDir, { withFileTypes: true }); } catch { /* dir missing — nothing to move */ }
+        for (const entry of entries) {
+            if (!entry.isFile()) continue; // skips numeric per-account subdirs
+            if (entry.name === '.migrated_to_fs') continue;
+            const src = path.join(inlayDir, entry.name);
+            const dest = path.join(inlayDirFor(adminId), entry.name);
+            renameSync(src, dest);
+            movedFiles++;
+        }
+    } catch (e) {
+        logger.error(`[Migration] Per-account inlay file move FAILED after moving ${movedFiles} file(s) — NOT marking done, will retry next boot:`, e);
+        return;
+    }
+
+    kvSet(PER_ACCOUNT_MIGRATION_MARKER_KEY, Buffer.from('done', 'utf-8'));
+    const elapsedMs = Date.now() - startedAt;
+    logger.info(`[Migration] Per-account kv/filesystem split COMPLETE: ${movedKeys} kv key(s) moved, ${movedFiles} inlay file(s) moved, ${elapsedMs}ms elapsed.`);
+}
+
 async function startServer() {
     try {
         await bootstrapAdmin();
         await migrateInlaysToFilesystem();
-        await migrateRemoteBlocksIfNeeded();
+        await migratePerAccountData();
+        // migrateRemoteBlocksIfNeeded() no longer runs unconditionally at boot —
+        // it needs a specific account's database.bin to evaluate, and there's no
+        // single global one anymore. It already runs lazily, per account, from
+        // decodeDatabaseWithPersistentChatIds() on that account's first read/patch.
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
         let server;
@@ -5974,12 +6161,28 @@ async function startServer() {
     }
 }
 
+// Flushes EVERY account's pending debounced database.bin save — used only at
+// shutdown, where there's no single request/userId to scope to. Recovers each
+// pending account's id straight out of the scoped hex keys already tracked in
+// saveTimers (u/<userId>/database/database.bin), so no separate registry of
+// "active users" needs to be maintained elsewhere.
+async function flushAllPendingDb() {
+    const hexKeys = Object.keys(saveTimers);
+    for (const hexKey of hexKeys) {
+        let decoded;
+        try { decoded = Buffer.from(hexKey, 'hex').toString('utf-8'); } catch { continue; }
+        const match = decoded.match(/^u\/([^/]+)\/database\/database\.bin$/);
+        if (!match) continue;
+        try { await flushPendingDb(match[1]); } catch (e) { logger.error(`[Server] Flush error for user ${match[1]}:`, e); }
+    }
+}
+
 // Graceful shutdown: flush pending patches and checkpoint WAL before exit
 for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, async () => {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         stopTunnel();
-        try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
+        try { await flushAllPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);
     });
@@ -6012,21 +6215,5 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         try { checkpointWal('TRUNCATE'); }
         catch { /* non-fatal */ }
     }, 5 * 60 * 1000); // every 5 minutes
-
-    // Periodic Google Drive backup — runs only if configured, connected, and DB changed.
-    setInterval(async () => {
-        if (!gdriveBackup?.isConfigured()) return;
-        if (!gdriveBackup?.loadTokens()?.refresh_token) return;
-        if (!gdriveBackup?.isDbNewerThanLastBackup()) return;
-        try {
-            const result = await gdriveBackup.performBackup(async () => {
-                await flushPendingDb();
-                return kvGet('database/database.bin');
-            });
-            logger.info(`[GDrive] Auto-backup: ${result.fileName}`);
-        } catch (err) {
-            logger.error('[GDrive] Auto-backup failed:', err?.message || err);
-        }
-    }, 5 * 60 * 1000);
 
 })();
