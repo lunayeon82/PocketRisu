@@ -36,8 +36,13 @@ export async function refreshLinkedBookIndex(force = false) {
 
 // content sent to the shared repo should never carry this local-only linking
 // metadata — it's meaningless (and stale) once it's someone else's copy.
+// `folder` is dropped too: it's the uploader's own organizational structure,
+// not content — a recipient character almost never has a same-keyed folder,
+// so shipping it made every synced entry silently invisible (still present
+// in globalLore, just filtered out of every folder view since it pointed at
+// a folder that doesn't exist there — see syncEntriesFromSharedLorebook).
 function stripLinkMeta(entry: loreBook): loreBook {
-    const { source_lorebook_id, source_updated_at, ...rest } = entry
+    const { source_lorebook_id, source_updated_at, folder, ...rest } = entry
     return rest as loreBook
 }
 
@@ -105,6 +110,17 @@ export async function uploadEntryToSharedLorebook(target: loreBook, content: lor
 // uploader had. Safe to always apply unconditionally — a linked entry's
 // `value` never holds unpublished WIP (that lives in the lock holder's
 // editDraft/server draft instead), so there's nothing here to lose.
+//
+// `folder` gets the same treatment for the same reason, plus a correctness
+// issue on top: newer shared-book content may still carry an uploader's
+// folder key from before stripLinkMeta dropped it on upload (already-
+// published books aren't retroactively cleaned). A folder key from a
+// DIFFERENT character almost never matches one of this character's own
+// folders, and LoreBookList only renders an entry under its own folder's
+// view — so inheriting it silently drops the entry from every view (it's
+// still in globalLore, just unreachable). Brand-new entries default to no
+// folder (top-level); already-linked entries keep whatever folder the user
+// locally filed them under.
 export async function syncEntriesFromSharedLorebook(character: character, bookId: string): Promise<number> {
     const detail = await ns.getSharedLorebook(bookId)
     const existingById = new Map(
@@ -113,10 +129,12 @@ export async function syncEntriesFromSharedLorebook(character: character, bookId
     const kept = character.globalLore.filter(e => e.source_lorebook_id !== bookId)
     const fresh = detail.content.map(entry => {
         const prev = entry.id ? existingById.get(entry.id) : undefined
+        const { folder: _folder, ...entryWithoutFolder } = entry
         return {
-            ...entry,
+            ...entryWithoutFolder,
             alwaysActive: prev ? prev.alwaysActive : entry.alwaysActive,
             disabled: prev ? prev.disabled : entry.disabled,
+            ...(prev?.folder ? { folder: prev.folder } : {}),
             source_lorebook_id: bookId,
             source_updated_at: detail.updated_at,
         }
