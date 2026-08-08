@@ -825,7 +825,11 @@ export class NodeStorage{
         if (!da.ok) throw new Error(`updateChatMeta error: ${da.status}`)
     }
 
-    // Bulk position/folder update for drag-and-drop reorder.
+    // Bulk position/folder update for drag-and-drop reorder. The server
+    // applies whichever ids it owns and reports the rest as `skipped`
+    // (e.g. a sibling whose fire-and-forget creation POST hasn't landed yet)
+    // instead of failing the whole batch — log those so a stuck-looking
+    // reorder is traceable instead of silently reverting on next reload.
     async reorderChats(updates: { id: string, position: number, folderId?: string | null }[]): Promise<void> {
         const da = await this.authFetch('/api/chats/reorder', {
             method: 'PATCH',
@@ -833,6 +837,10 @@ export class NodeStorage{
             body: JSON.stringify(updates.map(u => ({ id: u.id, position: u.position, folder_id: u.folderId ?? null }))),
         })
         if (!da.ok) throw new Error(`reorderChats error: ${da.status}`)
+        const result: { skipped?: string[] } = await da.json().catch(() => ({}))
+        if (result.skipped && result.skipped.length > 0) {
+            console.warn('[reorderChats] server skipped ids not yet owned (will need another reorder to settle):', result.skipped)
+        }
     }
 
     // ── Chat folders ────────────────────────────────────────────────────────

@@ -407,10 +407,14 @@ function patchChatMeta(req, res) {
 }
 
 // PATCH /api/chats/reorder — bulk position/folder update for drag-and-drop.
-// Body: [{ id, position, folder_id }, ...]. All-or-nothing: every id must
-// already belong to the requesting user or the whole batch is rejected, so a
-// forged id can't be used to probe/touch another account's chats and a
-// partial failure never leaves the list half-reordered.
+// Body: [{ id, position, folder_id }, ...]. Applies whichever ids the
+// requesting user actually owns and skips the rest (reported back in
+// `skipped`) instead of rejecting the whole batch — a forged id still can't
+// touch another account's chats (stmtReorderOne is scoped by user_id and a
+// non-owned id is filtered out before it ever runs), but a single stale or
+// not-yet-created id (e.g. a brand-new chat whose fire-and-forget POST
+// /api/chats hasn't landed yet when a sibling gets dragged) no longer nukes
+// every other sibling's position in the same request.
 function reorderChats(req, res) {
     const userId = resolveUserId(req);
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
@@ -425,22 +429,17 @@ function reorderChats(req, res) {
         }
     }
 
-    const ids = [...new Set(updates.map(u => u.id))];
-    const owned = new Set(
-        ids.filter(id => stmtOwnsChat.get(id, userId))
-    );
-    if (owned.size !== ids.length) {
-        return res.status(404).json({ error: 'One or more chats not found' });
-    }
+    const owned = updates.filter(u => stmtOwnsChat.get(u.id, userId));
+    const skipped = updates.filter(u => !owned.includes(u)).map(u => u.id);
 
     sharedDb.transaction(() => {
-        for (const u of updates) {
+        for (const u of owned) {
             const folderId = u.folder_id == null ? null : String(u.folder_id);
             stmtReorderOne.run(u.position, folderId, u.id, userId);
         }
     })();
 
-    return res.json({ ok: true, updated: updates.length });
+    return res.json({ ok: true, updated: owned.length, skipped });
 }
 
 // DELETE /api/chats/:id
