@@ -353,6 +353,39 @@
         moveFolderToPosition(dragging.id, null, (arr) => arr.length)
         persistFolderOrder(null)
     }
+
+    // ── Chat list / model-prompt-toggle panel resize ────────────────────────
+    // Plain pointer-drag (not native HTML5 DnD, which is overkill for a
+    // press-move-release gesture with no drop target) on a thin handle
+    // between the two sections. Height is clamped so the list can't be
+    // dragged down to nothing or up into an absurdly tall panel.
+    const CHAT_LIST_MIN_HEIGHT = 120
+    const CHAT_LIST_MAX_HEIGHT = 560
+    let chatListHeight = $state(320)
+    let resizingChatList = $state(false)
+    let resizeStartY = 0
+    let resizeStartHeight = 0
+
+    function clampChatListHeight(h: number): number {
+        return Math.min(CHAT_LIST_MAX_HEIGHT, Math.max(CHAT_LIST_MIN_HEIGHT, h))
+    }
+
+    function onResizeHandlePointerDown(e: PointerEvent) {
+        resizingChatList = true
+        resizeStartY = e.clientY
+        resizeStartHeight = chatListHeight
+        try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch {}
+    }
+
+    function onResizeHandlePointerMove(e: PointerEvent) {
+        if (!resizingChatList) return
+        chatListHeight = clampChatListHeight(resizeStartHeight + (e.clientY - resizeStartY))
+    }
+
+    function onResizeHandlePointerUp(e: PointerEvent) {
+        resizingChatList = false
+        try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId) } catch {}
+    }
 </script>
 <div class="flex flex-col w-full">
     <ShButton className="relative bottom-2 w-full" onclick={() => {
@@ -395,7 +428,7 @@
             </div>
         {/if}
     </div>
-    <div class="flex flex-col mt-2 overflow-y-auto max-h-80">
+    <div class="flex flex-col mt-2 overflow-y-auto" style="height: {chatListHeight}px">
         {#each tree as node (node.kind === 'folder' ? node.folder.id : node.chat.id)}
             <div animate:flip={{ duration: 200 }}>
                 <ChatTreeItem chara={chara} node={node} depth={0} onMove={onMove} dragState={dragState} draggingId={draggingId} onDragStart={onDragStart} onDragEnd={onDragEnd} onDropOn={onDropOn} onHoverChange={onHoverChange} onHoverClear={onHoverClear} hoverTarget={hoverTarget} resolveDropTargetAtPoint={resolveDropTargetAtPoint} onDropRoot={onDropRoot} onPointerHoverRoot={onPointerHoverRoot}/>
@@ -416,6 +449,26 @@
                 최상위로 이동
             </div>
         {/if}
+    </div>
+
+    <!-- Drag to resize the chat list vs. the model/prompt/toggle panel below.
+         touch-none stops touch-scroll from hijacking the gesture; pointer
+         capture (see onResizeHandlePointerDown) keeps move/up events routed
+         here even once the finger/cursor leaves this thin strip. -->
+    <div
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="채팅 목록 크기 조절"
+        class="group flex items-center justify-center h-3 shrink-0 cursor-row-resize touch-none select-none"
+        onpointerdown={onResizeHandlePointerDown}
+        onpointermove={onResizeHandlePointerMove}
+        onpointerup={onResizeHandlePointerUp}
+        onpointercancel={onResizeHandlePointerUp}
+    >
+        <span
+            class="w-8 h-1 rounded-full bg-textcolor2/30 group-hover:bg-primary transition-colors"
+            class:bg-primary={resizingChatList}
+        ></span>
     </div>
 
     <MoveToFolderModal
