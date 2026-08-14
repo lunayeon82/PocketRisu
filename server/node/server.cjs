@@ -66,7 +66,7 @@ const {
     mountPendingGenApi, createPendingGeneration, flushPendingGenerationBody,
     finishPendingGeneration, sweepPendingGenerations,
 } = require('./pendingGenApi.cjs');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, exec } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
 
@@ -2967,8 +2967,42 @@ mountLorebookApi(app);
 mountPendingGenApi(app);
 
 // ── Account management (admin only, except self password change) ──────────
-app.get('/admin', requireAdmin, (req, res) => {
-    res.send(adminPageHtml(listUsers(), getSession(req).username))
+
+// Deploy is `git pull` on this same checkout (see CLAUDE.md), so comparing
+// local HEAD against the remote branch tells us whether a deploy is pending.
+// Async (not execSync) so a slow/stalled network fetch never blocks the
+// single Node event loop for other users — bounded by `timeout` either way.
+const REPO_ROOT = path.join(__dirname, '..', '..');
+function execAsync(cmd, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        exec(cmd, { cwd: REPO_ROOT, timeout: timeoutMs, encoding: 'utf-8' }, (err, stdout) => {
+            if (err) reject(err);
+            else resolve(stdout.trim());
+        });
+    });
+}
+async function getGitUpdateStatus() {
+    if (!existsSync(path.join(REPO_ROOT, '.git'))) return null;
+    try {
+        const branch = await execAsync('git rev-parse --abbrev-ref HEAD', 5000);
+        await execAsync(`git fetch --quiet origin ${branch}`, 8000);
+        const local = await execAsync('git rev-parse HEAD', 5000);
+        const remote = await execAsync(`git rev-parse origin/${branch}`, 5000);
+        if (local === remote) return { checked: true, upToDate: true, branch };
+        const behindBy = parseInt(await execAsync(`git rev-list --count HEAD..origin/${branch}`, 5000), 10);
+        return {
+            checked: true, upToDate: false, branch, behindBy,
+            localCommit: local.slice(0, 7), remoteCommit: remote.slice(0, 7),
+        };
+    } catch (e) {
+        logger.error('[Admin] git update check failed:', e);
+        return { checked: false };
+    }
+}
+
+app.get('/admin', requireAdmin, async (req, res) => {
+    const gitStatus = await getGitUpdateStatus();
+    res.send(adminPageHtml(listUsers(), getSession(req).username, gitStatus))
 })
 
 app.get('/api/auth/users', requireAdmin, (req, res) => {

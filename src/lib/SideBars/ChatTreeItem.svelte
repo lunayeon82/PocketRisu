@@ -14,7 +14,7 @@
     import TextInput from "../UI/GUI/TextInput.svelte"
     import { chatDeselected } from "src/ts/stores.svelte"
     import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte"
-    import { ensureChatHydrated, saveChatToServer, deleteChatFromServer, updateChatMeta, updateChatFolder, deleteChatFolder } from "src/ts/storage/chatStorage"
+    import { ensureChatHydrated, saveNewChatToServer, deleteChatFromServer, updateChatMeta, updateChatFolder, deleteChatFolder } from "src/ts/storage/chatStorage"
     import { alertConfirm, alertError, alertSelect, notifySuccess, notifyError } from "src/ts/alert"
     import { exportChat } from "src/ts/characters"
     import { language } from "src/lang"
@@ -321,7 +321,7 @@
         changeChatTo(0)
         chara.chats = chara.chats
         void requestImmediateSave()
-        saveChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
+        saveNewChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
         notifySuccess(language.copyChatSuccess)
     }
 

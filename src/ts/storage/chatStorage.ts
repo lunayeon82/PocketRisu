@@ -118,6 +118,27 @@ export async function saveChatToServer(chaId: string, chatIndex: number, chatId:
     await storage.saveChatContent(chaId, chatIndex, chatId, chat)
 }
 
+// Per-character queue for saveNewChatToServer — see below.
+const pendingNewChatSaves = new Map<string, Promise<void>>()
+
+// Use this (not saveChatToServer directly) for the immediate, fire-and-forget
+// save fired right after a NEW chat is created (unshift + saveXToServer(...).catch(() => {})
+// at each chat-creation call site). upsertChatFull's INSERT branch is
+// last-writer-wins-at-position-0 (shifts every existing row down, then
+// inserts the new one at 0) — if two such creation saves for the same
+// character are in flight at once, whichever one's server transaction
+// commits last wins position 0, independent of which was created first
+// locally, which visibly scrambles the order of newly-created chats. This
+// only serializes the create-then-immediately-PUT step per character; the
+// periodic tracked-changes autosave loop (globalApi.svelte.ts) already saves
+// one chat at a time globally and is unaffected.
+export function saveNewChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
+    const prior = pendingNewChatSaves.get(chaId) ?? Promise.resolve()
+    const next = prior.catch(() => {}).then(() => saveChatToServer(chaId, chatIndex, chatId, chat))
+    pendingNewChatSaves.set(chaId, next.catch(() => {}))
+    return next
+}
+
 export async function deleteChatFromServer(chatId: string): Promise<void> {
     const storage = forageStorage.realStorage
     await storage.deleteChatContent(chatId)

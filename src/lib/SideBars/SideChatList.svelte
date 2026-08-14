@@ -5,7 +5,7 @@
 
     import type { character, Chat, ChatFolder } from "src/ts/storage/database.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
-    import { saveChatToServer, createChatFolder, updateChatMeta, updateChatFolder, reorderChats } from "src/ts/storage/chatStorage";
+    import { saveNewChatToServer, createChatFolder, updateChatMeta, updateChatFolder, reorderChats } from "src/ts/storage/chatStorage";
     import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID, chatDeselected } from "src/ts/stores.svelte";
 
@@ -399,7 +399,7 @@
         chara.chats = chats
         changeChatTo(0)
         void requestImmediateSave()
-        saveChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
+        saveNewChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {})
     }}>{language.newChat}</ShButton>
 
     <!-- Zero-height positioning anchor for the drag-hover banner below — it

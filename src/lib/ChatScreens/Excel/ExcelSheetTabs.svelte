@@ -4,7 +4,7 @@
     import { DBState, selectedCharID, chatDeselected, ReloadGUIPointer } from "src/ts/stores.svelte";
     import { newChatModelDefaults } from "src/ts/storage/database.svelte";
     import { changeChatTo, requestImmediateSave } from "src/ts/globalApi.svelte";
-    import { saveChatToServer } from "src/ts/storage/chatStorage";
+    import { saveNewChatToServer } from "src/ts/storage/chatStorage";
 
     let chara = $derived(DBState.db.characters[$selectedCharID]);
 
@@ -19,7 +19,7 @@
         chara.chats = chats;
         changeChatTo(0);
         void requestImmediateSave();
-        saveChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {});
+        saveNewChatToServer(chara.chaId, 0, newChat.id, newChat as any).catch(() => {});
         $ReloadGUIPointer += 1;
     }
 </script>

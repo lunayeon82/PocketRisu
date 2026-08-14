@@ -296,7 +296,16 @@ function escapeHtml(str) {
 // ── Admin page ───────────────────────────────────────────────────────────
 // Same standalone-inline-page approach as loginPageHtml, plus a small inline
 // <script> driving fetch() calls to the /api/auth/users endpoints.
-function adminPageHtml(users, currentUsername) {
+function adminPageHtml(users, currentUsername, gitStatus) {
+    const gitBanner = (() => {
+        if (!gitStatus || !gitStatus.checked) return '';
+        if (gitStatus.upToDate) return '';
+        return `<div class="update-banner">
+  업데이트 있음 — <code>${escapeHtml(gitStatus.branch)}</code> 브랜치가 origin보다 ${gitStatus.behindBy}커밋 뒤처짐
+  (<code>${escapeHtml(gitStatus.localCommit)}</code> → <code>${escapeHtml(gitStatus.remoteCommit)}</code>).
+  서버에서 <code>git pull</code>로 배포하면 반영됩니다.
+</div>`;
+    })();
     const rows = users.map((u) => {
         const isSelf = u.username === currentUsername;
         const isLastAdmin = !!u.is_admin && users.filter((x) => x.is_admin).length <= 1;
@@ -345,10 +354,13 @@ function adminPageHtml(users, currentUsername) {
   .msg { min-height: 1.2rem; font-size: 0.85rem; margin-bottom: 1rem; }
   .msg.error { color: #ff6b6b; }
   .msg.ok { color: #6bcb77; }
+  .update-banner { max-width: 48rem; margin-bottom: 1.5rem; padding: 0.75rem 1rem; border-radius: 0.375rem; background: #3a2f0d; border: 1px solid #6b5613; color: #f0d878; font-size: 0.85rem; }
+  .update-banner code { background: rgba(255,255,255,0.1); padding: 0.05rem 0.3rem; border-radius: 0.2rem; }
 </style>
 </head>
 <body>
 <h1>계정 관리 <a href="/">← 앱으로</a></h1>
+${gitBanner}
 
 <table>
   <thead><tr><th>사용자</th><th>권한</th><th>생성일</th><th>비밀번호 변경</th><th></th></tr></thead>
