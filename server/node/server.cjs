@@ -62,6 +62,10 @@ const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasR
 const { mountChatApi } = require('./chatApi.cjs');
 const { mountChatFolderApi } = require('./chatFolderApi.cjs');
 const { mountLorebookApi } = require('./lorebookApi.cjs');
+const {
+    mountPendingGenApi, createPendingGeneration, flushPendingGenerationBody,
+    finishPendingGeneration, sweepPendingGenerations,
+} = require('./pendingGenApi.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -1279,6 +1283,12 @@ const PROXY_STREAM_MAX_ACTIVE_JOBS = 64;
 const PROXY_STREAM_MAX_PENDING_EVENTS = 512;
 const PROXY_STREAM_MAX_PENDING_BYTES = 2 * 1024 * 1024;
 const PROXY_STREAM_MAX_BODY_BASE64_BYTES = 8 * 1024 * 1024;
+
+// --- Pending-generation (durable AI-stream buffering) constants ---
+const PENDING_GEN_STALL_MS = 10 * 60 * 1000;   // streaming row with no update in 10min = abandoned
+const PENDING_GEN_TTL_MS = Number(process.env.PENDING_GEN_TTL_MS) || 12 * 60 * 60 * 1000; // done/error rows kept 12h
+const PENDING_GEN_GC_INTERVAL_MS = 60000;
+const PENDING_GEN_PER_USER_CAP = 50;
 const proxyStreamJobs = new Map();
 
 const loginRouteLimiter = rateLimit({
@@ -2343,11 +2353,115 @@ async function checkAuth(req, res, returnOnlyStatus = false, _opts = {}){
     }
 }
 
+// ─── Durable buffering for cloud AI streaming (opt-in, /proxy2 only) ──────────
+// Normally /proxy2 is a pure stateless relay — nothing about an AI response
+// ever touches server storage. When the client tags a request with
+// risu-durable-meta (only the main assistant-reply generation does this, see
+// sendChat()), the server also buffers the raw upstream bytes into
+// rl_pending_generations so a client that disconnects mid-stream (tab
+// backgrounded/killed) can recover the response later instead of losing it.
+// Every other /proxy2 caller (images, backups, plugin fetches, ancillary
+// requests that don't set risu-durable-meta) is completely unaffected.
+const DURABLE_MAX_BODY_BYTES = 4 * 1024 * 1024;
+const DURABLE_FLUSH_INTERVAL_MS = 1000;
+const DURABLE_FLUSH_BYTES = 8 * 1024;
+
+function parseDurableMeta(headerVal) {
+    if (!headerVal) return null;
+    try {
+        const parsed = JSON.parse(decodeURIComponent(headerVal));
+        if (!parsed || typeof parsed !== 'object') return null;
+        const { genId, roomChatId, characterId, parserKind, replayMeta } = parsed;
+        if (!genId || !roomChatId || !characterId || !parserKind) return null;
+        return {
+            genId: String(genId),
+            roomChatId: String(roomChatId),
+            characterId: String(characterId),
+            parserKind: String(parserKind),
+            replayMeta,
+        };
+    } catch {
+        return null;
+    }
+}
+
+// Pumps the upstream AI response independently of the live client connection
+// (res) — a client disconnect no longer aborts the upstream read, unlike
+// pipeline() below which ties source and destination together. Bytes keep
+// landing in rl_pending_generations even if nobody's listening live. Mirrors
+// runProxyStreamJob's detached-pump shape (server.cjs, local-network-only
+// job system), but persists to SQLite instead of an in-memory Map so it
+// survives page reload / server restart, and isn't restricted to local hosts.
+async function runDurableProxyPump(originalResponse, res, meta) {
+    let resWritable = true;
+    res.on('close', () => { resWritable = false; });
+    res.on('error', () => { resWritable = false; });
+
+    createPendingGeneration({
+        id: meta.id,
+        userId: meta.userId,
+        roomChatId: meta.roomChatId,
+        characterId: meta.characterId,
+        parserKind: meta.parserKind,
+        replayMeta: meta.replayMeta,
+        initialBody: Buffer.alloc(0),
+    });
+
+    const chunks = [];
+    let totalLen = 0;
+    let truncated = false;
+    let lastFlushAt = Date.now();
+    let lastFlushedLen = 0;
+
+    const reader = originalResponse.body.getReader();
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (value && value.length > 0) {
+                if (resWritable) {
+                    try { res.write(value); } catch { resWritable = false; }
+                }
+                if (!truncated) {
+                    if (totalLen + value.length > DURABLE_MAX_BODY_BYTES) {
+                        truncated = true;
+                    } else {
+                        chunks.push(Buffer.from(value));
+                        totalLen += value.length;
+                    }
+                }
+                const sinceFlush = Date.now() - lastFlushAt;
+                if (sinceFlush >= DURABLE_FLUSH_INTERVAL_MS || (totalLen - lastFlushedLen) >= DURABLE_FLUSH_BYTES) {
+                    const body = Buffer.concat(chunks);
+                    flushPendingGenerationBody(meta.id, body, truncated);
+                    lastFlushAt = Date.now();
+                    lastFlushedLen = body.length;
+                }
+            }
+            if (done) break;
+        }
+        finishPendingGeneration({
+            id: meta.id, status: 'done', rawBody: Buffer.concat(chunks), truncated,
+            upstreamStatus: meta.upstreamStatus,
+        });
+    } catch (err) {
+        finishPendingGeneration({
+            id: meta.id, status: 'error', rawBody: Buffer.concat(chunks), truncated,
+            upstreamStatus: meta.upstreamStatus,
+            errorMessage: err?.name === 'AbortError' ? 'Proxy request timed out or aborted' : `${err}`,
+        });
+        logger.error(`[DurableProxy] ${meta.id}`, err);
+    } finally {
+        if (resWritable) {
+            try { res.end(); } catch { /* client already gone */ }
+        }
+    }
+}
+
 const reverseProxyFunc = async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    
+
     const urlParam = req.headers['risu-url'] ? decodeURIComponent(req.headers['risu-url']) : req.query.url;
 
     if (!urlParam) {
@@ -2356,6 +2470,8 @@ const reverseProxyFunc = async (req, res, next) => {
         });
         return;
     }
+    const durableMeta = parseDurableMeta(req.headers['risu-durable-meta']);
+    const durableUserId = durableMeta ? resolveUserId(req) : null;
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
     const timeout = createTimeoutController(timeoutMs);
     let originalResponse;
@@ -2419,9 +2535,24 @@ const reverseProxyFunc = async (req, res, next) => {
         res.header(headObj);
         // send response status to client
         res.status(originalResponse.status);
-        // send response body to client
-        await pipeline(originalResponse.body, res);
 
+        if (durableMeta && durableUserId) {
+            // Detached pump — see runDurableProxyPump. Does not throw; it
+            // owns its own error handling since by this point headers are
+            // already sent and a fresh error response can no longer be sent.
+            await runDurableProxyPump(originalResponse, res, {
+                id: durableMeta.genId,
+                userId: durableUserId,
+                roomChatId: durableMeta.roomChatId,
+                characterId: durableMeta.characterId,
+                parserKind: durableMeta.parserKind,
+                replayMeta: durableMeta.replayMeta,
+                upstreamStatus: originalResponse.status,
+            });
+        } else {
+            // send response body to client
+            await pipeline(originalResponse.body, res);
+        }
 
     }
     catch (err) {
@@ -2833,6 +2964,7 @@ app.get('/api/auth/whoami', (req, res) => {
 mountChatApi(app);
 mountChatFolderApi(app);
 mountLorebookApi(app);
+mountPendingGenApi(app);
 
 // ── Account management (admin only, except self password change) ──────────
 app.get('/admin', requireAdmin, (req, res) => {
@@ -6205,6 +6337,21 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
             }
         }
     }, PROXY_STREAM_GC_INTERVAL_MS);
+
+    // Pending-generation garbage collection (durable AI-stream buffering, see
+    // runDurableProxyPump) — same cadence/shape as the proxy-stream-job sweep
+    // above, but for rl_pending_generations rows in SQLite.
+    setInterval(() => {
+        try {
+            sweepPendingGenerations({
+                stallMs: PENDING_GEN_STALL_MS,
+                ttlMs: PENDING_GEN_TTL_MS,
+                perUserCap: PENDING_GEN_PER_USER_CAP,
+            });
+        } catch (e) {
+            logger.error('[PendingGen] GC sweep failed:', e);
+        }
+    }, PENDING_GEN_GC_INTERVAL_MS);
 
     await startServer();
 

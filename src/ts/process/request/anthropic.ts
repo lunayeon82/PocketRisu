@@ -793,6 +793,141 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
     return requestClaudeHTTP(replacerURL, headers, body, arg)
 }
 
+// Parses Anthropic's SSE event stream into the accumulated-text
+// StreamResponseChunk shape. Extracted out of requestClaudeHTTP (only
+// caller: replayMode always false/omitted there, `retry` always supplied) so
+// the durable-generation recovery path (storage/pendingGenRecovery.ts) can
+// replay a fully-buffered raw response through the exact same parser instead
+// of reimplementing it. replayMode short-circuits the overload-retry branch —
+// replaying a static buffer must never fire a new network request; the
+// overload text just falls through to the plain error-text path instead.
+export function buildAnthropicSseStream(
+    initialReader: ReadableStreamDefaultReader<Uint8Array>,
+    opts: {
+        abortSignal?: AbortSignal
+        replayMode?: boolean
+        retry?: () => Promise<Response>
+    } = {},
+): ReadableStream<StreamResponseChunk> {
+    const db = getDatabase()
+    return new ReadableStream<StreamResponseChunk>({
+        async start(controller){
+            let text = ''
+            let reader = initialReader
+            let parserData = ''
+            const decoder = new TextDecoder()
+            let thinking = false
+            const parseEvent = ((e:string) => {
+                try {
+                    const parsedData = JSON.parse(e)
+
+                    if(parsedData?.type === 'content_block_delta'){
+                        if(parsedData?.delta?.type === 'text' || parsedData.delta?.type === 'text_delta'){
+                            if(thinking){
+                                text += "</Thoughts>\n\n"
+                                thinking = false
+                            }
+                            text += parsedData.delta?.text ?? ''
+                        }
+
+                        if(parsedData?.delta?.type === 'thinking' || parsedData.delta?.type === 'thinking_delta'){
+                            if(!thinking){
+                                text += "<Thoughts>\n"
+                                thinking = true
+                            }
+                            text += parsedData.delta?.thinking ?? ''
+                        }
+
+                        if(parsedData?.delta?.type === 'redacted_thinking'){
+                            if(!thinking){
+                                text += "<Thoughts>\n"
+                                thinking = true
+                            }
+                            text += '\n{{redacted_thinking}}\n'
+                        }
+                    }
+
+                    if(parsedData?.type === 'error'){
+                        const errormsg:string = parsedData?.error?.message
+                        if(errormsg && errormsg.toLocaleLowerCase().includes('overload') && db.antiServerOverloads && !opts.replayMode && opts.retry){
+                            controller.enqueue({
+                                "0": "Overload detected, retrying..."
+                            })
+                            return 'overload'
+                        }
+                        text += "Error:" + parsedData?.error?.message
+                    }
+
+                }
+                catch (error) {
+                }
+            })
+            let breakWhile = false
+            let i = 0;
+            let prevText = ''
+            while(true){
+                try {
+                    if(opts.abortSignal?.aborted || breakWhile){
+                        break
+                    }
+                    const {done, value} = await reader.read()
+                    if(done){
+                        break
+                    }
+                    parserData += (decoder.decode(value))
+                    let parts = parserData.split('\n')
+                    for(;i<parts.length-1;i++){
+                        prevText = text
+                        if(parts?.[i]?.startsWith('data: ')){
+                            const d = await parseEvent(parts[i].slice(6))
+                            if(d === 'overload'){
+                                parserData = ''
+                                prevText = ''
+                                text = ''
+                                reader.cancel()
+                                const retryRes = await opts.retry()
+                                if(retryRes.status !== 200){
+                                    controller.enqueue({
+                                        "0": await textifyReadableStream(retryRes.body)
+                                    })
+                                    breakWhile = true
+                                    break
+                                }
+                                reader = retryRes.body.getReader()
+                                break
+                            }
+                        }
+                    }
+                    i--;
+                    text = prevText
+
+                    controller.enqueue({
+                        "0": text
+                    })
+
+                } catch (error) {
+                    if(opts.replayMode){
+                        // Replaying a static, already-complete buffer — sleeping
+                        // and retrying the same read() would spin forever since
+                        // there's no live source to eventually produce more data.
+                        break
+                    }
+                    await sleep(1)
+                }
+            }
+            if(thinking){
+                text += "</Thoughts>\n\n"
+                controller.enqueue({
+                    "0": text
+                })
+            }
+            controller.close()
+        },
+        cancel(){
+        }
+    })
+}
+
 async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:string}, body:any, arg:RequestDataArgumentExtended):Promise<requestDataResponse> {
     
     if(arg.useStreaming){
@@ -802,6 +937,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
             headers: headers,
             method: "POST",
             chatId: arg.chatId,
+            durable: arg.durable,
             signal: arg.abortSignal,
             interceptor: 'anthropic_streaming'
         })
@@ -812,132 +948,17 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                 result: await textifyReadableStream(res.body)
             }
         }
-        let breakError = ''
-        let thinking = false
-
-        const stream = new ReadableStream<StreamResponseChunk>({
-            async start(controller){
-                let text = ''
-                let reader = res.body.getReader()
-                let parserData = ''
-                const decoder = new TextDecoder()
-                const parseEvent = ((e:string) => {
-                    try {               
-                        const parsedData = JSON.parse(e)
-
-                        if(parsedData?.type === 'content_block_delta'){
-                            if(parsedData?.delta?.type === 'text' || parsedData.delta?.type === 'text_delta'){
-                                if(thinking){
-                                    text += "</Thoughts>\n\n"
-                                    thinking = false
-                                }
-                                text += parsedData.delta?.text ?? ''
-                            }
-    
-                            if(parsedData?.delta?.type === 'thinking' || parsedData.delta?.type === 'thinking_delta'){
-                                if(!thinking){
-                                    text += "<Thoughts>\n"
-                                    thinking = true
-                                }
-                                text += parsedData.delta?.thinking ?? ''
-                            }
-    
-                            if(parsedData?.delta?.type === 'redacted_thinking'){
-                                if(!thinking){
-                                    text += "<Thoughts>\n"
-                                    thinking = true
-                                }
-                                text += '\n{{redacted_thinking}}\n'
-                            }
-                        }
-
-                        if(parsedData?.type === 'error'){
-                            const errormsg:string = parsedData?.error?.message
-                            if(errormsg && errormsg.toLocaleLowerCase().includes('overload') && db.antiServerOverloads){
-                                // console.log('Overload detected, retrying...')
-                                controller.enqueue({
-                                    "0": "Overload detected, retrying..."
-                                })
-
-                                return 'overload'
-                            }
-                            text += "Error:" + parsedData?.error?.message
-
-                        }
-                        
-                    }
-                    catch (error) {
-                    }
-
-                        
-                        
-                })
-                let breakWhile = false
-                let i = 0;
-                let prevText = ''
-                while(true){
-                    try {
-                        if(arg?.abortSignal?.aborted || breakWhile){
-                            break
-                        }
-                        const {done, value} = await reader.read() 
-                        if(done){
-                            break
-                        }
-                        parserData += (decoder.decode(value))
-                        let parts = parserData.split('\n')
-                        for(;i<parts.length-1;i++){
-                            prevText = text
-                            if(parts?.[i]?.startsWith('data: ')){
-                                const d = await parseEvent(parts[i].slice(6))
-                                if(d === 'overload'){
-                                    parserData = ''
-                                    prevText = ''
-                                    text = ''
-                                    reader.cancel()
-                                    const res = await fetchNative(replacerURL, {
-                                        body: JSON.stringify(body),
-                                        headers: headers,
-                                        method: "POST",
-                                        chatId: arg.chatId,
-                                        signal: arg.abortSignal,
-                                        interceptor: 'anthropic_streaming_retry'
-                                    })
-                            
-                                    if(res.status !== 200){
-                                        controller.enqueue({
-                                            "0": await textifyReadableStream(res.body)
-                                        })
-                                        breakWhile = true
-                                        break
-                                    }
-
-                                    reader = res.body.getReader()
-                                    break
-                                }
-                            }
-                        }
-                        i--;
-                        text = prevText
-
-                        controller.enqueue({
-                            "0": text
-                        })
-
-                    } catch (error) {
-                        await sleep(1)
-                    }
-                }
-                if(thinking){
-                    text += "</Thoughts>\n\n"
-                    controller.enqueue({
-                        "0": text
-                    })
-                }
-                controller.close()
-            },
-            cancel(){
-            }
+        const stream = buildAnthropicSseStream(res.body.getReader(), {
+            abortSignal: arg.abortSignal,
+            retry: async () => fetchNative(replacerURL, {
+                body: JSON.stringify(body),
+                headers: headers,
+                method: "POST",
+                chatId: arg.chatId,
+                durable: arg.durable,
+                signal: arg.abortSignal,
+                interceptor: 'anthropic_streaming_retry'
+            }),
         })
 
         return {

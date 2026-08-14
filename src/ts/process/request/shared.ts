@@ -1,4 +1,5 @@
 import { getDatabase } from 'src/ts/storage/database.svelte'
+import type { StreamResponseChunk } from './request'
 
 export type LLMParameter =
     | 'temperature'
@@ -143,6 +144,27 @@ export async function collectStreamingText(stream: ReadableStream<{ [key: string
     }
 
     return lastChunk
+}
+
+// Replays a fully-buffered raw byte response through a live SSE
+// TransformStream (openAI/requests.ts's or google.ts's getTranStream) as if
+// it arrived as a single chunk, then drains to the terminal chunk — which,
+// since StreamResponseChunk always carries the full accumulated text (see
+// collectStreamingText above), is the same final text the live path would
+// have produced. Used by the durable-generation recovery path
+// (storage/pendingGenRecovery.ts) to reuse the exact parsers already written
+// for live streaming instead of re-implementing SSE parsing server-side.
+export async function replayViaTransformStream(
+    rawBytes: Uint8Array,
+    stream: TransformStream<Uint8Array, StreamResponseChunk>,
+): Promise<string> {
+    const source = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(rawBytes)
+            controller.close()
+        }
+    })
+    return collectStreamingText(source.pipeThrough(stream))
 }
 
 export function applyParameters(

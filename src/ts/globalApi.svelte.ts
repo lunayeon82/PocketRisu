@@ -1,4 +1,5 @@
 import { changeFullscreen, checkNullish, sleep } from "./util"
+import type { DurableGenerationMeta } from "./process/request/request"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { tick } from "svelte";
 import { get } from "svelte/store";
@@ -503,7 +504,17 @@ export async function saveDb() {
             void flushServerDbKeepalive()
         }
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'hidden') flushImmediate();
+            if (document.visibilityState === 'hidden') {
+                flushImmediate();
+            } else if (document.visibilityState === 'visible') {
+                // Tab regained foreground — the stream reader for an in-flight
+                // reply may have died while backgrounded without the tab fully
+                // closing (mobile Safari/Chrome throttle background network
+                // activity). Dynamic import: avoids a static cycle back into
+                // this module (pendingGenRecovery pulls in the request/*.ts
+                // files, which import fetchNative/globalFetch from here).
+                void import('./storage/pendingGenRecovery').then(m => m.checkPendingGenerationsForCurrentChat())
+            }
         });
         window.addEventListener('pagehide', flushImmediate);
 
@@ -2015,6 +2026,7 @@ export async function fetchNative(url: string, arg: {
     interceptor?: string
     requestTimeoutMs?: number
     networkRoute?: 'auto' | 'local_network'
+    durable?: DurableGenerationMeta
 }): Promise<Response> {
     const useInterceptor = !!arg.interceptor
     if (arg.body === undefined && (arg.method === 'POST' || arg.method === 'PUT')) {
@@ -2133,8 +2145,14 @@ async function fetchViaProxy2(
     url: string,
     headers: Record<string, string>,
     realBody: Uint8Array | undefined,
-    arg: { method?: string, signal?: AbortSignal, useRisuTk?: boolean, requestTimeoutMs?: number }
+    arg: { method?: string, signal?: AbortSignal, useRisuTk?: boolean, requestTimeoutMs?: number, chatId?: string, durable?: DurableGenerationMeta }
 ): Promise<Response> {
+    // Only actually opt this request into server-side durable buffering
+    // (rl_pending_generations, see server.cjs's runDurableProxyPump) once
+    // requestChatDataMain has resolved a parserKind for it — an unresolved
+    // durable (format the replay path doesn't cover) is left inert here, same
+    // as if the caller had never set it at all.
+    const durable = arg.durable?.parserKind ? arg.durable : undefined
     const proxyHeaders: Record<string, string> = {
         "risu-header": encodeURIComponent(JSON.stringify(headers)),
         "risu-url": encodeURIComponent(url),
@@ -2142,6 +2160,13 @@ async function fetchViaProxy2(
         ...(arg.useRisuTk ? { "x-risu-tk": "use" } : {}),
         ...(arg.requestTimeoutMs && { "risu-timeout-ms": Math.max(1, Math.floor(arg.requestTimeoutMs)).toString() }),
         ...(DBState?.db?.requestLocation ? { "risu-location": DBState.db.requestLocation } : {}),
+        ...(durable && arg.chatId ? { "risu-durable-meta": encodeURIComponent(JSON.stringify({
+            genId: arg.chatId,
+            roomChatId: durable.roomChatId,
+            characterId: durable.characterId,
+            parserKind: durable.parserKind,
+            replayMeta: durable.replayMeta,
+        })) } : {}),
     }
 
     if (realBody) {

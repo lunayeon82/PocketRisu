@@ -681,6 +681,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
             body: JSON.stringify(body),
             method: 'POST',
             chatId: arg.chatId,
+            durable: arg.durable,
             signal: arg.abortSignal,
             interceptor: 'gemini_base_stream'
         })
@@ -1007,7 +1008,10 @@ function initStreamState(state?: {[key:string]:string}): {[key:string]:string} {
     return state;
 }
 
-function getTranStream(args:{
+// Exported (only) so the durable-generation recovery path
+// (storage/pendingGenRecovery.ts) can replay a fully-buffered raw response
+// through the exact same parser via shared.ts's replayViaTransformStream.
+export function getTranStream(args:{
     modelInfo:LLMModel,
     saveSignature:boolean
 }):TransformStream<Uint8Array, StreamResponseChunk> {
@@ -1266,6 +1270,7 @@ function wrapToolStream(
                                 body: JSON.stringify(body),
                                 method: 'POST',
                                 chatId: arg.chatId,
+                                durable: arg.durable,
                                 signal: arg.abortSignal,
                                 interceptor: 'gemini_tool'
                             })

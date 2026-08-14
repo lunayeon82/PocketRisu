@@ -108,8 +108,19 @@ export async function* streamChatRequest(
         throw new ModelPresetAdapterError('parse', 'OpenAI-compatible stream response has no body')
     }
 
+    yield* mapOpenAiSseToDeltas(response.body)
+}
+
+// Decoupled from fetch (only caller besides streamChatRequest: the
+// durable-generation recovery path, storage/pendingGenRecovery.ts, which
+// feeds it a one-shot ReadableStream built from a buffered raw response
+// instead of a live fetch body) so replay reuses the exact same event/delta
+// mapping instead of reimplementing it.
+export async function* mapOpenAiSseToDeltas(
+    body: ReadableStream<Uint8Array>,
+): AsyncGenerator<AdapterChatStreamDelta, void, void> {
     try {
-        for await (const event of parseSseStream(response.body)) {
+        for await (const event of parseSseStream(body)) {
             if (event.data === '[DONE]') return
             if (event.data.length === 0) continue
             let raw: unknown

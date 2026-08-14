@@ -783,6 +783,59 @@ export class NodeStorage{
         }
     }
 
+    // ── Pending generations (durable AI-stream buffering recovery) ──────────
+    // Client-side counterpart to server.cjs's runDurableProxyPump /
+    // pendingGenApi.cjs — see checkPendingGenerationsForChat in
+    // storage/pendingGenRecovery.ts for how these are used.
+
+    async listPendingGenerations(roomChatId: string): Promise<Array<{
+        id: string
+        status: 'streaming' | 'done' | 'error'
+        parserKind: string
+        byteLength: number
+        truncated: boolean
+        upstreamStatus: number | null
+        errorMessage: string | null
+        createdAt: number
+        updatedAt: number
+        completedAt: number | null
+    }>> {
+        const da = await this.authFetch(`/api/pending-generations?roomChatId=${encodeURIComponent(roomChatId)}`)
+        if (!da.ok) throw new Error(`listPendingGenerations error: ${da.status}`)
+        return da.json()
+    }
+
+    async getPendingGeneration(id: string): Promise<{
+        id: string
+        roomChatId: string
+        characterId: string
+        parserKind: string
+        replayMeta: Record<string, unknown> | null
+        status: 'streaming' | 'done' | 'error'
+        rawBodyBase64: string
+        byteLength: number
+        truncated: boolean
+        upstreamStatus: number | null
+        errorMessage: string | null
+        createdAt: number
+        updatedAt: number
+        completedAt: number | null
+    } | null> {
+        const da = await this.authFetch(`/api/pending-generations/${encodeURIComponent(id)}`)
+        if (da.status === 404) return null
+        if (!da.ok) throw new Error(`getPendingGeneration error: ${da.status}`)
+        return da.json()
+    }
+
+    // Idempotent — acking an id that's already gone (double-ack race, or
+    // already swept by GC) is not an error, matching the server's DELETE semantics.
+    async ackPendingGeneration(id: string): Promise<void> {
+        const da = await this.authFetch(`/api/pending-generations/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        if (!da.ok && da.status !== 404) {
+            console.error(`[PendingGen] ack failed: ${da.status}`)
+        }
+    }
+
     // ── Chat list (Phase 4) ───────────────────────────────────────────────────
 
     async loadChatListFromServer(): Promise<Map<string, ChatStub[]>> {

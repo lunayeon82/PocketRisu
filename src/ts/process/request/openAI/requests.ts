@@ -571,6 +571,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
             headers: headers,
             signal: arg.abortSignal,
             chatId: arg.chatId,
+            durable: arg.durable,
             interceptor: 'openai_streaming',
             ...getLocalNetworkRequestOptions(replacerURL, arg.forceLocalNetwork),
         })
@@ -1113,7 +1114,11 @@ export async function requestOpenAIResponseAPI(arg:RequestDataArgumentExtended):
     }
 }
 
-function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Array, StreamResponseChunk> {
+// Exported (only) so the durable-generation recovery path
+// (storage/pendingGenRecovery.ts) can replay a fully-buffered raw response
+// through the exact same parser via shared.ts's replayViaTransformStream —
+// not called with a live chunked stream from anywhere but requestOpenAI.
+export function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Array, StreamResponseChunk> {
     let dataUint:Uint8Array|Buffer = new Uint8Array([])
     let reasoningContent = ""
     const db = getDatabase()
@@ -1378,6 +1383,7 @@ function wrapToolStream(
                                 headers: headers,
                                 signal: arg.abortSignal,
                                 chatId: arg.chatId,
+                                durable: arg.durable,
                                 interceptor: 'openai_tool',
                                 ...getLocalNetworkRequestOptions(replacerURL),
                             })

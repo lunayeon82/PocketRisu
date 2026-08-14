@@ -146,6 +146,23 @@ export async function migrateAllChatsToServer(
     return storage.migrateChatsToServer(characters, onProgress)
 }
 
+// ── Pending generations (durable AI-stream buffering recovery) ──────────────
+
+export async function listPendingGenerations(roomChatId: string) {
+    const storage = forageStorage.realStorage
+    return storage.listPendingGenerations(roomChatId)
+}
+
+export async function getPendingGeneration(id: string) {
+    const storage = forageStorage.realStorage
+    return storage.getPendingGeneration(id)
+}
+
+export async function ackPendingGeneration(id: string): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.ackPendingGeneration(id)
+}
+
 // ── Chat folders ─────────────────────────────────────────────────────────────
 
 export async function loadChatFoldersFromServer(chaId: string): Promise<ChatFolder[]> {
@@ -190,7 +207,22 @@ export async function ensureChatHydrated(
 ): Promise<Chat | null> {
     const slot = chats[index]
     if (!slot) return null
-    if (!slot._placeholder) return slot
+
+    if (!slot._placeholder) {
+        // Fire-and-forget: check for a server-side durable generation this
+        // chat missed while disconnected (see storage/pendingGenRecovery.ts).
+        // Already-resident chats return here and never reach the hydration
+        // branch below, so this is the only place that would otherwise never
+        // check them. The placeholder/hydration branch below runs its own
+        // check instead, chained after the hydration write completes — firing
+        // it here too (unconditionally, before the _placeholder check) would
+        // race a concurrent hydration and risk the recovered message getting
+        // silently overwritten by `chats[currentIndex] = full` below.
+        if (slot.id) {
+            void import('./pendingGenRecovery').then(m => m.checkPendingGenerationsForChat(chaId, slot.id!))
+        }
+        return slot
+    }
 
     const chatId = slot.id
     if (!chatId) return null
@@ -230,6 +262,11 @@ export async function ensureChatHydrated(
             // Wait one tick so Svelte reactivity settles before allowing dirty tracking
             await tick()
             hydrationJustApplied.delete(key)
+
+            // Only after the hydration write above has landed — running this
+            // any earlier could race `chats[currentIndex] = full` and lose
+            // the recovered message to that overwrite.
+            void import('./pendingGenRecovery').then(m => m.checkPendingGenerationsForChat(chaId, chatId))
 
             return full
         } finally {

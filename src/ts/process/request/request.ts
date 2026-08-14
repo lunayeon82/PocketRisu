@@ -46,6 +46,22 @@ export type ToolCall = {
     arguments: string;
 }
 
+// Durable-buffering opt-in for the main assistant-reply streaming call (see
+// sendChat() in process/index.svelte.ts). roomChatId/characterId are set at
+// the call site; parserKind is filled in by requestChatDataMain/
+// requestModelPreset once the actual provider/adapter is resolved — a caller
+// that never reaches a covered format leaves it unset, which keeps the whole
+// object inert (the server ignores risu-durable-meta without a parserKind).
+export type DurableGenerationParserKind =
+    'openai-legacy' | 'anthropic-legacy' | 'google-legacy' |
+    'adapter-openai' | 'adapter-anthropic' | 'adapter-google'
+export type DurableGenerationMeta = {
+    roomChatId: string
+    characterId: string
+    parserKind?: DurableGenerationParserKind
+    replayMeta?: Record<string, unknown>
+}
+
 interface requestDataArgument{
     formated: OpenAIChat[]
     bias: {[key:number]:number}
@@ -72,6 +88,7 @@ interface requestDataArgument{
     forceStreaming?: boolean
     blockPlugins?: boolean
     forceLocalNetwork?: boolean
+    durable?: DurableGenerationMeta
 }
 
 export interface RequestDataArgumentExtended extends requestDataArgument{
@@ -439,6 +456,49 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
 
     targ.formated = reformater(targ.formated, targ.modelInfo)
 
+    // Tag the durable-buffering request (if the caller opted in) with which
+    // replay parser applies once the format is known — only the formats whose
+    // fetchNative call sites actually thread `durable` through (openAI.ts/
+    // anthropic.ts/google.ts) get a kind; everything else is left unset so
+    // the server never receives risu-durable-meta for it (see request.ts's
+    // DurableGenerationMeta / server.cjs's parseDurableMeta).
+    if(targ.durable){
+        switch(format){
+            case LLMFormat.OpenAICompatible:
+            case LLMFormat.Mistral:
+            case LLMFormat.NanoGPT:
+                targ.durable.parserKind = 'openai-legacy'
+                break
+            case LLMFormat.Anthropic:
+            case LLMFormat.AnthropicLegacy:
+            case LLMFormat.AWSBedrockClaude:
+                targ.durable.parserKind = 'anthropic-legacy'
+                break
+            case LLMFormat.VertexAIGemini:
+            case LLMFormat.GoogleCloud:
+                targ.durable.parserKind = 'google-legacy'
+                break
+            default:
+                targ.durable = undefined
+        }
+        if(targ.durable){
+            // Everything replayViaTransformStream's caller needs to rebuild a
+            // minimal arg/args object matching what getTranStream (openAI.ts/
+            // google.ts) or buildAnthropicSseStream actually reads — see
+            // storage/pendingGenRecovery.ts.
+            targ.durable.replayMeta = {
+                extractJson: targ.extractJson,
+                schema: targ.schema,
+                multiGen: targ.multiGen,
+                modelFlags: targ.modelInfo.flags,
+                modelInternalID: targ.modelInfo.internalID,
+                modelId: targ.modelInfo.id,
+                modelFormat: targ.modelInfo.format,
+                saveSignatures: targ.saveSignatures ?? false,
+            }
+        }
+    }
+
     switch(format){
         case LLMFormat.OpenAICompatible:
         case LLMFormat.Mistral:
@@ -539,7 +599,7 @@ function previewModelPreset(
 // chatId (= the message generationId) is threaded into fetchNative so the
 // request is recorded in the fetch log against the message — otherwise the
 // per-message "view log" shows "deleted log" for binding requests.
-function makeProxiedFetch(chatId?: string): typeof fetch {
+function makeProxiedFetch(chatId?: string, durable?: DurableGenerationMeta): typeof fetch {
     return ((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === 'string' ? input : input.toString()
         return fetchNative(url, {
@@ -548,6 +608,7 @@ function makeProxiedFetch(chatId?: string): typeof fetch {
             body: init?.body as string,
             signal: init?.signal ?? undefined,
             chatId,
+            durable,
             // Local providers (e.g. self-hosted Ollama) must route through the node
             // proxy rather than a browser-direct fetch to a private address.
             networkRoute: isLocalNetworkUrl(url) ? 'local_network' : 'auto',
@@ -665,7 +726,11 @@ function toAdapterToolDef(tool: MCPTool): AdapterToolDef {
 // renderer already parses (mirrors the classic anthropic path). Returns '' when
 // there is nothing to show, so non-reasoning models are byte-identical to before.
 // redacted_thinking has no visible text — surface the same placeholder as classic.
-function formatPresetReasoning(reasoning?: AdapterReasoningPart[]): string {
+// Exported (only) so the durable-generation recovery path
+// (storage/pendingGenRecovery.ts) can reproduce pumpPresetStream's
+// buildChunk() reasoning-wrapping exactly when replaying a buffered adapter
+// response, instead of reimplementing the <Thoughts> wrapping convention.
+export function formatPresetReasoning(reasoning?: AdapterReasoningPart[]): string {
     if (!reasoning || reasoning.length === 0) return ''
     let body = ''
     for (const part of reasoning) {
@@ -679,7 +744,18 @@ function formatPresetReasoning(reasoning?: AdapterReasoningPart[]): string {
 async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelPreset, abortSignal:AbortSignal=null, mode:ModelModeExtended='model'):Promise<requestDataResponse> {
     const credential = buildModelPresetCredential(preset)
     const kind = preset.profileSnapshot.adapterKind
-    const fetchImpl = makeProxiedFetch(arg.chatId)
+    if(arg.durable){
+        const adapterParserKind: Partial<Record<AdapterKind, DurableGenerationParserKind>> = {
+            'openai-compatible': 'adapter-openai',
+            'anthropic-messages': 'adapter-anthropic',
+            'google-gemini': 'adapter-google',
+        }
+        arg.durable.parserKind = adapterParserKind[kind]
+        if(!arg.durable.parserKind){
+            arg.durable = undefined
+        }
+    }
+    const fetchImpl = makeProxiedFetch(arg.chatId, arg.durable)
     // arg.chatId is the per-request generationId for main chat (sendChat passes
     // it under that name; see generation-state-keying.md §1-bis). Aux requests
     // (translate/memory/emotion/sub) don't supply one, so mint a per-request key

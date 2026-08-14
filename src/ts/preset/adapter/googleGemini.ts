@@ -163,28 +163,41 @@ export async function* streamGoogleChatRequest(
         // usageMetadata arrives on the last SSE chunk; capture it so the cache
         // lifecycle can run once the stream completes normally.
         let lastUsage: AdapterUsage | undefined
-        for await (const event of parseSseStream(response.body)) {
-            if (event.data.length === 0) continue
-            let raw: unknown
-            try {
-                raw = JSON.parse(event.data)
-            } catch (err) {
-                throw new ModelPresetAdapterError(
-                    'parse',
-                    'Failed to parse Gemini stream chunk JSON',
-                    { cause: err },
-                )
-            }
-            const delta = parseGeminiStreamDelta(raw)
-            if (delta) {
-                if (delta.usage) lastUsage = delta.usage
-                yield delta
-            }
+        for await (const delta of mapGeminiSseToDeltas(response.body)) {
+            if (delta.usage) lastUsage = delta.usage
+            yield delta
         }
         cacheTurn?.finish(lastUsage?.promptTokens)
     } catch (err) {
         if (err instanceof ModelPresetAdapterError) throw err
         throw normalizeFetchError(err)
+    }
+}
+
+// Decoupled from fetch/cache-turn bookkeeping (only caller besides
+// streamGoogleChatRequest: the durable-generation recovery path,
+// storage/pendingGenRecovery.ts, which feeds it a one-shot ReadableStream
+// built from a buffered raw response instead of a live fetch body) so replay
+// reuses the exact same event/delta mapping instead of reimplementing it.
+// Context-cache finish() is intentionally NOT called here — that's a live-
+// request side effect the streaming wrapper above owns.
+export async function* mapGeminiSseToDeltas(
+    body: ReadableStream<Uint8Array>,
+): AsyncGenerator<AdapterChatStreamDelta, void, void> {
+    for await (const event of parseSseStream(body)) {
+        if (event.data.length === 0) continue
+        let raw: unknown
+        try {
+            raw = JSON.parse(event.data)
+        } catch (err) {
+            throw new ModelPresetAdapterError(
+                'parse',
+                'Failed to parse Gemini stream chunk JSON',
+                { cause: err },
+            )
+        }
+        const delta = parseGeminiStreamDelta(raw)
+        if (delta) yield delta
     }
 }
 

@@ -1,5 +1,6 @@
 import { get, writable } from "svelte/store";
 import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
+import { ackPendingGeneration } from "../storage/chatStorage";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -1391,6 +1392,19 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return true
     }
 
+    // Opt this (and only this) call into server-side durable buffering (see
+    // runDurableProxyPump in server.cjs) so a backgrounded/killed tab doesn't
+    // lose the reply outright — recovered on next chat-open/visibility via
+    // checkPendingGenerationsForChat. Needs a real room chat id to key the
+    // server-side row; very old/never-synced chats without one just don't
+    // get durability (requestChatDataMain also requires a resolved
+    // parserKind before actually sending the header — see its format switch).
+    const roomChatId = nowChatroom.chats[nowChatroom.chatPage]?.id
+    const durable = (roomChatId && currentChar.chaId) ? {
+        roomChatId,
+        characterId: currentChar.chaId,
+    } : undefined
+
     const req = await requestChatData({
         formated: formated,
         biasString: biases,
@@ -1404,6 +1418,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
+        durable,
     }, 'model', abortSignal)
 
     console.log(req)
@@ -1425,6 +1440,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return false
     }
     if(req.type === 'fail'){
+        // Harmless no-op if no durable row was ever created for this attempt
+        // (e.g. a non-streaming path never sent risu-durable-meta) — ack is
+        // idempotent server-side either way.
+        if(durable){
+            void ackPendingGeneration(generationId).catch(() => {})
+        }
         throwError(req.result)
         return false
     }
@@ -1494,6 +1515,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
             DBState.db.characters[selectedChar].reloadKeys += 1
             void reader.cancel().catch(() => {})
+            // This client handled the generation's outcome one way or another
+            // (finished, aborted, or errored) — the server-side durable copy
+            // (if any was created; see server.cjs's runDurableProxyPump) is no
+            // longer needed as a disconnect safety net, so ack it away. Fires
+            // regardless of how the stream ended so a row never lingers past
+            // the tab that started it actually finishing with it.
+            if(durable){
+                void ackPendingGeneration(generationId).catch(() => {})
+            }
         }
 
         if(streamAborted || abortSignal.aborted){
