@@ -75,6 +75,15 @@ const stmtGetById = sharedDb.prepare(`
 
 const stmtDeleteById = sharedDb.prepare(`DELETE FROM rl_pending_generations WHERE id = ? AND user_id = ?`);
 
+// Lightweight existence check for the push-notification trigger hook
+// (runDurableProxyPump in server.cjs) — no user_id filter needed since the
+// caller already has a trusted userId from the pump's own closure, and no
+// need to pull raw_body just to check "is this still unacked".
+const stmtExists = sharedDb.prepare(`SELECT 1 FROM rl_pending_generations WHERE id = ?`);
+function pendingGenerationStillExists(id) {
+    return !!stmtExists.get(id);
+}
+
 const stmtMarkStalled = sharedDb.prepare(`
   UPDATE rl_pending_generations
   SET status = 'error', error_message = 'Stalled: no upstream activity before server-side timeout', updated_at = ?, completed_at = ?
@@ -208,4 +217,5 @@ module.exports = {
     flushPendingGenerationBody,
     finishPendingGeneration,
     sweepPendingGenerations,
+    pendingGenerationStillExists,
 };

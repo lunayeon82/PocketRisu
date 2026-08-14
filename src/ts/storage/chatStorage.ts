@@ -184,6 +184,23 @@ export async function ackPendingGeneration(id: string): Promise<void> {
     await storage.ackPendingGeneration(id)
 }
 
+// ── Web Push subscription ────────────────────────────────────────────────────
+
+export async function getVapidPublicKey(): Promise<string> {
+    const storage = forageStorage.realStorage
+    return storage.getVapidPublicKey()
+}
+
+export async function subscribePush(subscription: PushSubscriptionJSON, userAgent?: string): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.subscribePush(subscription, userAgent)
+}
+
+export async function unsubscribePush(endpoint: string): Promise<void> {
+    const storage = forageStorage.realStorage
+    await storage.unsubscribePush(endpoint)
+}
+
 // ── Chat folders ─────────────────────────────────────────────────────────────
 
 export async function loadChatFoldersFromServer(chaId: string): Promise<ChatFolder[]> {

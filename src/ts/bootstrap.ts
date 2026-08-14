@@ -36,6 +36,17 @@ import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelt
  * Loads the application data.
  */
 export async function loadData() {
+    // Unconditional (not gated on db.notification) — needed for Web Push
+    // subscription regardless of when the user opts in, and also activates
+    // sw.js's existing (previously never-registered, effectively dead) image
+    // cache / share-target handlers as a side effect. Runs once per entry
+    // (main/chat-main/settings-main all call loadData() the same way);
+    // browser-side SW registration is idempotent per origin+scope, so
+    // running it from all 3 is harmless.
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch((e) => console.warn('[SW] register failed', e))
+    }
+
     const loaded = get(loadedStore)
     if (!loaded) {
         try {

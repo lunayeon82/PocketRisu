@@ -131,3 +131,30 @@ async function registerCache(urlr, buffer, noContentType = false){
         "done": true
     }))
 }
+
+// Server never puts the actual reply text in the push payload (see
+// pushApi.cjs) — always a generic title/body, so this stays a simple display.
+self.addEventListener('push', (event) => {
+    let data = {}
+    try { data = event.data ? event.data.json() : {} } catch {}
+    event.waitUntil(self.registration.showNotification(data.title || '포켓리수', {
+        body: data.body || '',
+        icon: '/logo_192.png',
+        data: { url: '/' },
+    }))
+})
+
+self.addEventListener('notificationclick', (event) => {
+    event.notification.close()
+    event.waitUntil((async () => {
+        const allClients = await clients.matchAll({ type: 'window', includeUncontrolled: true })
+        for (const client of allClients) {
+            if (client.url.startsWith(self.registration.scope)) {
+                client.focus()
+                return
+            }
+        }
+        const targetUrl = (event.notification.data && event.notification.data.url) || '/'
+        await clients.openWindow(targetUrl)
+    })())
+})

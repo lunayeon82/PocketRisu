@@ -1232,6 +1232,8 @@ export const languageEnglish = {
     autoTranslateCachedOnly: "Auto-translate Cached Messages Only",
     notification: "Notification",
     permissionDenied: "Permission Denied by Your Browser or OS",
+    pushSubscribeFailed:
+      "Failed to subscribe to OS notifications. In-tab notifications will still show while the tab is open.",
     customFlags: "Custom Flags",
     enableCustomFlags: "Enable Custom Flags",
     googleCloudTokenization: "Google Cloud Tokenization",

@@ -86,6 +86,7 @@
     "wasm-vips": "^0.0.17",
     "wasmoon": "^1.16.0",
     "wavefile": "^11.0.0",
+    "web-push": "^3.6.7",
     "web-streams-polyfill": "^3.3.3",
     "ws": "^8.18.3"
   },

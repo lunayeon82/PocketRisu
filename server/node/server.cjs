@@ -64,9 +64,11 @@ const { mountChatFolderApi } = require('./chatFolderApi.cjs');
 const { mountLorebookApi } = require('./lorebookApi.cjs');
 const {
     mountPendingGenApi, createPendingGeneration, flushPendingGenerationBody,
-    finishPendingGeneration, sweepPendingGenerations,
+    finishPendingGeneration, sweepPendingGenerations, pendingGenerationStillExists,
 } = require('./pendingGenApi.cjs');
+const { mountPushApi, sendPushToUser, configureVapid } = require('./pushApi.cjs');
 const { spawn, execSync, exec } = require('child_process');
+const webpush = require('web-push');
 const os = require('os');
 const { Readable, Transform } = require('stream');
 
@@ -644,6 +646,33 @@ if (existsSync(instanceIdPath)) {
     instanceId = nodeCrypto.randomUUID()
     writeFileSync(instanceIdPath, instanceId, 'utf-8')
 }
+
+// ── VAPID keys for Web Push ───────────────────────────────────────────────────
+// Must survive restarts forever, unlike jwtSecret above — if this keypair ever
+// changes, every existing browser push subscription silently breaks (the
+// subscription is cryptographically tied to the public key used at subscribe
+// time) and every user would need to re-subscribe. Same generate-once-then-
+// persist-to-save/ shape as jwtSecret/instanceId, not the kv config/* store —
+// this is read once at boot and held in memory, never re-read/mutated by a
+// request handler the way config/* values are.
+const vapidPublicKeyPath = path.join(savePath, '__vapid_public_key')
+const vapidPrivateKeyPath = path.join(savePath, '__vapid_private_key')
+let vapidPublicKey, vapidPrivateKey
+if (existsSync(vapidPublicKeyPath) && existsSync(vapidPrivateKeyPath)) {
+    vapidPublicKey = readFileSync(vapidPublicKeyPath, 'utf-8').trim()
+    vapidPrivateKey = readFileSync(vapidPrivateKeyPath, 'utf-8').trim()
+} else {
+    const vapidKeys = webpush.generateVAPIDKeys()
+    vapidPublicKey = vapidKeys.publicKey
+    vapidPrivateKey = vapidKeys.privateKey
+    writeFileSync(vapidPublicKeyPath, vapidPublicKey, 'utf-8')
+    writeFileSync(vapidPrivateKeyPath, vapidPrivateKey, 'utf-8')
+}
+const VAPID_CONTACT_EMAIL = process.env.VAPID_CONTACT_EMAIL || 'mailto:admin@lunayeon.com'
+// configureVapid also caches the public key inside pushApi.cjs for its
+// GET /api/push/vapid-public-key handler — web-push itself doesn't expose
+// the keys it was configured with back out.
+configureVapid(vapidPublicKey, vapidPrivateKey, VAPID_CONTACT_EMAIL)
 
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
@@ -1289,6 +1318,9 @@ const PENDING_GEN_STALL_MS = 10 * 60 * 1000;   // streaming row with no update i
 const PENDING_GEN_TTL_MS = Number(process.env.PENDING_GEN_TTL_MS) || 12 * 60 * 60 * 1000; // done/error rows kept 12h
 const PENDING_GEN_GC_INTERVAL_MS = 60000;
 const PENDING_GEN_PER_USER_CAP = 50;
+
+// --- Web Push notify-on-still-unacked delay (see runDurableProxyPump) ---
+const PUSH_NOTIFY_DELAY_MS = Number(process.env.PUSH_NOTIFY_DELAY_MS) || 8000;
 const proxyStreamJobs = new Map();
 
 const loginRouteLimiter = rateLimit({
@@ -2443,6 +2475,26 @@ async function runDurableProxyPump(originalResponse, res, meta) {
             id: meta.id, status: 'done', rawBody: Buffer.concat(chunks), truncated,
             upstreamStatus: meta.upstreamStatus,
         });
+        // Only push if the client hasn't already ack'd this by the time the
+        // delay elapses — a live tab acks near-instantly on stream completion
+        // (index.svelte.ts's finally block), so this only fires for the
+        // "actually missed it" case (backgrounded/closed tab), reusing that
+        // existing ack contract instead of needing a new client-side signal.
+        // Fire-and-forget: by the time this timer fires, res has long since
+        // ended, nothing on the request path is waiting on it.
+        setTimeout(() => {
+            try {
+                if (pendingGenerationStillExists(meta.id)) {
+                    sendPushToUser(meta.userId, {
+                        title: '포켓리수',
+                        body: '답변이 도착했어요. 앱으로 돌아와 확인해보세요.',
+                        data: { chaId: meta.characterId, roomChatId: meta.roomChatId },
+                    }).catch((e) => logger.error('[Push] send failed', e));
+                }
+            } catch (e) {
+                logger.error('[Push] trigger check failed', e);
+            }
+        }, PUSH_NOTIFY_DELAY_MS);
     } catch (err) {
         finishPendingGeneration({
             id: meta.id, status: 'error', rawBody: Buffer.concat(chunks), truncated,
@@ -2965,6 +3017,7 @@ mountChatApi(app);
 mountChatFolderApi(app);
 mountLorebookApi(app);
 mountPendingGenApi(app);
+mountPushApi(app);
 
 // ── Account management (admin only, except self password change) ──────────
 

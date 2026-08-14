@@ -1337,6 +1337,8 @@ export const languageKorean = {
   autoTranslateCachedOnly: "캐시된 메시지만 자동 번역",
   notification: "알림",
   permissionDenied: "브라우저 또는 OS에 의해 권한이 거부되었습니다",
+  pushSubscribeFailed:
+    "OS 알림 구독에 실패했어요. 탭이 열려있을 때는 계속 알림이 표시됩니다.",
   customFlags: "커스텀 플래그",
   enableCustomFlags: "커스텀 플래그 활성화",
   googleCloudTokenization: "Google Cloud 토큰화",

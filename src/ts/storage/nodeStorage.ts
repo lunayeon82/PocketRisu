@@ -836,6 +836,36 @@ export class NodeStorage{
         }
     }
 
+    // ── Web Push subscription (durable-generation "you missed it" notify) ───
+
+    async getVapidPublicKey(): Promise<string> {
+        const da = await this.authFetch('/api/push/vapid-public-key')
+        if (!da.ok) throw new Error(`getVapidPublicKey error: ${da.status}`)
+        const data = await da.json()
+        return data.publicKey
+    }
+
+    async subscribePush(subscription: PushSubscriptionJSON, userAgent?: string): Promise<void> {
+        const da = await this.authFetch('/api/push/subscribe', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ endpoint: subscription.endpoint, keys: subscription.keys, userAgent }),
+        })
+        if (!da.ok) throw new Error(`subscribePush error: ${da.status}`)
+    }
+
+    // Idempotent — unsubscribing an endpoint that's already gone is not an error.
+    async unsubscribePush(endpoint: string): Promise<void> {
+        const da = await this.authFetch('/api/push/subscribe', {
+            method: 'DELETE',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ endpoint }),
+        })
+        if (!da.ok && da.status !== 404) {
+            console.error(`[Push] unsubscribe failed: ${da.status}`)
+        }
+    }
+
     // ── Chat list (Phase 4) ───────────────────────────────────────────────────
 
     async loadChatListFromServer(): Promise<Map<string, ChatStub[]>> {
