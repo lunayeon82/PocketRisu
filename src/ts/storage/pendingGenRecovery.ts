@@ -160,9 +160,24 @@ export async function checkPendingGenerationsForChat(chaId: string, roomChatId: 
             // status === 'done'. Dedup: the live path may have already
             // delivered and saved this exact generation before the server-side
             // ack landed (or before this poll ran) — message.chatId is stamped
-            // with the same generationId either way.
+            // with the same generationId either way. But sendChat() also
+            // stamps that same chatId onto an *empty placeholder* message the
+            // moment it starts streaming (index.svelte.ts), before any reply
+            // text exists — matching on chatId alone treated that placeholder
+            // as "already delivered" and silently ack'd the real reply away
+            // without ever filling it in, whenever the original tab's own
+            // stream reader stalled forever (fetchViaProxy2 has no client-side
+            // read timeout) instead of erroring. chat.isStreaming is the
+            // reliable signal: it's only ever false once the live path's own
+            // stream loop actually finished (its `finally` ran), so a
+            // matching message while isStreaming is still true means that
+            // original call is stuck, not done — recover into it instead of
+            // treating it as delivered.
             const chat = DBState.db.characters[charIndex].chats[chatIndex]
-            if (chat.message.some(m => m.chatId === row.id)) {
+            const existingIndex = chat.message.findIndex(m => m.chatId === row.id)
+            const existingMsg = existingIndex === -1 ? null : chat.message[existingIndex]
+            const deliveredLive = !!existingMsg && !!existingMsg.data && chat.isStreaming === false
+            if (deliveredLive) {
                 void ackPendingGeneration(row.id).catch(() => {})
                 continue
             }
@@ -178,13 +193,33 @@ export async function checkPendingGenerationsForChat(chaId: string, roomChatId: 
                     rawBytes,
                     full.replayMeta,
                 )
-                DBState.db.characters[charIndex].chats[chatIndex].message.push({
-                    role: 'char',
-                    data: finalText,
-                    saying: chaId,
-                    time: full.completedAt ?? Date.now(),
-                    chatId: row.id,
-                })
+                if (existingMsg) {
+                    // Fill in the stalled placeholder in place rather than
+                    // pushing a duplicate message.
+                    existingMsg.data = finalText
+                    existingMsg.time = full.completedAt ?? existingMsg.time
+                } else {
+                    DBState.db.characters[charIndex].chats[chatIndex].message.push({
+                        role: 'char',
+                        data: finalText,
+                        saying: chaId,
+                        time: full.completedAt ?? Date.now(),
+                        chatId: row.id,
+                    })
+                }
+                // The stalled original sendChat() call (if any) never reaches
+                // its `finally` block on its own, so the "still generating"
+                // flags it set never clear by themselves — clear them now
+                // that we've delivered the content ourselves. Chat-local
+                // isStreaming is always safe to clear here; the global
+                // doingChat store is only cleared when this chat is the one
+                // currently in view, so we don't stomp an unrelated
+                // generation the user is actively watching elsewhere.
+                DBState.db.characters[charIndex].chats[chatIndex].isStreaming = false
+                if (get(selectedCharID) === charIndex && DBState.db.characters[charIndex].chatPage === chatIndex) {
+                    const { doingChat } = await import('../process/index.svelte')
+                    doingChat.set(false)
+                }
                 appended = true
             } catch (e) {
                 console.error(`[PendingGen] replay failed for ${row.id}`, e)
