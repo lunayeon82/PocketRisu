@@ -2084,6 +2084,22 @@ export async function fetchNative(url: string, arg: {
     }
 
     try {
+        // A request that opted into durable buffering (the main assistant
+        // reply) must go through /proxy2 even when a direct fetch would
+        // succeed — direct fetch bypasses our server entirely, so there is
+        // nothing buffering the response if the client disconnects mid-reply.
+        // This is exactly the gap already documented as durable buffering's
+        // "known limitation" #1 in CLAUDE.md (CORS-permissive endpoints skip
+        // /proxy2 and fall outside the mechanism's reach) — observed in
+        // practice with a Vertex AI Gemini endpoint that allows a direct
+        // browser fetch to succeed, silently defeating durability.
+        if (arg.durable?.parserKind) {
+            return await fetchViaProxy2(url, headers, realBody, {
+                ...arg,
+                signal: requestSignal
+            })
+        }
+
         if (window.userScriptFetch && !throughProxy) {
             return await window.userScriptFetch(url, {
                 body: realBody as any,

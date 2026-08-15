@@ -2522,14 +2522,8 @@ const reverseProxyFunc = async (req, res, next) => {
         });
         return;
     }
-    const rawDurableHeader = req.headers['risu-durable-meta'];
-    const durableMeta = parseDurableMeta(rawDurableHeader);
+    const durableMeta = parseDurableMeta(req.headers['risu-durable-meta']);
     const durableUserId = durableMeta ? resolveUserId(req) : null;
-    // TEMP DIAG — pin down why some /proxy2 streams fall back to pipeline()
-    // instead of the durable pump; remove once root-caused.
-    if (rawDurableHeader) {
-        logger.info(`[DurableDiag] headerPresent=true rawLen=${rawDurableHeader.length} parsedOk=${!!durableMeta} genId=${durableMeta?.genId} userId=${durableUserId}` + (!durableMeta ? ` rawPrefix=${rawDurableHeader.slice(0, 300)}` : ''));
-    }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
     const timeout = createTimeoutController(timeoutMs);
     let originalResponse;
