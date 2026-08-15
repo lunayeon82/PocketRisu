@@ -2522,8 +2522,19 @@ const reverseProxyFunc = async (req, res, next) => {
         });
         return;
     }
-    const durableMeta = parseDurableMeta(req.headers['risu-durable-meta']);
+    const rawDurableHeader = req.headers['risu-durable-meta'];
+    const durableMeta = parseDurableMeta(rawDurableHeader);
     const durableUserId = durableMeta ? resolveUserId(req) : null;
+    // TEMP DIAG round 2 — header now reaches /proxy2 (confirmed via nginx
+    // access log), but ERR_STREAM_PREMATURE_CLOSE is still logged from the
+    // pipeline() catch block, meaning durableMeta/durableUserId is still
+    // falsy here for at least some requests. Pin down which. Remove once
+    // root-caused.
+    if (rawDurableHeader) {
+        logger.info(`[DurableDiag2] rawLen=${rawDurableHeader.length} parsedOk=${!!durableMeta} genId=${durableMeta?.genId} parserKind=${durableMeta?.parserKind} userId=${durableUserId} hasAuthCookie=${!!req.headers.cookie} rawPrefix=${rawDurableHeader.slice(0, 400)}`);
+    } else {
+        logger.info(`[DurableDiag2] no risu-durable-meta header on this /proxy2 call url=${urlParam.slice(0, 120)}`);
+    }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
     const timeout = createTimeoutController(timeoutMs);
     let originalResponse;
