@@ -1,5 +1,18 @@
 // @ts-nocheck
 
+// No install/activate handling existed before — a new sw.js deploy would sit
+// in "waiting" until every open tab/PWA instance was fully closed, and even
+// then wouldn't take control of already-open clients without a reload.
+// Doesn't affect app JS/HTML staleness (this SW never intercepts those — see
+// the fetch handler below, scoped to /sw/* and /tf/* only) but matters for
+// this SW's own listeners (push/notificationclick) taking effect promptly.
+self.addEventListener('install', () => {
+    self.skipWaiting()
+})
+self.addEventListener('activate', (event) => {
+    event.waitUntil(clients.claim())
+})
+
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url)
     const path = url.pathname.split('/')
