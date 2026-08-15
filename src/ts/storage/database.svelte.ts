@@ -24,10 +24,6 @@ import { emptyModelBinding } from '../preset/types';
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
 export let webAppSubVer = ''
 export const nodeOnlyVer: string = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0'
-// TEMP DEBUG — build-time fingerprint so a real device can confirm it's
-// running the latest deploy's JS, not a stale cached bundle. Remove once
-// the durable-buffering-on-Vertex investigation (CLAUDE.md) is closed.
-export const buildTimestamp: string = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'unknown'
 
 // 'custom' was a deprecated experimental theme (kwaroran's "not for real use now",
 // 2024-10) whose select option had been hidden but still reachable through legacy

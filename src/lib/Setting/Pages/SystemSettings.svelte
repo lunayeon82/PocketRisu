@@ -29,7 +29,6 @@
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
     import { language, getCurrentLocale } from 'src/lang'
-    import { nodeOnlyVer, buildTimestamp } from 'src/ts/storage/database.svelte'
 
     type LogLevel = 'error' | 'warning' | 'info'
     type LogOrigin = 'client' | 'server'
@@ -418,13 +417,6 @@
         { label: language.pluginStorageTab, value: 3 },
         { label: language.accountTab, value: 4 },
     ]} bind:selected={$SystemSubmenuIndex} />
-
-    <!-- TEMP DEBUG — build fingerprint so a real device can confirm it's on
-         the latest deploy vs a stale cached bundle. Remove once the
-         durable-buffering-on-Vertex investigation (CLAUDE.md) is closed. -->
-    <div class="text-textcolor2 text-xs mb-3 font-mono">
-        build: {buildTimestamp} (v{nodeOnlyVer})
-    </div>
 
     {#if $SystemSubmenuIndex === 0}
     <SystemDashboard />

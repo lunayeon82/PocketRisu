@@ -12,11 +12,6 @@ export default defineConfig(({command, mode}) => {
   return {
     define: {
       '__APP_VERSION__': JSON.stringify(pkg.version),
-      // Debug aid: lets a real device confirm it's actually running the JS
-      // bundle from the latest deploy (vs a stale cached one) — baked in at
-      // build time, so it changes on every rebuild regardless of package
-      // version. See CLAUDE.md's durable-buffering-on-Vertex investigation.
-      '__BUILD_TIME__': JSON.stringify(new Date().toISOString()),
     },
     plugins: [
       svelte({

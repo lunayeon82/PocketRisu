@@ -2522,22 +2522,8 @@ const reverseProxyFunc = async (req, res, next) => {
         });
         return;
     }
-    const rawDurableHeader = req.headers['risu-durable-meta'];
-    const durableMeta = parseDurableMeta(rawDurableHeader);
+    const durableMeta = parseDurableMeta(req.headers['risu-durable-meta']);
     const durableUserId = durableMeta ? resolveUserId(req) : null;
-    // TEMP DIAG round 2 — header now reaches /proxy2 (confirmed via nginx
-    // access log), but ERR_STREAM_PREMATURE_CLOSE is still logged from the
-    // pipeline() catch block, meaning durableMeta/durableUserId is still
-    // falsy here for at least some requests. Pin down which. Remove once
-    // root-caused.
-    if (rawDurableHeader) {
-        logger.info(`[DurableDiag2] rawLen=${rawDurableHeader.length} parsedOk=${!!durableMeta} genId=${durableMeta?.genId} parserKind=${durableMeta?.parserKind} userId=${durableUserId} hasAuthCookie=${!!req.headers.cookie} rawPrefix=${rawDurableHeader.slice(0, 400)}`);
-    } else {
-        // Strip query string — some legacy formats embed an API key there
-        // (?key=...); never want that landing in the log store.
-        const urlPathOnly = urlParam.split('?')[0];
-        logger.info(`[DurableDiag2] no risu-durable-meta header on this /proxy2 call method=${req.method} urlPath=${urlPathOnly.slice(0, 300)} hasQuery=${urlParam.includes('?')} risuHeaderPresent=${!!req.headers['risu-header']}`);
-    }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
     const timeout = createTimeoutController(timeoutMs);
     let originalResponse;
